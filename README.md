@@ -17,29 +17,35 @@ capabilities. Kamui remains an independent coding agent and does not need to kno
 Kumo currently provides a single-user Telegram bot that receives text messages and sends a hardcoded
 reply. Skills and host execution are not implemented yet.
 
-## Telegram setup
+## Onboarding
 
-1. Create a bot through [@BotFather](https://t.me/BotFather) and copy its token.
-2. Get your numeric Telegram user ID, for example through [@userinfobot](https://t.me/userinfobot).
-3. Copy `.env.example` to `.env` and replace both placeholder values.
-4. Run Kumo with `cargo run`.
-
-PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-cargo run
-```
-
-Bash:
+Run Kumo without arguments:
 
 ```sh
-cp .env.example .env
 cargo run
 ```
 
-The `.env` file is ignored by Git and must not be committed. Send a text message to the bot after it
-starts. Kumo ignores messages from every other Telegram user.
+On first run, Kumo starts an interactive setup that:
+
+- opens [@BotFather](https://t.me/BotFather) to create a private bot;
+- asks for the bot token without displaying it in the terminal;
+- validates the token with Telegram;
+- opens the new bot with a one-time pairing link;
+- detects the owner's Telegram user ID when they tap **Start**;
+- saves everything to the OS config directory as `kumo/kumo.toml`.
+
+No `.env` file or manual user ID lookup is required. The pairing nonce ensures that an unrelated
+Telegram user cannot claim the bot by messaging it first. Kumo ignores messages from every account
+except the paired owner.
+
+Run onboarding again at any time to replace the bot:
+
+```sh
+cargo run -- onboard
+```
+
+The bot token is stored in the user's global `kumo.toml`. On Unix, Kumo restricts this file to the
+current user (`0600`). Never publish or commit this file.
 
 ## Development
 
