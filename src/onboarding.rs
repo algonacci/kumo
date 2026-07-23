@@ -1,21 +1,58 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use dialoguer::{Confirm, Password, theme::ColorfulTheme};
+use dialoguer::{Confirm, FuzzySelect, Input, Password, theme::ColorfulTheme};
 use teloxide::{payloads::GetUpdatesSetters, prelude::*, types::UpdateKind};
 use uuid::Uuid;
 
-use crate::config::{Config, TelegramConfig};
+use crate::{
+    config::{Config, ProviderConfig, TelegramConfig},
+    provider,
+};
 
 const BOTFATHER_URL: &str = "https://t.me/BotFather";
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
 
-pub async fn run() -> Result<()> {
-    let theme = ColorfulTheme::default();
-
+pub async fn run(existing: Option<Config>) -> Result<Config> {
     println!("Kumo onboarding");
     println!("===============");
     println!();
+
+    let telegram = match existing {
+        Some(config) => {
+            println!(
+                "Telegram is already connected as @{}.",
+                config.telegram.bot_username
+            );
+            config.telegram
+        }
+        None => {
+            let telegram = setup_telegram().await?;
+            Config {
+                telegram: telegram.clone(),
+                provider: None,
+            }
+            .save()?;
+            telegram
+        }
+    };
+    let provider = setup_provider().await?;
+    let config = Config {
+        telegram,
+        provider: Some(provider),
+    };
+    let path = config.save()?;
+
+    println!();
+    println!("Setup complete.");
+    println!("Configuration saved to {}", path.display());
+    Ok(config)
+}
+
+async fn setup_telegram() -> Result<TelegramConfig> {
+    let theme = ColorfulTheme::default();
+
     println!("Kumo needs a private Telegram bot. Setup takes about a minute.");
     println!();
     println!("1. Create a bot with @BotFather using /newbot.");
@@ -47,8 +84,6 @@ pub async fn run() -> Result<()> {
 
     println!();
     println!("Connected to @{bot_username}.");
-    println!("Now Kumo will securely pair your Telegram account.");
-
     let nonce = Uuid::new_v4().simple().to_string();
     let payload = format!("kumo_{nonce}");
     let bot_link = format!("https://t.me/{bot_username}?start={payload}");
@@ -60,21 +95,63 @@ pub async fn run() -> Result<()> {
     bot.send_message(owner_user_id, "Kumo is connected to your account.")
         .await
         .context("paired successfully, but could not send confirmation")?;
-
-    let config = Config {
-        telegram: TelegramConfig {
-            bot_token: token,
-            bot_username,
-            owner_user_id: owner_user_id.0,
-        },
-    };
-    let path = config.save()?;
-
-    println!();
     println!("Telegram connected successfully.");
-    println!("Configuration saved to {}", path.display());
-    println!("Setup complete.");
-    Ok(())
+
+    Ok(TelegramConfig {
+        bot_token: token,
+        bot_username,
+        owner_user_id: owner_user_id.0,
+    })
+}
+
+async fn setup_provider() -> Result<ProviderConfig> {
+    let theme = ColorfulTheme::default();
+    println!();
+    println!("Connect an OpenAI-compatible model provider.");
+
+    loop {
+        let base_url = Input::<String>::with_theme(&theme)
+            .with_prompt("Provider base URL")
+            .default(DEFAULT_BASE_URL.to_owned())
+            .interact_text()?
+            .trim_end_matches('/')
+            .to_owned();
+        let api_key = Password::with_theme(&theme)
+            .with_prompt("API key (leave empty for a local provider)")
+            .allow_empty_password(true)
+            .interact()?
+            .trim()
+            .to_owned();
+
+        println!("Checking available models...");
+        match provider::list_models(&base_url, &api_key).await {
+            Ok(models) => {
+                let selected = FuzzySelect::with_theme(&theme)
+                    .with_prompt("Choose the default model (type to search)")
+                    .items(&models)
+                    .default(0)
+                    .interact()?;
+                let active_model = models[selected].clone();
+                println!("Connected. Found {} models.", models.len());
+                return Ok(ProviderConfig {
+                    base_url,
+                    api_key,
+                    active_model,
+                    models,
+                });
+            }
+            Err(error) => {
+                eprintln!("Could not load models: {error:#}");
+                if !Confirm::with_theme(&theme)
+                    .with_prompt("Try the provider setup again?")
+                    .default(true)
+                    .interact()?
+                {
+                    bail!("provider setup cancelled");
+                }
+            }
+        }
+    }
 }
 
 async fn wait_for_owner(bot: &Bot, payload: &str) -> Result<UserId> {

@@ -6,16 +6,26 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = "kumo.toml";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     pub telegram: TelegramConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub bot_username: String,
     pub owner_user_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub active_model: String,
+    pub models: Vec<String>,
 }
 
 impl Config {
@@ -43,6 +53,12 @@ impl Config {
             .with_context(|| format!("failed to write {}", path.display()))?;
         restrict_permissions(&path)?;
         Ok(path)
+    }
+
+    pub fn provider(&self) -> Result<&ProviderConfig> {
+        self.provider
+            .as_ref()
+            .context("model provider is not configured; run `kumo onboard`")
     }
 }
 
@@ -77,6 +93,12 @@ mod tests {
                 bot_username: "kumo_test_bot".into(),
                 owner_user_id: 42,
             },
+            provider: Some(ProviderConfig {
+                base_url: "https://api.example.com/v1".into(),
+                api_key: "secret".into(),
+                active_model: "model-a".into(),
+                models: vec!["model-a".into(), "model-b".into()],
+            }),
         };
 
         let encoded = toml::to_string(&config).unwrap();
@@ -85,5 +107,16 @@ mod tests {
         assert_eq!(decoded.telegram.bot_token, "123:secret");
         assert_eq!(decoded.telegram.bot_username, "kumo_test_bot");
         assert_eq!(decoded.telegram.owner_user_id, 42);
+        assert_eq!(decoded.provider.unwrap().active_model, "model-a");
+    }
+
+    #[test]
+    fn loads_legacy_telegram_only_config() {
+        let decoded: Config = toml::from_str(
+            "[telegram]\nbot_token = \"123:secret\"\nbot_username = \"bot\"\nowner_user_id = 42",
+        )
+        .unwrap();
+
+        assert!(decoded.provider.is_none());
     }
 }
