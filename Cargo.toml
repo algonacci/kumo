@@ -14,7 +14,7 @@ reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 teloxide = "0.17"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 webbrowser = "1"

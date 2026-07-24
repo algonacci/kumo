@@ -15,8 +15,8 @@ capabilities. Kamui remains an independent coding agent and does not need to kno
 ## Status
 
 Kumo currently provides a single-user Telegram bot backed by an OpenAI-compatible model provider,
-with read-only workspace tools. Conversation history, mutation tools, and host command execution are
-not implemented yet.
+with workspace inspection and approval-gated command execution. Conversation history and mutation
+tools are not implemented yet.
 
 ## Onboarding
 
@@ -62,15 +62,20 @@ left empty for local OpenAI-compatible servers that do not require authenticatio
 Normal text messages are sent to the active model. The current MVP treats every message as an
 independent request; conversation history will be added separately.
 
-## Read-only tools
+## Host tools
 
 The model may call two tools while answering:
 
 - `read_file` reads UTF-8 files up to 64 KiB inside the configured workspace.
 - `list_directory` lists up to 200 entries inside the configured workspace.
+- `run_command` runs a shell command in the workspace only after explicit Telegram approval.
 
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
-the workspace, including through symlinks. Kumo cannot edit files or run shell commands yet.
+the workspace, including through symlinks.
+
+Every command request displays **Allow once** and **Deny** buttons in Telegram. Approval expires after
+two minutes and cannot be replayed. Commands run with stdin disabled, a 30-second timeout, and a 16
+KiB combined output limit. A timed-out command is terminated. Kumo cannot edit files yet.
 
 ## Development
 
