@@ -77,6 +77,26 @@ Every command request displays **Allow once** and **Deny** buttons in Telegram. 
 two minutes and cannot be replayed. Commands run with stdin disabled, a 30-second timeout, and a 16
 KiB combined output limit. A timed-out command is terminated. Kumo cannot edit files yet.
 
+## MCP servers
+
+Kumo can launch MCP servers over stdio. Add servers to the global `kumo.toml` and restart Kumo:
+
+```toml
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "C:\\path\\to\\files"]
+
+[mcp.excel]
+command = "uvx"
+args = ["mcp-excel"]
+trusted = true
+```
+
+Advertised tools are exposed to the model as `<server>__<tool>`, preventing collisions with built-in
+tools and other servers. MCP servers can execute arbitrary code or external actions, so each call
+requires the same one-time Telegram approval by default. Set `trusted = true` only for a server whose
+tools may run unattended. A server that fails to start is reported in the terminal and skipped.
+
 ## Development
 
 Requires a current stable Rust toolchain.

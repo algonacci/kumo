@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -18,21 +19,31 @@ const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct ToolRegistry {
     root: PathBuf,
+    extra: Vec<std::sync::Arc<dyn ExternalTool>>,
+}
+
+#[async_trait]
+pub trait ExternalTool: Send + Sync {
+    fn name(&self) -> &str;
+    fn definition(&self) -> ToolDefinition;
+    fn requires_confirmation(&self) -> bool;
+    fn preview(&self, arguments: &str) -> Option<String>;
+    async fn run(&self, arguments: &str) -> Result<String>;
 }
 
 impl ToolRegistry {
-    pub fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf, extra: Vec<std::sync::Arc<dyn ExternalTool>>) -> Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("could not resolve workspace {}", root.display()))?;
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
         }
-        Ok(Self { root })
+        Ok(Self { root, extra })
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![
+        let mut definitions = vec![
             ToolDefinition {
                 name: "read_file".to_owned(),
                 description: "Read a UTF-8 text file inside the configured workspace.".to_owned(),
@@ -77,17 +88,31 @@ impl ToolRegistry {
                     "required": ["command"]
                 }),
             },
-        ]
+        ];
+        definitions.extend(self.extra.iter().map(|tool| tool.definition()));
+        definitions
     }
 
     pub fn requires_confirmation(&self, name: &str) -> bool {
         name == "run_command"
+            || self
+                .extra
+                .iter()
+                .find(|tool| tool.name() == name)
+                .is_some_and(|tool| tool.requires_confirmation())
     }
 
     pub fn preview(&self, call: &ToolCall) -> Option<String> {
-        (call.name == "run_command")
-            .then(|| parse_command(&call.arguments).ok())
-            .flatten()
+        if call.name == "run_command" {
+            parse_command(&call.arguments)
+                .ok()
+                .map(|command| format!("Command: {command}"))
+        } else {
+            self.extra
+                .iter()
+                .find(|tool| tool.name() == call.name)
+                .and_then(|tool| tool.preview(&call.arguments))
+        }
     }
 
     pub async fn dispatch(&self, call: &ToolCall) -> String {
@@ -95,7 +120,10 @@ impl ToolRegistry {
             "read_file" => self.read_file(&call.arguments),
             "list_directory" => self.list_directory(&call.arguments),
             "run_command" => self.run_command(&call.arguments).await,
-            _ => Err(anyhow::anyhow!("unknown tool '{}'", call.name)),
+            _ => match self.extra.iter().find(|tool| tool.name() == call.name) {
+                Some(tool) => tool.run(&call.arguments).await,
+                None => Err(anyhow::anyhow!("unknown tool '{}'", call.name)),
+            },
         };
         result.unwrap_or_else(|error| format!("Error: {error:#}"))
     }
@@ -245,6 +273,35 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    struct FakeExternalTool;
+
+    #[async_trait]
+    impl ExternalTool for FakeExternalTool {
+        fn name(&self) -> &str {
+            "fake__ping"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_owned(),
+                description: "Ping".to_owned(),
+                parameters: json!({ "type": "object" }),
+            }
+        }
+
+        fn requires_confirmation(&self) -> bool {
+            true
+        }
+
+        fn preview(&self, arguments: &str) -> Option<String> {
+            Some(format!("Fake {arguments}"))
+        }
+
+        async fn run(&self, _arguments: &str) -> Result<String> {
+            Ok("pong".to_owned())
+        }
+    }
+
     fn workspace() -> PathBuf {
         let root = std::env::temp_dir().join(format!("kumo-tools-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
@@ -255,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn reads_and_lists_workspace_content() {
         let root = workspace();
-        let tools = ToolRegistry::new(root.clone()).unwrap();
+        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
 
         assert_eq!(
             tools
@@ -287,7 +344,7 @@ mod tests {
         let outside_name = format!("kumo-outside-{}.txt", Uuid::new_v4());
         let outside = root.parent().unwrap().join(&outside_name);
         std::fs::write(&outside, "secret").unwrap();
-        let tools = ToolRegistry::new(root.clone()).unwrap();
+        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
         let output = tools
             .dispatch(&ToolCall {
                 id: "1".into(),
@@ -304,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn runs_commands_in_workspace() {
         let root = workspace();
-        let tools = ToolRegistry::new(root.clone()).unwrap();
+        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
         let command = if cfg!(windows) {
             "type hello.txt"
         } else {
@@ -330,5 +387,28 @@ mod tests {
 
         assert!(output.ends_with("... output truncated"));
         assert!(output.is_char_boundary(MAX_COMMAND_OUTPUT));
+    }
+
+    #[tokio::test]
+    async fn routes_external_tools_through_shared_policy() {
+        let root = workspace();
+        let tools =
+            ToolRegistry::new(root.clone(), vec![std::sync::Arc::new(FakeExternalTool)]).unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "fake__ping".into(),
+            arguments: "{}".into(),
+        };
+
+        assert!(
+            tools
+                .definitions()
+                .iter()
+                .any(|tool| tool.name == call.name)
+        );
+        assert!(tools.requires_confirmation(&call.name));
+        assert_eq!(tools.preview(&call).as_deref(), Some("Fake {}"));
+        assert_eq!(tools.dispatch(&call).await, "pong");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

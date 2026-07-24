@@ -1,4 +1,5 @@
 mod config;
+mod mcp;
 mod onboarding;
 mod provider;
 mod tools;
@@ -26,7 +27,7 @@ struct AppState {
 
 const MAX_TOOL_ROUNDS: usize = 8;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_COMMAND_PREVIEW_CHARS: usize = 3500;
+const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
 const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it.";
 type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
@@ -70,7 +71,19 @@ async fn run_gateway(config: Config) -> Result<()> {
         .context("tools are not configured; run `kumo onboard`")?
         .workspace
         .clone();
-    let tools = ToolRegistry::new(workspace)?;
+    let mcp = mcp::connect_all(&config.mcp).await;
+    for status in &mcp.statuses {
+        match &status.error {
+            Some(error) => println!("MCP {}: failed ({error})", status.name),
+            None => println!(
+                "MCP {}: {} tool(s){}",
+                status.name,
+                status.tool_count,
+                if status.trusted { " [trusted]" } else { "" }
+            ),
+        }
+    }
+    let tools = ToolRegistry::new(workspace, mcp.tools)?;
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let state = Arc::new(RwLock::new(AppState {
         config,
@@ -258,7 +271,7 @@ async fn request_approval(
     bot: &Bot,
     chat_id: ChatId,
     approvals: &PendingApprovals,
-    command: &str,
+    action: &str,
 ) -> Result<bool> {
     let nonce = Uuid::new_v4().simple().to_string();
     let keyboard = InlineKeyboardMarkup::new([[
@@ -268,19 +281,19 @@ async fn request_approval(
     let (sender, receiver) = oneshot::channel();
     approvals.lock().await.insert(nonce.clone(), sender);
 
-    let preview = command
+    let preview = action
         .chars()
-        .take(MAX_COMMAND_PREVIEW_CHARS)
+        .take(MAX_APPROVAL_PREVIEW_CHARS)
         .collect::<String>();
-    let preview = if command.chars().count() > MAX_COMMAND_PREVIEW_CHARS {
-        format!("{preview}\n... command preview truncated")
+    let preview = if action.chars().count() > MAX_APPROVAL_PREVIEW_CHARS {
+        format!("{preview}\n... approval preview truncated")
     } else {
         preview
     };
     let prompt = match bot
         .send_message(
             chat_id,
-            format!("Kumo wants to run this command:\n\n{preview}"),
+            format!("Kumo wants to run this host action:\n\n{preview}"),
         )
         .reply_markup(keyboard)
         .await

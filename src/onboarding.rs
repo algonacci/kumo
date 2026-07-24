@@ -19,13 +19,13 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
     println!("===============");
     println!();
 
-    let (telegram, existing_provider) = match existing {
+    let (telegram, existing_provider, mcp) = match existing {
         Some(config) => {
             println!(
                 "Telegram is already connected as @{}.",
                 config.telegram.bot_username
             );
-            (config.telegram, config.provider)
+            (config.telegram, config.provider, config.mcp)
         }
         None => {
             let telegram = setup_telegram().await?;
@@ -33,9 +33,10 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
                 telegram: telegram.clone(),
                 provider: None,
                 tools: None,
+                mcp: Default::default(),
             }
             .save()?;
-            (telegram, None)
+            (telegram, None, Default::default())
         }
     };
     let provider = match existing_provider {
@@ -47,6 +48,7 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
         telegram,
         provider: Some(provider),
         tools: Some(tools),
+        mcp,
     };
     let path = config.save()?;
 

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
@@ -13,6 +13,8 @@ pub struct Config {
     pub provider: Option<ProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -33,6 +35,15 @@ pub struct ProviderConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolsConfig {
     pub workspace: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl Config {
@@ -109,6 +120,14 @@ mod tests {
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
             }),
+            mcp: BTreeMap::from([(
+                "files".into(),
+                McpServerConfig {
+                    command: "server".into(),
+                    args: vec!["--stdio".into()],
+                    trusted: true,
+                },
+            )]),
         };
 
         let encoded = toml::to_string(&config).unwrap();
@@ -122,6 +141,7 @@ mod tests {
             decoded.tools.unwrap().workspace,
             PathBuf::from("/tmp/workspace")
         );
+        assert!(decoded.mcp["files"].trusted);
     }
 
     #[test]
@@ -133,5 +153,6 @@ mod tests {
 
         assert!(decoded.provider.is_none());
         assert!(decoded.tools.is_none());
+        assert!(decoded.mcp.is_empty());
     }
 }
