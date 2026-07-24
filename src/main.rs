@@ -1,19 +1,25 @@
 mod config;
 mod onboarding;
 mod provider;
+mod tools;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use config::Config;
-use provider::Provider;
+use provider::{Message as ProviderMessage, Provider};
 use teloxide::{dispatching::Dispatcher, prelude::*, types::ChatAction};
 use tokio::sync::RwLock;
+use tools::ToolRegistry;
 
 struct AppState {
     config: Config,
     provider: Provider,
+    tools: ToolRegistry,
 }
+
+const MAX_TOOL_ROUNDS: usize = 8;
+const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools when useful. Never claim that you changed files or ran commands because those capabilities are not available.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,9 +34,10 @@ async fn main() -> Result<()> {
     let needs_onboarding = matches!(command, Command::Onboard)
         || existing
             .as_ref()
-            .is_none_or(|config| config.provider.is_none());
+            .is_none_or(|config| config.provider.is_none() || config.tools.is_none());
     let config = if needs_onboarding {
-        let config = onboarding::run(existing).await?;
+        let reconfigure_provider = matches!(command, Command::Onboard);
+        let config = onboarding::run(existing, reconfigure_provider).await?;
         if matches!(command, Command::Onboard) {
             return Ok(());
         }
@@ -48,7 +55,18 @@ async fn run_gateway(config: Config) -> Result<()> {
     let bot = Bot::new(config.telegram.bot_token.clone());
     let allowed_user_id = config.telegram.owner_user_id;
     let provider = Provider::new(config.provider()?.clone());
-    let state = Arc::new(RwLock::new(AppState { config, provider }));
+    let workspace = config
+        .tools
+        .as_ref()
+        .context("tools are not configured; run `kumo onboard`")?
+        .workspace
+        .clone();
+    let tools = ToolRegistry::new(workspace)?;
+    let state = Arc::new(RwLock::new(AppState {
+        config,
+        provider,
+        tools,
+    }));
 
     let current = state.read().await;
     println!(
@@ -56,6 +74,16 @@ async fn run_gateway(config: Config) -> Result<()> {
         current.config.telegram.bot_username
     );
     println!("Model: {}", current.provider.active_model());
+    println!(
+        "Workspace: {}",
+        current
+            .config
+            .tools
+            .as_ref()
+            .expect("tools are configured before gateway startup")
+            .workspace
+            .display()
+    );
     drop(current);
     println!("Press Ctrl+C to stop.");
 
@@ -129,8 +157,7 @@ async fn handle_message(
 
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
-    let provider = state.read().await.provider.clone();
-    match provider.chat(text).await {
+    match run_agent(&state, text).await {
         Ok(response) => {
             for chunk in message_chunks(&response, 4000) {
                 bot.send_message(message.chat.id, chunk).await?;
@@ -147,6 +174,44 @@ async fn handle_message(
     }
 
     respond(())
+}
+
+async fn run_agent(state: &RwLock<AppState>, prompt: &str) -> Result<String> {
+    let (provider, tool_definitions) = {
+        let state = state.read().await;
+        (state.provider.clone(), state.tools.definitions())
+    };
+    let mut messages = vec![
+        ProviderMessage::system(SYSTEM_PROMPT),
+        ProviderMessage::user(prompt),
+    ];
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let response = provider.chat(&messages, &tool_definitions).await?;
+        if response.tool_calls.is_empty() {
+            if response.content.trim().is_empty() {
+                bail!("provider returned an empty response");
+            }
+            return Ok(response.content);
+        }
+
+        println!(
+            "Model requested {} tool call(s).",
+            response.tool_calls.len()
+        );
+        messages.push(ProviderMessage::tool_request(
+            response.content,
+            response.tool_calls.clone(),
+        ));
+        for call in response.tool_calls {
+            println!("Tool: {}", call.name);
+            let tools = state.read().await.tools.clone();
+            let output = tools.dispatch(&call);
+            messages.push(ProviderMessage::tool_result(call.id, output));
+        }
+    }
+
+    bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
 }
 
 fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
@@ -237,7 +302,7 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  kumo            Start the gateway (onboards on first run)");
-    println!("  kumo onboard    Configure the model provider");
+    println!("  kumo onboard    Configure the model provider and workspace");
     println!("  kumo --help     Show this help");
 }
 

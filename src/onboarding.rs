@@ -6,7 +6,7 @@ use teloxide::{payloads::GetUpdatesSetters, prelude::*, types::UpdateKind};
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, ProviderConfig, TelegramConfig},
+    config::{Config, ProviderConfig, TelegramConfig, ToolsConfig},
     provider,
 };
 
@@ -14,33 +14,39 @@ const BOTFATHER_URL: &str = "https://t.me/BotFather";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
 
-pub async fn run(existing: Option<Config>) -> Result<Config> {
+pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result<Config> {
     println!("Kumo onboarding");
     println!("===============");
     println!();
 
-    let telegram = match existing {
+    let (telegram, existing_provider) = match existing {
         Some(config) => {
             println!(
                 "Telegram is already connected as @{}.",
                 config.telegram.bot_username
             );
-            config.telegram
+            (config.telegram, config.provider)
         }
         None => {
             let telegram = setup_telegram().await?;
             Config {
                 telegram: telegram.clone(),
                 provider: None,
+                tools: None,
             }
             .save()?;
-            telegram
+            (telegram, None)
         }
     };
-    let provider = setup_provider().await?;
+    let provider = match existing_provider {
+        Some(provider) if !reconfigure_provider => provider,
+        _ => setup_provider().await?,
+    };
+    let tools = setup_tools()?;
     let config = Config {
         telegram,
         provider: Some(provider),
+        tools: Some(tools),
     };
     let path = config.save()?;
 
@@ -48,6 +54,25 @@ pub async fn run(existing: Option<Config>) -> Result<Config> {
     println!("Setup complete.");
     println!("Configuration saved to {}", path.display());
     Ok(config)
+}
+
+fn setup_tools() -> Result<ToolsConfig> {
+    let theme = ColorfulTheme::default();
+    let default = std::env::current_dir().context("could not determine the current directory")?;
+    println!();
+    println!("Choose the workspace Kumo may inspect with read-only tools.");
+
+    loop {
+        let value = Input::<String>::with_theme(&theme)
+            .with_prompt("Workspace directory")
+            .default(default.display().to_string())
+            .interact_text()?;
+        let path = std::path::PathBuf::from(value.trim());
+        match path.canonicalize() {
+            Ok(path) if path.is_dir() => return Ok(ToolsConfig { workspace: path }),
+            _ => eprintln!("That workspace directory does not exist."),
+        }
+    }
 }
 
 async fn setup_telegram() -> Result<TelegramConfig> {

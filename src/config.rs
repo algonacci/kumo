@@ -11,6 +11,8 @@ pub struct Config {
     pub telegram: TelegramConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -26,6 +28,11 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub active_model: String,
     pub models: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolsConfig {
+    pub workspace: PathBuf,
 }
 
 impl Config {
@@ -99,6 +106,9 @@ mod tests {
                 active_model: "model-a".into(),
                 models: vec!["model-a".into(), "model-b".into()],
             }),
+            tools: Some(ToolsConfig {
+                workspace: PathBuf::from("/tmp/workspace"),
+            }),
         };
 
         let encoded = toml::to_string(&config).unwrap();
@@ -108,6 +118,10 @@ mod tests {
         assert_eq!(decoded.telegram.bot_username, "kumo_test_bot");
         assert_eq!(decoded.telegram.owner_user_id, 42);
         assert_eq!(decoded.provider.unwrap().active_model, "model-a");
+        assert_eq!(
+            decoded.tools.unwrap().workspace,
+            PathBuf::from("/tmp/workspace")
+        );
     }
 
     #[test]
@@ -118,5 +132,6 @@ mod tests {
         .unwrap();
 
         assert!(decoded.provider.is_none());
+        assert!(decoded.tools.is_none());
     }
 }
