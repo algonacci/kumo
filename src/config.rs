@@ -30,6 +30,8 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub active_model: String,
     pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -116,6 +118,7 @@ mod tests {
                 api_key: "secret".into(),
                 active_model: "model-a".into(),
                 models: vec!["model-a".into(), "model-b".into()],
+                context_window: Some(128_000),
             }),
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),

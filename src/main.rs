@@ -1,3 +1,4 @@
+mod compaction;
 mod config;
 mod mcp;
 mod onboarding;
@@ -256,10 +257,7 @@ async fn handle_message(
 
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
-    let history = database
-        .lock()
-        .await
-        .load_active_messages(message.chat.id.0)?;
+    let history = prepare_history(&state, &database, message.chat.id.0).await?;
     match run_agent(&bot, message.chat.id, &state, &approvals, history, text).await {
         Ok(turn) => {
             for chunk in message_chunks(&turn.answer, 4000) {
@@ -291,7 +289,7 @@ async fn run_agent(
     chat_id: ChatId,
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
-    history: Vec<ProviderMessage>,
+    history: storage::History,
     prompt: &str,
 ) -> Result<AgentTurn> {
     let (provider, tool_definitions, model) = {
@@ -303,8 +301,13 @@ async fn run_agent(
         )
     };
     let user_message = ProviderMessage::user(prompt);
-    let mut messages = vec![ProviderMessage::system(SYSTEM_PROMPT)];
-    messages.extend(history);
+    let mut system = SYSTEM_PROMPT.to_owned();
+    if let Some(summary) = &history.summary {
+        system.push_str("\n\nSummary of the earlier conversation:\n\n");
+        system.push_str(summary);
+    }
+    let mut messages = vec![ProviderMessage::system(system)];
+    messages.extend(history.messages);
     messages.push(user_message.clone());
     let mut trail = Vec::new();
     let mut usage = Usage::default();
@@ -363,6 +366,43 @@ async fn run_agent(
     bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
 }
 
+async fn prepare_history(
+    state: &RwLock<AppState>,
+    database: &Mutex<Database>,
+    chat_id: i64,
+) -> Result<storage::History> {
+    let mut history = database.lock().await.load_active_history(chat_id)?;
+    let (provider, context_window) = {
+        let state = state.read().await;
+        (
+            state.provider.clone(),
+            state.config.provider()?.context_window,
+        )
+    };
+    if compaction::total_bytes(&history.messages) <= compaction::threshold(context_window) {
+        return Ok(history);
+    }
+    let Some(cutoff) = compaction::cutoff(&history.messages) else {
+        return Ok(history);
+    };
+
+    println!("Compacting {cutoff} older message(s)...");
+    let rendered = compaction::render(&history.messages[..cutoff]);
+    let summary = provider
+        .summarize(&compaction::summary_messages(
+            history.summary.as_deref(),
+            &rendered,
+        ))
+        .await?;
+    database
+        .lock()
+        .await
+        .compact_active_session(chat_id, &summary, cutoff)?;
+    history.messages.drain(..cutoff);
+    history.summary = Some(summary);
+    Ok(history)
+}
+
 fn accumulate_usage(total: &mut Usage, usage: &Usage) {
     total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
     total.completion_tokens = total
@@ -386,6 +426,7 @@ async fn status_message(
         .display()
         .to_string();
     let model = state.provider.active_model().to_owned();
+    let context_window = state.config.provider()?.context_window;
     let mcp = if state.mcp_statuses.is_empty() {
         "none".to_owned()
     } else {
@@ -397,17 +438,23 @@ async fn status_message(
     let session = database.active_session(chat_id)?;
     let session = match session {
         Some(session) => format!(
-            "{} ({})\nMessages: {}\nRequests: {}\nTokens: {}",
+            "{} ({})\nMessages: {}\nRequests: {}\nTokens: {}\nCompacted: {}",
             session.title,
             &session.id[..8],
             session.message_count,
             session.request_count,
-            session.total_tokens
+            session.total_tokens,
+            if session.summary.is_some() {
+                format!("yes (through message {})", session.summarized_message_id)
+            } else {
+                "no".to_owned()
+            }
         ),
         None => "none (created after the first successful reply)".to_owned(),
     };
     Ok(format!(
-        "Model: {model}\nWorkspace: {workspace}\nSession: {session}\nMCP:\n{mcp}\nDatabase: {}",
+        "Model: {model}\nContext window: {}\nWorkspace: {workspace}\nSession: {session}\nMCP:\n{mcp}\nDatabase: {}",
+        context_window.map_or_else(|| "default".to_owned(), |window| window.to_string()),
         database.path().display()
     ))
 }

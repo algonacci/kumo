@@ -190,6 +190,14 @@ impl Provider {
             finish_reason: choice.finish_reason,
         })
     }
+
+    pub async fn summarize(&self, messages: &[Message]) -> Result<String> {
+        let response = self.chat(messages, &[]).await?;
+        if response.content.trim().is_empty() {
+            bail!("provider returned an empty summary");
+        }
+        Ok(response.content)
+    }
 }
 
 pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {

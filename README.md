@@ -69,6 +69,16 @@ The database lives in the OS local data directory as `kumo/kumo.db`. Set `KUMO_D
 the directory for containers or servers. Schema changes use sequential `PRAGMA user_version`
 migrations; Kumo refuses to open databases created by a newer unsupported version.
 
+Long sessions are compacted automatically. Kumo folds older messages into a persisted rolling
+summary while keeping the six most recent messages verbatim; full history remains in SQLite. The
+default compaction threshold is 48 KiB of recent message content. Set the provider's context window
+to compact at roughly half of its capacity:
+
+```toml
+[provider]
+context_window = 128000
+```
+
 ## Host tools
 
 The model may call two tools while answering:

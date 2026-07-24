@@ -165,6 +165,7 @@ async fn setup_provider() -> Result<ProviderConfig> {
                     api_key,
                     active_model,
                     models,
+                    context_window: None,
                 });
             }
             Err(error) => {

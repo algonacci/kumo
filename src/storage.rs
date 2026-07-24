@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 1;
+const CURRENT_VERSION: i64 = 2;
 
 pub struct Database {
     connection: Connection,
@@ -20,6 +20,13 @@ pub struct ActiveSession {
     pub message_count: i64,
     pub request_count: i64,
     pub total_tokens: i64,
+    pub summary: Option<String>,
+    pub summarized_message_id: i64,
+}
+
+pub struct History {
+    pub messages: Vec<Message>,
+    pub summary: Option<String>,
 }
 
 impl Database {
@@ -45,6 +52,9 @@ impl Database {
         if version < 1 {
             migrate_to_v1(&connection)?;
         }
+        if version < 2 {
+            migrate_to_v2(&connection)?;
+        }
         Ok(Self { connection, path })
     }
 
@@ -52,32 +62,46 @@ impl Database {
         &self.path
     }
 
-    pub fn load_active_messages(&self, chat_id: i64) -> Result<Vec<Message>> {
+    pub fn load_active_history(&self, chat_id: i64) -> Result<History> {
         let Some(session_id) = self.active_session_id(chat_id)? else {
-            return Ok(Vec::new());
+            return Ok(History {
+                messages: Vec::new(),
+                summary: None,
+            });
         };
         let mut statement = self.connection.prepare(
-            "SELECT role, content, tool_calls, tool_call_id
-             FROM messages WHERE session_id = ?1 ORDER BY id",
+            "SELECT id, role, content, tool_calls, tool_call_id
+             FROM messages
+             WHERE session_id = ?1
+               AND id > (SELECT summarized_message_id FROM sessions WHERE id = ?1)
+             ORDER BY id",
         )?;
-        let rows = statement.query_map([session_id], |row| {
+        let rows = statement.query_map([session_id.as_str()], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
-        rows.map(|row| {
-            let (role, content, tool_calls, tool_call_id) = row?;
-            let tool_calls = tool_calls
-                .map(|value| serde_json::from_str::<Vec<ToolCall>>(&value))
-                .transpose()
-                .context("failed to parse stored tool calls")?
-                .unwrap_or_default();
-            Message::from_stored(&role, content, tool_calls, tool_call_id)
-        })
-        .collect()
+        let messages = rows
+            .map(|row| {
+                let (_, role, content, tool_calls, tool_call_id) = row?;
+                let tool_calls = tool_calls
+                    .map(|value| serde_json::from_str::<Vec<ToolCall>>(&value))
+                    .transpose()
+                    .context("failed to parse stored tool calls")?
+                    .unwrap_or_default();
+                Message::from_stored(&role, content, tool_calls, tool_call_id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let summary = self.connection.query_row(
+            "SELECT summary FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(History { messages, summary })
     }
 
     pub fn save_turn(
@@ -163,7 +187,8 @@ impl Database {
                         (SELECT COUNT(*) FROM messages WHERE session_id = s.id),
                         (SELECT COUNT(*) FROM usage_records WHERE session_id = s.id),
                         (SELECT COALESCE(SUM(total_tokens), 0)
-                         FROM usage_records WHERE session_id = s.id)
+                         FROM usage_records WHERE session_id = s.id),
+                        s.summary, s.summarized_message_id
                  FROM active_sessions a
                  JOIN sessions s ON s.id = a.session_id
                  WHERE a.telegram_chat_id = ?1",
@@ -175,6 +200,8 @@ impl Database {
                         message_count: row.get(2)?,
                         request_count: row.get(3)?,
                         total_tokens: row.get(4)?,
+                        summary: row.get(5)?,
+                        summarized_message_id: row.get(6)?,
                     })
                 },
             )
@@ -191,6 +218,34 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn compact_active_session(
+        &mut self,
+        chat_id: i64,
+        summary: &str,
+        summarized_message_count: usize,
+    ) -> Result<()> {
+        if summarized_message_count == 0 {
+            bail!("compaction must summarize at least one message");
+        }
+        let session_id = self
+            .active_session_id(chat_id)?
+            .context("cannot compact without an active session")?;
+        let cutoff_id: i64 = self.connection.query_row(
+            "SELECT id FROM messages
+             WHERE session_id = ?1 AND id > (
+                 SELECT summarized_message_id FROM sessions WHERE id = ?1
+             )
+             ORDER BY id LIMIT 1 OFFSET ?2",
+            params![session_id, i64::try_from(summarized_message_count - 1)?],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "UPDATE sessions SET summary = ?2, summarized_message_id = ?3 WHERE id = ?1",
+            params![session_id, summary, cutoff_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -230,6 +285,17 @@ fn migrate_to_v1(connection: &Connection) -> Result<()> {
              session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
          );
          PRAGMA user_version = 1;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v2(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         ALTER TABLE sessions ADD COLUMN summary TEXT;
+         ALTER TABLE sessions ADD COLUMN summarized_message_id INTEGER NOT NULL DEFAULT 0;
+         PRAGMA user_version = 2;
          COMMIT;",
     )?;
     Ok(())
@@ -315,7 +381,7 @@ mod tests {
         assert_eq!(session.message_count, 4);
         assert_eq!(session.request_count, 1);
         assert_eq!(session.total_tokens, 6);
-        let messages = database.load_active_messages(42).unwrap();
+        let messages = database.load_active_history(42).unwrap().messages;
         assert_eq!(messages[1].tool_calls[0].name, "read_file");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
         assert!(
@@ -338,7 +404,13 @@ mod tests {
             )
             .unwrap();
         assert!(database.clear_active_session(42).unwrap());
-        assert!(database.load_active_messages(42).unwrap().is_empty());
+        assert!(
+            database
+                .load_active_history(42)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
         let second = database
             .save_turn(
                 42,
@@ -372,5 +444,58 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("newer"));
+    }
+
+    #[test]
+    fn migration_to_v2_preserves_existing_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (id, telegram_chat_id, title) VALUES ('s1', 42, 'chat')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (session_id, role, content) VALUES ('s1', 'user', 'hello')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO active_sessions (telegram_chat_id, session_id) VALUES (42, 's1')",
+                [],
+            )
+            .unwrap();
+
+        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        let history = database.load_active_history(42).unwrap();
+
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0].content, "hello");
+        assert!(history.summary.is_none());
+    }
+
+    #[test]
+    fn compaction_persists_summary_and_keeps_full_history() {
+        let mut database = database();
+        let messages = (0..8)
+            .map(|index| Message::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+        database
+            .save_turn(42, "model", &messages, &Usage::default(), "stop")
+            .unwrap();
+
+        database.compact_active_session(42, "summary", 2).unwrap();
+
+        let history = database.load_active_history(42).unwrap();
+        assert_eq!(history.summary.as_deref(), Some("summary"));
+        assert_eq!(history.messages.len(), 6);
+        let full_count: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(full_count, 8);
     }
 }
