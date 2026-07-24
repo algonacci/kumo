@@ -13,14 +13,14 @@ pub struct Provider {
 
 #[derive(Clone, Debug)]
 pub struct Message {
-    role: Role,
-    content: String,
-    tool_calls: Vec<ToolCall>,
-    tool_call_id: Option<String>,
+    pub(crate) role: Role,
+    pub(crate) content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-enum Role {
+pub(crate) enum Role {
     System,
     User,
     Assistant,
@@ -34,6 +34,10 @@ impl Message {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::text(Role::User, content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::text(Role::Assistant, content)
     }
 
     pub fn tool_request(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
@@ -63,13 +67,34 @@ impl Message {
         }
     }
 
-    fn role_name(&self) -> &'static str {
+    pub(crate) fn role_name(&self) -> &'static str {
         match self.role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         }
+    }
+
+    pub(crate) fn from_stored(
+        role: &str,
+        content: String,
+        tool_calls: Vec<ToolCall>,
+        tool_call_id: Option<String>,
+    ) -> Result<Self> {
+        let role = match role {
+            "system" => Role::System,
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
+            _ => bail!("unknown stored message role: {role}"),
+        };
+        Ok(Self {
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+        })
     }
 }
 
@@ -80,7 +105,7 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -90,6 +115,18 @@ pub struct ToolCall {
 pub struct ChatResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
+    pub finish_reason: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 impl Provider {
@@ -149,6 +186,8 @@ impl Provider {
                     arguments: call.function.arguments,
                 })
                 .collect(),
+            usage: response.usage,
+            finish_reason: choice.finish_reason,
         })
     }
 }
@@ -293,11 +332,15 @@ struct WireToolFunction<'a> {
 #[derive(Deserialize)]
 struct WireChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Usage,
 }
 
 #[derive(Deserialize)]
 struct Choice {
     message: AssistantMessage,
+    #[serde(default)]
+    finish_reason: String,
 }
 
 #[derive(Deserialize)]

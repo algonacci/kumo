@@ -15,8 +15,8 @@ capabilities. Kamui remains an independent coding agent and does not need to kno
 ## Status
 
 Kumo currently provides a single-user Telegram bot backed by an OpenAI-compatible model provider,
-with workspace inspection and approval-gated command execution. Conversation history and mutation
-tools are not implemented yet.
+with persistent conversation sessions, workspace inspection, and approval-gated command execution.
+Mutation tools are not implemented yet.
 
 ## Onboarding
 
@@ -55,12 +55,19 @@ left empty for local OpenAI-compatible servers that do not require authenticatio
 
 ## Telegram commands
 
+- `/new` starts a fresh conversation while retaining the previous session in storage.
+- `/status` shows the active session, model, workspace, MCP status, usage, and database path.
 - `/model` shows the active model.
 - `/models` lists models discovered during onboarding.
 - `/model <id>` switches the active model and saves the choice.
 
-Normal text messages are sent to the active model. The current MVP treats every message as an
-independent request; conversation history will be added separately.
+Normal text messages continue the active session for that Telegram chat. Completed turns are stored
+in SQLite, including tool requests, tool results, and token usage. A session is created lazily only
+after the first complete answer is delivered. Failed or partially delivered turns are not stored.
+
+The database lives in the OS local data directory as `kumo/kumo.db`. Set `KUMO_DATA_DIR` to override
+the directory for containers or servers. Schema changes use sequential `PRAGMA user_version`
+migrations; Kumo refuses to open databases created by a newer unsupported version.
 
 ## Host tools
 

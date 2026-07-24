@@ -2,13 +2,15 @@ mod config;
 mod mcp;
 mod onboarding;
 mod provider;
+mod storage;
 mod tools;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use config::Config;
-use provider::{Message as ProviderMessage, Provider};
+use provider::{Message as ProviderMessage, Provider, Usage};
+use storage::Database;
 use teloxide::{
     dispatching::Dispatcher,
     payloads::SendMessageSetters,
@@ -23,6 +25,15 @@ struct AppState {
     config: Config,
     provider: Provider,
     tools: ToolRegistry,
+    mcp_statuses: Vec<String>,
+}
+
+struct AgentTurn {
+    answer: String,
+    record: Vec<ProviderMessage>,
+    usage: Usage,
+    finish_reason: String,
+    model: String,
 }
 
 const MAX_TOOL_ROUNDS: usize = 8;
@@ -72,6 +83,19 @@ async fn run_gateway(config: Config) -> Result<()> {
         .workspace
         .clone();
     let mcp = mcp::connect_all(&config.mcp).await;
+    let mcp_statuses = mcp
+        .statuses
+        .iter()
+        .map(|status| match &status.error {
+            Some(error) => format!("{}: failed ({error})", status.name),
+            None => format!(
+                "{}: {} tool(s){}",
+                status.name,
+                status.tool_count,
+                if status.trusted { " [trusted]" } else { "" }
+            ),
+        })
+        .collect::<Vec<_>>();
     for status in &mcp.statuses {
         match &status.error {
             Some(error) => println!("MCP {}: failed ({error})", status.name),
@@ -84,11 +108,14 @@ async fn run_gateway(config: Config) -> Result<()> {
         }
     }
     let tools = ToolRegistry::new(workspace, mcp.tools)?;
+    let database = Arc::new(Mutex::new(Database::open()?));
+    let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let state = Arc::new(RwLock::new(AppState {
         config,
         provider,
         tools,
+        mcp_statuses,
     }));
 
     let current = state.read().await;
@@ -115,8 +142,19 @@ async fn run_gateway(config: Config) -> Result<()> {
             move |bot: Bot,
                   message: Message,
                   state: Arc<RwLock<AppState>>,
-                  approvals: PendingApprovals| async move {
-                handle_message(bot, message, allowed_user_id, state, approvals).await
+                  approvals: PendingApprovals,
+                  database: Arc<Mutex<Database>>,
+                  turn_lock: Arc<Mutex<()>>| async move {
+                handle_message(
+                    bot,
+                    message,
+                    allowed_user_id,
+                    state,
+                    approvals,
+                    database,
+                    turn_lock,
+                )
+                .await
             },
         ))
         .branch(Update::filter_callback_query().endpoint(
@@ -125,7 +163,12 @@ async fn run_gateway(config: Config) -> Result<()> {
             },
         ));
     let mut dispatcher = Dispatcher::builder(bot, handler)
-        .dependencies(teloxide::dptree::deps![state, approvals.clone()])
+        .dependencies(teloxide::dptree::deps![
+            state,
+            approvals.clone(),
+            database,
+            turn_lock
+        ])
         .distribution_function(|_| None::<()>)
         .build();
     let shutdown_token = dispatcher.shutdown_token();
@@ -157,23 +200,44 @@ async fn handle_message(
     allowed_user_id: u64,
     state: Arc<RwLock<AppState>>,
     approvals: PendingApprovals,
-) -> ResponseResult<()> {
+    database: Arc<Mutex<Database>>,
+    turn_lock: Arc<Mutex<()>>,
+) -> Result<()> {
     let Some(user) = message.from.as_ref() else {
-        return respond(());
+        return Ok(());
     };
 
     let Some(text) = message.text() else {
-        return respond(());
+        return Ok(());
     };
     if user.id.0 != allowed_user_id {
-        return respond(());
+        return Ok(());
     }
+    let _turn_guard = turn_lock.lock().await;
 
     println!("Received a message from Telegram user {}", user.id.0);
+    if text == "/new" {
+        let cleared = database
+            .lock()
+            .await
+            .clear_active_session(message.chat.id.0)?;
+        let response = if cleared {
+            "Started a new conversation. Your previous history is still stored."
+        } else {
+            "There is no active conversation yet."
+        };
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/status" {
+        let response = status_message(&state, &database, message.chat.id.0).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if text == "/models" {
         let response = models_message(&state.read().await.config);
         bot.send_message(message.chat.id, response).await?;
-        return respond(());
+        return Ok(());
     }
     if text == "/model" {
         let active_model = state.read().await.provider.active_model().to_owned();
@@ -182,21 +246,32 @@ async fn handle_message(
             format!("Current model: {active_model}\n\nUse /models to list models or /model <id> to switch."),
         )
         .await?;
-        return respond(());
+        return Ok(());
     }
     if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
         let response = switch_model(&state, model).await;
         bot.send_message(message.chat.id, response).await?;
-        return respond(());
+        return Ok(());
     }
 
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
-    match run_agent(&bot, message.chat.id, &state, &approvals, text).await {
-        Ok(response) => {
-            for chunk in message_chunks(&response, 4000) {
+    let history = database
+        .lock()
+        .await
+        .load_active_messages(message.chat.id.0)?;
+    match run_agent(&bot, message.chat.id, &state, &approvals, history, text).await {
+        Ok(turn) => {
+            for chunk in message_chunks(&turn.answer, 4000) {
                 bot.send_message(message.chat.id, chunk).await?;
             }
+            database.lock().await.save_turn(
+                message.chat.id.0,
+                &turn.model,
+                &turn.record,
+                &turn.usage,
+                &turn.finish_reason,
+            )?;
         }
         Err(error) => {
             eprintln!("Model request failed: {error:#}");
@@ -208,7 +283,7 @@ async fn handle_message(
         }
     }
 
-    respond(())
+    Ok(())
 }
 
 async fn run_agent(
@@ -216,34 +291,53 @@ async fn run_agent(
     chat_id: ChatId,
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
+    history: Vec<ProviderMessage>,
     prompt: &str,
-) -> Result<String> {
-    let (provider, tool_definitions) = {
+) -> Result<AgentTurn> {
+    let (provider, tool_definitions, model) = {
         let state = state.read().await;
-        (state.provider.clone(), state.tools.definitions())
+        (
+            state.provider.clone(),
+            state.tools.definitions(),
+            state.provider.active_model().to_owned(),
+        )
     };
-    let mut messages = vec![
-        ProviderMessage::system(SYSTEM_PROMPT),
-        ProviderMessage::user(prompt),
-    ];
+    let user_message = ProviderMessage::user(prompt);
+    let mut messages = vec![ProviderMessage::system(SYSTEM_PROMPT)];
+    messages.extend(history);
+    messages.push(user_message.clone());
+    let mut trail = Vec::new();
+    let mut usage = Usage::default();
 
     for _ in 0..MAX_TOOL_ROUNDS {
         let response = provider.chat(&messages, &tool_definitions).await?;
+        accumulate_usage(&mut usage, &response.usage);
         if response.tool_calls.is_empty() {
             if response.content.trim().is_empty() {
                 bail!("provider returned an empty response");
             }
-            return Ok(response.content);
+            let assistant = ProviderMessage::assistant(response.content.clone());
+            let mut record = Vec::with_capacity(trail.len() + 2);
+            record.push(user_message);
+            record.append(&mut trail);
+            record.push(assistant);
+            return Ok(AgentTurn {
+                answer: response.content,
+                record,
+                usage,
+                finish_reason: response.finish_reason,
+                model,
+            });
         }
 
         println!(
             "Model requested {} tool call(s).",
             response.tool_calls.len()
         );
-        messages.push(ProviderMessage::tool_request(
-            response.content,
-            response.tool_calls.clone(),
-        ));
+        let request_message =
+            ProviderMessage::tool_request(response.content, response.tool_calls.clone());
+        messages.push(request_message.clone());
+        trail.push(request_message);
         for call in response.tool_calls {
             println!("Tool: {}", call.name);
             let tools = state.read().await.tools.clone();
@@ -260,11 +354,62 @@ async fn run_agent(
             } else {
                 tools.dispatch(&call).await
             };
-            messages.push(ProviderMessage::tool_result(call.id, output));
+            let result_message = ProviderMessage::tool_result(call.id, output);
+            messages.push(result_message.clone());
+            trail.push(result_message);
         }
     }
 
     bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
+}
+
+fn accumulate_usage(total: &mut Usage, usage: &Usage) {
+    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+}
+
+async fn status_message(
+    state: &RwLock<AppState>,
+    database: &Mutex<Database>,
+    chat_id: i64,
+) -> Result<String> {
+    let state = state.read().await;
+    let workspace = state
+        .config
+        .tools
+        .as_ref()
+        .expect("tools are configured before gateway startup")
+        .workspace
+        .display()
+        .to_string();
+    let model = state.provider.active_model().to_owned();
+    let mcp = if state.mcp_statuses.is_empty() {
+        "none".to_owned()
+    } else {
+        state.mcp_statuses.join("\n")
+    };
+    drop(state);
+
+    let database = database.lock().await;
+    let session = database.active_session(chat_id)?;
+    let session = match session {
+        Some(session) => format!(
+            "{} ({})\nMessages: {}\nRequests: {}\nTokens: {}",
+            session.title,
+            &session.id[..8],
+            session.message_count,
+            session.request_count,
+            session.total_tokens
+        ),
+        None => "none (created after the first successful reply)".to_owned(),
+    };
+    Ok(format!(
+        "Model: {model}\nWorkspace: {workspace}\nSession: {session}\nMCP:\n{mcp}\nDatabase: {}",
+        database.path().display()
+    ))
 }
 
 async fn request_approval(
@@ -322,30 +467,30 @@ async fn handle_approval_callback(
     query: CallbackQuery,
     allowed_user_id: u64,
     approvals: PendingApprovals,
-) -> ResponseResult<()> {
+) -> Result<()> {
     bot.answer_callback_query(query.id.clone()).await?;
     if query.from.id.0 != allowed_user_id {
-        return respond(());
+        return Ok(());
     }
     let Some(data) = query.data.as_deref() else {
-        return respond(());
+        return Ok(());
     };
     let Some(rest) = data.strip_prefix("approval:") else {
-        return respond(());
+        return Ok(());
     };
     let Some((nonce, decision)) = rest.rsplit_once(':') else {
-        return respond(());
+        return Ok(());
     };
     let approved = match decision {
         "allow" => true,
         "deny" => false,
-        _ => return respond(()),
+        _ => return Ok(()),
     };
 
     if let Some(sender) = approvals.lock().await.remove(nonce) {
         let _ = sender.send(approved);
     }
-    respond(())
+    Ok(())
 }
 
 fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
