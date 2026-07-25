@@ -14,6 +14,9 @@ use crate::{
 /// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
 /// a personal-assistant feature, not a precision timer, so this is a deliberate simplicity trade.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// A task more than this far past its `run_at` (e.g. Kumo was offline) is expired instead of run,
+/// since a reminder this late is unlikely to still be useful.
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Runs until the process exits; intended to be spawned once alongside the Telegram dispatcher.
 /// Shares `turn_lock` with `handle_message` so a scheduled task and an incoming message never run
@@ -42,8 +45,28 @@ async fn run_due_tasks(
     turn_lock: &Arc<Mutex<()>>,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let due = database.lock().await.due_scheduled_tasks(now)?;
 
+    // Tasks that missed their window by too long (e.g. Kumo was offline) are skipped rather than
+    // run late and silently; tell the owning chat why nothing happened at the scheduled time.
+    let stale = database
+        .lock()
+        .await
+        .expire_stale_scheduled_tasks(now, STALE_AFTER.as_secs() as i64)?;
+    for task in stale {
+        let chat_id = ChatId(task.telegram_chat_id);
+        let notice = format!(
+            "\u{26a0}\u{fe0f} A scheduled task missed its time by more than an hour and was skipped: \"{}\"",
+            task.prompt
+        );
+        if let Err(error) = bot.send_message(chat_id, notice).await {
+            eprintln!(
+                "Could not notify chat {chat_id} about expired task {}: {error:#}",
+                &task.id[..8]
+            );
+        }
+    }
+
+    let due = database.lock().await.claim_due_scheduled_tasks(now)?;
     for task in due {
         let _turn_guard = turn_lock.lock().await;
         let chat_id = ChatId(task.telegram_chat_id);
@@ -59,6 +82,16 @@ async fn run_due_tasks(
             Ok(()) => "completed",
             Err(error) => {
                 eprintln!("Scheduled task {} failed: {error:#}", &task.id[..8]);
+                let notice = format!(
+                    "\u{26a0}\u{fe0f} A scheduled task failed to run: \"{}\"\nError: {error:#}",
+                    task.prompt
+                );
+                if let Err(send_error) = bot.send_message(chat_id, notice).await {
+                    eprintln!(
+                        "Could not notify chat {chat_id} about failed task {}: {send_error:#}",
+                        &task.id[..8]
+                    );
+                }
                 "failed"
             }
         };

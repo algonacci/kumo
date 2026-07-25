@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 3;
+const CURRENT_VERSION: i64 = 4;
 
 pub struct Database {
     connection: Connection,
@@ -64,6 +64,9 @@ impl Database {
         }
         if version < 3 {
             migrate_to_v3(&connection)?;
+        }
+        if version < 4 {
+            migrate_to_v4(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -278,14 +281,21 @@ impl Database {
         Ok(id)
     }
 
-    /// Pending tasks whose `run_at` has passed, oldest first, ready to be dispatched.
-    pub fn due_scheduled_tasks(&self, now: i64) -> Result<Vec<ScheduledTask>> {
+    /// Mark `pending` tasks more than `stale_after` seconds past their `run_at` as `expired`
+    /// instead of dispatching them, and return the ones just expired (so the caller can tell the
+    /// user their reminder was skipped rather than silently dropping it).
+    pub fn expire_stale_scheduled_tasks(
+        &self,
+        now: i64,
+        stale_after: i64,
+    ) -> Result<Vec<ScheduledTask>> {
+        let cutoff = now - stale_after;
         let mut statement = self.connection.prepare(
             "SELECT id, telegram_chat_id, prompt, run_at FROM scheduled_tasks
-             WHERE status = 'pending' AND run_at <= ?1
+             WHERE status = 'pending' AND run_at < ?1
              ORDER BY run_at",
         )?;
-        let rows = statement.query_map([now], |row| {
+        let rows = statement.query_map([cutoff], |row| {
             Ok(ScheduledTask {
                 id: row.get(0)?,
                 telegram_chat_id: row.get(1)?,
@@ -293,11 +303,60 @@ impl Database {
                 run_at: row.get(3)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let stale = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for task in &stale {
+            self.connection.execute(
+                "UPDATE scheduled_tasks SET status = 'expired' WHERE id = ?1",
+                [&task.id],
+            )?;
+        }
+        Ok(stale)
     }
 
-    /// Mark a task's terminal outcome so it is never picked up again by `due_scheduled_tasks`.
+    /// Atomically claim every `pending` task whose `run_at` has passed by moving it straight to
+    /// `running` and returning it, oldest first. Claiming (rather than a plain read) means a crash
+    /// mid-run leaves the task `running`, not `pending`, so a restart does not dispatch it a second
+    /// time; `reset_stuck_running_tasks` is what recovers a task stuck there by a hard crash.
+    pub fn claim_due_scheduled_tasks(&mut self, now: i64) -> Result<Vec<ScheduledTask>> {
+        let transaction = self.connection.transaction()?;
+        let due = {
+            let mut statement = transaction.prepare(
+                "SELECT id, telegram_chat_id, prompt, run_at FROM scheduled_tasks
+                 WHERE status = 'pending' AND run_at <= ?1
+                 ORDER BY run_at",
+            )?;
+            let rows = statement.query_map([now], |row| {
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    telegram_chat_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    run_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for task in &due {
+            transaction.execute(
+                "UPDATE scheduled_tasks SET status = 'running' WHERE id = ?1",
+                [&task.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(due)
+    }
+
+    /// On startup, any task still `running` was interrupted mid-execution by a crash or a hard
+    /// kill (a graceful shutdown never leaves one in this state, since `claim_due_scheduled_tasks`
+    /// and `complete_scheduled_task` bracket every run). Reset it to `pending` so the scheduler
+    /// picks it up again instead of losing it.
+    pub fn reset_stuck_running_tasks(&self) -> Result<usize> {
+        Ok(self.connection.execute(
+            "UPDATE scheduled_tasks SET status = 'pending' WHERE status = 'running'",
+            [],
+        )?)
+    }
+
+    /// Mark a claimed task's terminal outcome so it is never picked up again.
     pub fn complete_scheduled_task(&self, id: &str, status: &str) -> Result<()> {
         self.connection.execute(
             "UPDATE scheduled_tasks SET status = ?2 WHERE id = ?1",
@@ -373,6 +432,34 @@ fn migrate_to_v3(connection: &Connection) -> Result<()> {
          );
          CREATE INDEX scheduled_tasks_due ON scheduled_tasks(status, run_at);
          PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// SQLite cannot alter a CHECK constraint in place, so this rebuilds `scheduled_tasks` with two
+/// additional terminal/in-flight statuses: `running` (claimed by a poll cycle, so a crash mid-run
+/// does not cause a duplicate execution on restart) and `expired` (too far past `run_at` to still
+/// be worth running; see `due_scheduled_tasks`'s staleness cutoff).
+fn migrate_to_v4(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE scheduled_tasks_v4 (
+             id TEXT PRIMARY KEY,
+             telegram_chat_id INTEGER NOT NULL,
+             prompt TEXT NOT NULL,
+             run_at INTEGER NOT NULL,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             status TEXT NOT NULL
+                 CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled', 'expired'))
+                 DEFAULT 'pending'
+         );
+         INSERT INTO scheduled_tasks_v4 (id, telegram_chat_id, prompt, run_at, created_at, status)
+             SELECT id, telegram_chat_id, prompt, run_at, created_at, status FROM scheduled_tasks;
+         DROP TABLE scheduled_tasks;
+         ALTER TABLE scheduled_tasks_v4 RENAME TO scheduled_tasks;
+         CREATE INDEX scheduled_tasks_due ON scheduled_tasks(status, run_at);
+         PRAGMA user_version = 4;
          COMMIT;",
     )?;
     Ok(())
@@ -577,8 +664,8 @@ mod tests {
     }
 
     #[test]
-    fn due_scheduled_tasks_returns_only_pending_tasks_at_or_before_now() {
-        let database = database();
+    fn claim_due_scheduled_tasks_returns_only_pending_tasks_at_or_before_now() {
+        let mut database = database();
         let past = database
             .create_scheduled_task(42, "check the weather", 100)
             .unwrap();
@@ -586,7 +673,7 @@ mod tests {
             .create_scheduled_task(42, "check it later", 1_000_000)
             .unwrap();
 
-        let due = database.due_scheduled_tasks(500).unwrap();
+        let due = database.claim_due_scheduled_tasks(500).unwrap();
 
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, past);
@@ -595,25 +682,118 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_task_prevents_it_being_claimed_again() {
+        let mut database = database();
+        database.create_scheduled_task(42, "ping me", 100).unwrap();
+
+        let first_claim = database.claim_due_scheduled_tasks(500).unwrap();
+        let second_claim = database.claim_due_scheduled_tasks(500).unwrap();
+
+        assert_eq!(first_claim.len(), 1);
+        assert!(
+            second_claim.is_empty(),
+            "a claimed (running) task must not be claimed a second time"
+        );
+    }
+
+    #[test]
     fn completed_tasks_are_not_returned_as_due_again() {
-        let database = database();
+        let mut database = database();
         let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
 
         database.complete_scheduled_task(&id, "completed").unwrap();
 
-        assert!(database.due_scheduled_tasks(500).unwrap().is_empty());
+        assert!(database.claim_due_scheduled_tasks(500).unwrap().is_empty());
     }
 
     #[test]
-    fn migration_to_v3_adds_the_scheduled_tasks_table() {
+    fn expire_stale_scheduled_tasks_skips_tasks_past_the_grace_period() {
+        let database = database();
+        let stale = database
+            .create_scheduled_task(42, "long overdue", 100)
+            .unwrap();
+        let fresh = database.create_scheduled_task(42, "just due", 950).unwrap();
+
+        // now=1000, stale_after=100: "long overdue" (run_at=100) is 900s late, past the grace
+        // period; "just due" (run_at=950) is only 50s late, still within it.
+        let expired = database.expire_stale_scheduled_tasks(1000, 100).unwrap();
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, stale);
+        assert_ne!(expired[0].id, fresh);
+    }
+
+    #[test]
+    fn an_expired_task_is_never_claimed() {
+        let mut database = database();
+        database
+            .create_scheduled_task(42, "long overdue", 100)
+            .unwrap();
+
+        database.expire_stale_scheduled_tasks(1000, 100).unwrap();
+
+        assert!(database.claim_due_scheduled_tasks(1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_stuck_running_tasks_returns_running_tasks_to_pending() {
+        let mut database = database();
+        database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database.claim_due_scheduled_tasks(500).unwrap();
+
+        let reset_count = database.reset_stuck_running_tasks().unwrap();
+
+        assert_eq!(reset_count, 1);
+        // Now pending again, so it can be claimed once more.
+        assert_eq!(database.claim_due_scheduled_tasks(500).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reset_stuck_running_tasks_leaves_completed_tasks_alone() {
+        let mut database = database();
+        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database.claim_due_scheduled_tasks(500).unwrap();
+        database.complete_scheduled_task(&id, "completed").unwrap();
+
+        assert_eq!(database.reset_stuck_running_tasks().unwrap(), 0);
+    }
+
+    #[test]
+    fn migration_to_v4_adds_the_scheduled_tasks_table_with_running_and_expired_statuses() {
         let connection = Connection::open_in_memory().unwrap();
         migrate_to_v1(&connection).unwrap();
         migrate_to_v2(&connection).unwrap();
         migrate_to_v3(&connection).unwrap();
+        migrate_to_v4(&connection).unwrap();
 
-        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        let mut database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
         let id = database.create_scheduled_task(1, "test", 0).unwrap();
 
-        assert_eq!(database.due_scheduled_tasks(0).unwrap()[0].id, id);
+        let claimed = database.claim_due_scheduled_tasks(0).unwrap();
+        assert_eq!(claimed[0].id, id);
+        // The claim moved the row to 'running', which the CHECK constraint added in v4 must allow.
+        database.complete_scheduled_task(&id, "expired").unwrap();
+    }
+
+    #[test]
+    fn migration_to_v4_preserves_existing_scheduled_tasks() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        migrate_to_v2(&connection).unwrap();
+        migrate_to_v3(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO scheduled_tasks (id, telegram_chat_id, prompt, run_at)
+                 VALUES ('t1', 42, 'legacy task', 100)",
+                [],
+            )
+            .unwrap();
+
+        migrate_to_v4(&connection).unwrap();
+
+        let mut database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        let due = database.claim_due_scheduled_tasks(500).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].prompt, "legacy task");
     }
 }

@@ -119,7 +119,17 @@ usual 2-minute approval window) for the owner to respond.
 A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
 incoming messages, so a scheduled task and a live conversation never run their agent loops at the
 same time. Scheduling itself is a plain SQLite row — no separate process or external scheduler is
-required.
+required, and a task survives a Kumo restart: it stays in the database and is picked up on the next
+poll after Kumo comes back up.
+
+If Kumo was offline (or otherwise didn't poll in time) and a task is found more than an hour past its
+scheduled time, it is skipped rather than run late — the chat gets a short notice explaining the
+reminder was missed, instead of either staying silent or firing hours late with no explanation. A
+task that is claimed for execution moves to a `running` state before it starts, so a hard crash or
+`kill -9` mid-run cannot cause it to be dispatched twice; on the next startup, any task still stuck in
+`running` (only possible after such a crash — a clean shutdown never leaves one there) is reset back
+to pending. A task that fails while running (a provider error, an unreachable MCP server, and so on)
+is reported to the chat with the error, not just logged to the terminal.
 
 ## MCP servers
 

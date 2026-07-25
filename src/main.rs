@@ -110,7 +110,12 @@ async fn run_gateway(config: Config) -> Result<()> {
             ),
         }
     }
-    let database = Arc::new(Mutex::new(Database::open()?));
+    let database = Database::open()?;
+    let reset_count = database.reset_stuck_running_tasks()?;
+    if reset_count > 0 {
+        println!("Recovered {reset_count} scheduled task(s) interrupted by a previous shutdown.");
+    }
+    let database = Arc::new(Mutex::new(database));
     let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?;
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));

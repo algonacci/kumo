@@ -735,7 +735,7 @@ mod tests {
         let due = database
             .lock()
             .await
-            .due_scheduled_tasks(next_year.timestamp() + 1)
+            .claim_due_scheduled_tasks(next_year.timestamp() + 1)
             .unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].prompt, "check the weather");

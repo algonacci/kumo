@@ -78,6 +78,12 @@ it would compress `run_command` output before it reaches the model, nothing more
 - [x] `schedule_task` tool: one-shot future prompt, run through the same agent loop
 - [x] Timezone-aware scheduling (onboarding asks for an IANA timezone, stored in `kumo.toml`)
 - [x] Background scheduler polling loop, sharing the turn lock with live messages
+- [x] Survives a restart: tasks live in SQLite, not memory, and are picked up on the next poll
+- [x] Stale tasks (missed by more than an hour, e.g. Kumo was offline) are skipped with a notice
+      instead of run late silently
+- [x] Atomic claim (`pending` → `running`) so a crash mid-run cannot double-dispatch a task, plus
+      startup recovery for any task a hard crash left stuck in `running`
+- [x] A failed task notifies the chat with the error, not just the terminal log
 - [ ] Recurring tasks (daily/weekly), not just one-shot
 - [ ] A way to list or cancel a pending scheduled task from Telegram
 
@@ -88,22 +94,41 @@ expected because `run_agent` already took no Telegram-specific state as input (`
 (`src/scheduler.rs`) can call the exact same function a live message does; no second code path for
 "answering a prompt" was needed.
 
-A `scheduled_tasks` SQLite table (`user_version = 3`) holds one-shot rows: `telegram_chat_id`,
-`prompt`, `run_at` (unix seconds), and a `status` that starts `pending` and ends `completed` or
-`failed`. The model requests a schedule via the `schedule_task` tool, passing an RFC 3339 timestamp
-with a UTC offset that it computes from the current date/time and the user's configured timezone,
-both given in the system prompt; Kumo validates the timestamp is in the future and less than a year
-out (a sanity bound against a misparsed year) before persisting it. Scheduling itself does not
-require approval — recording a future intent is not a side effect — but when the task actually runs,
-any tool it requests that needs confirmation (`run_command`, an untrusted MCP tool) still goes
-through the normal Telegram Allow once/Deny flow with the same 2-minute timeout, so an unattended run
-can still wait for the owner rather than silently doing something irreversible.
+A `scheduled_tasks` SQLite table holds one-shot rows: `telegram_chat_id`, `prompt`, `run_at` (unix
+seconds), and a `status` that starts `pending` and ends in one of `completed`, `failed`, `cancelled`,
+or `expired`. The model requests a schedule via the `schedule_task` tool, passing an RFC 3339
+timestamp with a UTC offset that it computes from the current date/time and the user's configured
+timezone, both given in the system prompt; Kumo validates the timestamp is in the future and less
+than a year out (a sanity bound against a misparsed year) before persisting it. Scheduling itself
+does not require approval — recording a future intent is not a side effect — but when the task
+actually runs, any tool it requests that needs confirmation (`run_command`, an untrusted MCP tool)
+still goes through the normal Telegram Allow once/Deny flow with the same 2-minute timeout, so an
+unattended run can still wait for the owner rather than silently doing something irreversible.
 
 The scheduler polls every 30 seconds and takes the same `turn_lock` mutex as incoming messages, so a
 scheduled task's agent loop and a live conversation's agent loop never interleave. Timezone support
 (`chrono-tz`, `Config::timezone()`, falling back to UTC for installs from before this field existed)
 exists specifically to make "in 2 minutes" or "tomorrow at 9am" resolve correctly without the model
 having to guess an offset.
+
+Because a task lives in SQLite rather than an in-process timer, it survives a restart by
+construction — the row is just still `pending` next time Kumo polls. That raised two questions a
+pure in-memory scheduler wouldn't have to answer, both addressed in a `user_version = 4` migration
+that widened the `status` CHECK constraint to add `running` and `expired`:
+
+- **How late is too late?** If Kumo is offline for hours, a task's `run_at` can be arbitrarily far in
+  the past by the time polling resumes. `expire_stale_scheduled_tasks` marks anything more than an
+  hour past due as `expired` instead of dispatching it, and the scheduler sends the owning chat a
+  short notice explaining the reminder was skipped — better than either silence or a reminder firing
+  hours late with no context.
+- **What if Kumo crashes mid-task?** A plain read-then-execute-then-write has a window where a hard
+  kill (`kill -9`, an OOM, a host reboot) leaves a task `pending` after it already partially ran, so
+  a naive restart would run it again. `claim_due_scheduled_tasks` closes that window by moving a task
+  straight from `pending` to `running` in the same transaction it reads it, so a normal restart never
+  sees it as claimable a second time. The only way a task can be left `running` is exactly that kind
+  of hard crash (an orderly shutdown always reaches `complete_scheduled_task`), so
+  `reset_stuck_running_tasks` runs once at startup to put any such task back to `pending` rather than
+  lose it permanently.
 
 What is intentionally out of scope for now: recurring schedules (a `repeat_interval` column would be
 the natural extension, but one-shot covers the common "remind me" case first) and any Telegram UI to
