@@ -137,18 +137,33 @@ tasks at all. Both are reasonable follow-ups once one-shot scheduling sees real 
 
 ## Phase 4: Session and Approval Quality
 
-- [ ] `/sessions` — list saved sessions for the current chat
-- [ ] `/resume <id>` — switch the active session back to a past one
-- [ ] `/delete <id>` — delete a saved session
+- [x] `/sessions` — list saved sessions for the current chat
+- [x] `/resume <id>` — switch the active session back to a past one
+- [x] `/delete <id>` — delete a saved session
 - [ ] Per-session "always allow this command" opt-in, distinct from per-server MCP trust
 - [ ] Typing/progress feedback during long tool rounds (Kumo sends one `ChatAction::Typing` and then
       goes silent until the final answer)
 
-Kumo already stores every session in SQLite and multiplexes one *active* session per Telegram chat,
-but there is no user-facing way to see or return to a session that `/new` has retired — the rows sit
-in the database with no command to list or resume them. This is a smaller, lower-risk change than
-Phase 2: it is a read/update path over an existing schema (`sessions`, `active_sessions`), not a new
-tool or permission surface. Bring the UX in line with Kamui's `/sessions`, `/resume`, `/delete` triad.
+Kumo already stored every session in SQLite and multiplexed one *active* session per Telegram chat,
+but there was no user-facing way to see or return to a session that `/new` had retired — the rows sat
+in the database with no command to list or resume them. This was exactly the smaller, lower-risk
+change it was expected to be: a read/update path over the existing `sessions`/`active_sessions`
+schema, not a new tool or permission surface, bringing the UX in line with Kamui's `/sessions`,
+`/resume`, `/delete` triad.
+
+`list_sessions(chat_id)` (`src/storage.rs`) scopes the listing to the requesting chat and, like
+Kamui's version, omits a session with no messages yet (a `/new` that was never followed by a
+completed turn). `find_session_by_prefix(chat_id, prefix)` resolves an ID prefix the same way
+Kamui's `find_session` does — `None` for both "no match" and "ambiguous prefix," reported identically
+to the user — but scoped to `chat_id` as well, so a prefix that happens to match another chat's
+session id never resolves; each Telegram chat can only see, resume, or delete its own sessions.
+`/resume <id>` calls `set_active_session`, which is a plain upsert into `active_sessions` (the same
+row `/new` and a completed turn already write), so resuming an older session works identically to
+however that chat's active session normally gets set — no separate code path for "returning to" a
+session versus continuing the current one. `/delete <id>` removes the `sessions` row and relies on
+the `ON DELETE CASCADE` already in place on `messages`, `usage_records`, and `active_sessions` (in
+place since the schema's first migration) to clean up everything that referenced it, including
+clearing the chat's active-session pointer if the deleted session happened to be the active one.
 
 The approval flow is currently "allow once" for every single confirmable call, with no way to say
 "allow this exact command for the rest of the session" short of marking an entire MCP server

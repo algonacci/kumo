@@ -58,9 +58,17 @@ left empty for local OpenAI-compatible servers that do not require authenticatio
 
 - `/new` starts a fresh conversation while retaining the previous session in storage.
 - `/status` shows the active session, model, workspace, MCP status, usage, and database path.
+- `/sessions` lists every saved session for this chat, newest first, marking the active one.
+- `/resume <id>` switches the active session back to a previous one, identified by an unambiguous
+  ID prefix (as shown by `/sessions`).
+- `/delete <id>` permanently deletes a session and its messages.
 - `/model` shows the active model.
 - `/models` lists models discovered during onboarding.
 - `/model <id>` switches the active model and saves the choice.
+
+Session IDs are scoped to the Telegram chat they belong to, so `/resume` and `/delete` can only act
+on a session that chat itself created — a prefix that happens to match another chat's session ID
+resolves to nothing.
 
 Normal text messages continue the active session for that Telegram chat. Completed turns are stored
 in SQLite, including tool requests, tool results, and token usage. A session is created lazily only

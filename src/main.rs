@@ -251,6 +251,21 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if text == "/sessions" {
+        let response = sessions_message(&database, message.chat.id.0).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(id_prefix) = text.strip_prefix("/resume ").map(str::trim) {
+        let response = resume_session(&database, message.chat.id.0, id_prefix).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(id_prefix) = text.strip_prefix("/delete ").map(str::trim) {
+        let response = delete_session(&database, message.chat.id.0, id_prefix).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if text == "/models" {
         let response = models_message(&state.read().await.config);
         bot.send_message(message.chat.id, response).await?;
@@ -481,6 +496,91 @@ async fn status_message(
     ))
 }
 
+/// List every saved session for this chat, newest first, marking the active one. `/new` only
+/// detaches the active pointer — it never deletes a session — so this is how a retired session
+/// becomes visible and resumable again.
+async fn sessions_message(database: &Mutex<Database>, chat_id: i64) -> Result<String> {
+    let database = database.lock().await;
+    let sessions = database.list_sessions(chat_id)?;
+    if sessions.is_empty() {
+        return Ok("No saved sessions yet.".to_owned());
+    }
+    let active_id = database.active_session(chat_id)?.map(|session| session.id);
+
+    let mut lines = vec!["Saved sessions:".to_owned()];
+    for session in &sessions {
+        let marker = if active_id.as_deref() == Some(session.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        lines.push(format!(
+            "{marker} {}  {}  {:<40}  {} messages",
+            &session.id[..8],
+            format_timestamp(session.updated_at),
+            truncate(&session.title, 40),
+            session.message_count,
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Use /resume <id> to switch, or /delete <id> to remove one.".to_owned());
+    Ok(lines.join("\n"))
+}
+
+/// Switch this chat's active session to a previously saved one, identified by an unambiguous ID
+/// prefix scoped to this chat (so one chat cannot resume another chat's session by guessing).
+async fn resume_session(
+    database: &Mutex<Database>,
+    chat_id: i64,
+    id_prefix: &str,
+) -> Result<String> {
+    if id_prefix.is_empty() {
+        return Ok("Usage: /resume <id>. Use /sessions to list saved sessions.".to_owned());
+    }
+    let database = database.lock().await;
+    let Some(session_id) = database.find_session_by_prefix(chat_id, id_prefix)? else {
+        return Ok(format!(
+            "No session matches '{id_prefix}', or the prefix is ambiguous. Use /sessions to list saved sessions."
+        ));
+    };
+    database.set_active_session(chat_id, &session_id)?;
+    Ok(format!("Resumed session {}.", &session_id[..8]))
+}
+
+/// Permanently delete a saved session (and, via cascade, its messages and usage records),
+/// identified the same way as `/resume`.
+async fn delete_session(
+    database: &Mutex<Database>,
+    chat_id: i64,
+    id_prefix: &str,
+) -> Result<String> {
+    if id_prefix.is_empty() {
+        return Ok("Usage: /delete <id>. Use /sessions to list saved sessions.".to_owned());
+    }
+    let database = database.lock().await;
+    let Some(session_id) = database.find_session_by_prefix(chat_id, id_prefix)? else {
+        return Ok(format!(
+            "No session matches '{id_prefix}', or the prefix is ambiguous. Use /sessions to list saved sessions."
+        ));
+    };
+    database.delete_session(&session_id)?;
+    Ok(format!("Deleted session {}.", &session_id[..8]))
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    let mut result: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        result.push('\u{2026}');
+    }
+    result
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown time".to_owned())
+}
+
 async fn request_approval(
     bot: &Bot,
     chat_id: ChatId,
@@ -679,5 +779,140 @@ mod tests {
     #[test]
     fn splits_long_unicode_messages_without_corruption() {
         assert_eq!(message_chunks("abé日", 2), vec!["ab", "é日"]);
+    }
+
+    #[test]
+    fn truncate_appends_ellipsis_only_when_needed() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 5), "hello\u{2026}");
+    }
+
+    #[test]
+    fn format_timestamp_renders_a_readable_date() {
+        // 2024-01-15T10:30:00Z
+        assert_eq!(format_timestamp(1_705_314_600), "2024-01-15 10:30");
+    }
+
+    #[tokio::test]
+    async fn sessions_message_reports_no_sessions_when_chat_is_empty() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        assert_eq!(
+            sessions_message(&database, 42).await.unwrap(),
+            "No saved sessions yet."
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_marks_the_active_session() {
+        let mut db = Database::open_in_memory_for_tests();
+        let id = db
+            .save_turn(
+                42,
+                "model-a",
+                &[
+                    ProviderMessage::user("hi"),
+                    ProviderMessage::assistant("hello"),
+                ],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        let database = Mutex::new(db);
+
+        let response = sessions_message(&database, 42).await.unwrap();
+
+        assert!(response.contains(&id[..8]));
+        assert!(
+            response.contains('*'),
+            "the only session should be marked active"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_reports_usage_on_an_empty_argument() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        let response = resume_session(&database, 42, "").await.unwrap();
+        assert!(response.starts_with("Usage:"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_reports_no_match_for_an_unknown_prefix() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        let response = resume_session(&database, 42, "nope").await.unwrap();
+        assert!(response.contains("No session matches"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_switches_the_active_session() {
+        let mut db = Database::open_in_memory_for_tests();
+        let first = db
+            .save_turn(
+                42,
+                "model-a",
+                &[
+                    ProviderMessage::user("first"),
+                    ProviderMessage::assistant("a"),
+                ],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        db.clear_active_session(42).unwrap();
+        db.save_turn(
+            42,
+            "model-a",
+            &[
+                ProviderMessage::user("second"),
+                ProviderMessage::assistant("a"),
+            ],
+            &Usage::default(),
+            "stop",
+        )
+        .unwrap();
+        let database = Mutex::new(db);
+
+        let response = resume_session(&database, 42, &first[..8]).await.unwrap();
+
+        assert!(response.contains(&first[..8]));
+        assert_eq!(
+            database
+                .lock()
+                .await
+                .active_session(42)
+                .unwrap()
+                .unwrap()
+                .id,
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_reports_usage_on_an_empty_argument() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        let response = delete_session(&database, 42, "").await.unwrap();
+        assert!(response.starts_with("Usage:"));
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_a_resolved_session() {
+        let mut db = Database::open_in_memory_for_tests();
+        let id = db
+            .save_turn(
+                42,
+                "model-a",
+                &[
+                    ProviderMessage::user("hi"),
+                    ProviderMessage::assistant("hello"),
+                ],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        let database = Mutex::new(db);
+
+        let response = delete_session(&database, 42, &id[..8]).await.unwrap();
+
+        assert!(response.contains(&id[..8]));
+        assert!(database.lock().await.list_sessions(42).unwrap().is_empty());
     }
 }

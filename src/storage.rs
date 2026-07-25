@@ -36,6 +36,13 @@ pub struct ScheduledTask {
     pub run_at: i64,
 }
 
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub message_count: i64,
+    pub updated_at: i64,
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let directory = data_dir()?;
@@ -229,6 +236,69 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Every session that has at least one message, scoped to `chat_id` and newest first. A
+    /// session created but never completed (no message saved yet) is omitted, matching how a
+    /// brand-new "New chat" is invisible until its first successful turn.
+    pub fn list_sessions(&self, chat_id: i64) -> Result<Vec<SessionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.title, (SELECT COUNT(*) FROM messages WHERE session_id = s.id), s.updated_at
+             FROM sessions s
+             WHERE s.telegram_chat_id = ?1 AND EXISTS (SELECT 1 FROM messages WHERE session_id = s.id)
+             ORDER BY s.updated_at DESC, s.rowid DESC",
+        )?;
+        let rows = statement.query_map([chat_id], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                message_count: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Resolve an unambiguous ID prefix to a full session ID, scoped to `chat_id` so one chat
+    /// cannot resume or delete another chat's session by guessing a prefix. `None` covers both "no
+    /// match" and "ambiguous prefix" — the caller reports both the same way, as Kamui's
+    /// `find_session` does.
+    pub fn find_session_by_prefix(&self, chat_id: i64, id_prefix: &str) -> Result<Option<String>> {
+        let pattern = format!("{id_prefix}%");
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM sessions WHERE telegram_chat_id = ?1 AND id LIKE ?2
+             ORDER BY updated_at DESC LIMIT 2",
+        )?;
+        let ids = statement
+            .query_map(params![chat_id, pattern], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(if ids.len() == 1 {
+            ids.into_iter().next()
+        } else {
+            None
+        })
+    }
+
+    /// Point `chat_id`'s active session at an existing session (used by `/resume`). The caller is
+    /// responsible for having resolved `session_id` via `find_session_by_prefix` first, so this
+    /// never silently activates a session belonging to a different chat.
+    pub fn set_active_session(&self, chat_id: i64, session_id: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO active_sessions (telegram_chat_id, session_id) VALUES (?1, ?2)
+             ON CONFLICT(telegram_chat_id) DO UPDATE SET session_id = excluded.session_id",
+            params![chat_id, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a session and, via `ON DELETE CASCADE`, its messages and usage records. If it was
+    /// the active session for some chat, `active_sessions` cascades away too, leaving that chat
+    /// with no active session (the same state `/new` produces).
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+        Ok(())
     }
 
     fn active_session_id(&self, chat_id: i64) -> Result<Option<String>> {
@@ -595,6 +665,129 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old_count, 2);
+    }
+
+    #[test]
+    fn list_sessions_returns_only_completed_sessions_newest_first_and_scoped_to_chat() {
+        let mut database = database();
+        let first = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("first"), Message::assistant("answer")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        database.clear_active_session(42).unwrap();
+        let second = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("second"), Message::assistant("answer")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        // A session for a different chat must never leak into chat 42's list.
+        database
+            .save_turn(
+                99,
+                "model-a",
+                &[Message::user("other chat"), Message::assistant("answer")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+
+        let sessions = database.list_sessions(42).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions[0].id, second,
+            "newest session should be listed first"
+        );
+        assert_eq!(sessions[1].id, first);
+        assert!(sessions.iter().all(|session| session.message_count == 2));
+    }
+
+    #[test]
+    fn find_session_by_prefix_resolves_an_unambiguous_prefix_scoped_to_chat() {
+        let mut database = database();
+        let id = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("hi"), Message::assistant("hello")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+
+        assert_eq!(
+            database.find_session_by_prefix(42, &id[..8]).unwrap(),
+            Some(id.clone())
+        );
+        // Same prefix, wrong chat: must not resolve.
+        assert_eq!(database.find_session_by_prefix(99, &id[..8]).unwrap(), None);
+        assert_eq!(database.find_session_by_prefix(42, "nope").unwrap(), None);
+    }
+
+    #[test]
+    fn resume_switches_the_active_session_without_deleting_the_previous_one() {
+        let mut database = database();
+        let first = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("first"), Message::assistant("answer")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        database.clear_active_session(42).unwrap();
+        database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("second"), Message::assistant("answer")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+
+        database.set_active_session(42, &first).unwrap();
+
+        assert_eq!(database.active_session(42).unwrap().unwrap().id, first);
+        assert_eq!(database.list_sessions(42).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_session_removes_it_and_its_messages() {
+        let mut database = database();
+        let id = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("hi"), Message::assistant("hello")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+
+        database.delete_session(&id).unwrap();
+
+        assert!(database.list_sessions(42).unwrap().is_empty());
+        assert!(database.active_session(42).unwrap().is_none());
+        let message_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 0);
     }
 
     #[test]
