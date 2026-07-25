@@ -522,7 +522,7 @@ impl ToolRegistry {
 
 /// Whether the `kamui` binary is reachable on `PATH`. Detected once per process; delegation is an
 /// optional capability, never a requirement for Kumo's built-in tools.
-fn kamui_available() -> bool {
+pub fn kamui_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         std::process::Command::new("kamui")

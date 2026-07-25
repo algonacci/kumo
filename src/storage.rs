@@ -47,6 +47,12 @@ pub struct MemoryEntry {
     pub content: String,
 }
 
+pub struct StorageSummary {
+    pub session_count: i64,
+    pub pending_scheduled_tasks: i64,
+    pub memory_entries: i64,
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let directory = data_dir()?;
@@ -382,6 +388,29 @@ impl Database {
     /// Delete every memory entry (used by the `/forget all` Telegram command).
     pub fn clear_memory(&self) -> Result<usize> {
         Ok(self.connection.execute("DELETE FROM memory", [])?)
+    }
+
+    /// Database-wide counts for `kumo status`, independent of any single chat.
+    pub fn storage_summary(&self) -> Result<StorageSummary> {
+        let session_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE EXISTS
+                (SELECT 1 FROM messages WHERE session_id = sessions.id)",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_scheduled_tasks = self.connection.query_row(
+            "SELECT COUNT(*) FROM scheduled_tasks WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let memory_entries =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM memory", [], |row| row.get(0))?;
+        Ok(StorageSummary {
+            session_count,
+            pending_scheduled_tasks,
+            memory_entries,
+        })
     }
 
     fn active_session_id(&self, chat_id: i64) -> Result<Option<String>> {
@@ -1201,5 +1230,40 @@ mod tests {
         let due = database.claim_due_scheduled_tasks(500).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].prompt, "legacy task");
+    }
+
+    #[test]
+    fn storage_summary_counts_sessions_pending_tasks_and_memory() {
+        let mut database = database();
+        database
+            .save_turn(
+                42,
+                "model",
+                &[Message::user("hi")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        // An untouched session (no messages saved yet) must not be counted.
+        database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database.remember("a fact").unwrap();
+
+        let summary = database.storage_summary().unwrap();
+
+        assert_eq!(summary.session_count, 1);
+        assert_eq!(summary.pending_scheduled_tasks, 1);
+        assert_eq!(summary.memory_entries, 1);
+    }
+
+    #[test]
+    fn storage_summary_excludes_completed_scheduled_tasks() {
+        let database = database();
+        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database.complete_scheduled_task(&id, "completed").unwrap();
+
+        assert_eq!(
+            database.storage_summary().unwrap().pending_scheduled_tasks,
+            0
+        );
     }
 }

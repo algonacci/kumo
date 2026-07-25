@@ -54,6 +54,27 @@ The bot token and provider API key are stored in the user's global `kumo.toml`. 
 restricts this file to the current user (`0600`). Never publish or commit this file. API keys may be
 left empty for local OpenAI-compatible servers that do not require authentication.
 
+## CLI commands
+
+Two commands check on Kumo without going through Telegram at all, useful when you're at the
+terminal (over SSH, in a script) rather than the bot itself:
+
+```sh
+cargo run -- status
+cargo run -- doctor
+```
+
+`status` reads the config file and local database directly and prints a summary — active model,
+workspace, timezone, configured MCP servers, database path, session count, pending scheduled
+tasks, and remembered facts. It makes no network calls and does not connect to Telegram, the model
+provider, or any MCP server.
+
+`doctor` is the opposite: it actively checks that things work, not just that they're configured.
+It parses the config, sends a real test request to the model provider, connects to every
+configured MCP server, checks for the optional `kamui` binary on `PATH`, and opens the database —
+printing a ✓ or ✗ line for each with an actionable message on failure. It exits with a non-zero
+status if anything failed, so it's usable as a pre-flight check in a script.
+
 ## Telegram commands
 
 - `/new` starts a fresh conversation while retaining the previous session in storage.

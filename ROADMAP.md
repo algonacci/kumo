@@ -287,6 +287,33 @@ question open — if so, the text answers it instead of starting a new turn, sin
 question is not itself a new turn (the turn that asked it is already in progress, waiting on this
 very answer).
 
+## Phase 4e: Operator CLI Commands
+
+- [x] `kumo status` — read-only summary from config and the local database, no network calls
+- [x] `kumo doctor` — active checks (provider request, MCP connections) with pass/fail output and
+      a non-zero exit on failure
+
+This followed a survey of OpenClaw's CLI (`docs.openclaw.ai/cli`), which ships a large surface of
+subcommands (`gateway`, `agents`, `channels`, `plugins`, `sandbox`, `nodes`, `dashboard`, and more)
+aimed at multi-user or distributed deployments. Almost none of it fit Kumo: `gateway start/stop`
+duplicates what the OS's own process supervisor (systemd, launchd) already does for a single
+process; `logs` duplicates redirecting stdout or `journalctl`; `config get/set` duplicates editing
+`kumo.toml` directly, which is already meant to be hand-edited; `models list` and `message send`
+duplicate the existing `/models` and normal chat through Telegram. Adding CLI equivalents for any
+of these would be a second, redundant interface for something Kumo (or the OS) already does.
+
+`status` and `doctor` were the two commands that didn't have an existing equivalent: checking on
+Kumo *without* going through Telegram — useful when you're at a terminal (SSH, a script) rather
+than the bot — wasn't possible at all before this. They intentionally do different jobs: `status`
+answers "what is Kumo configured to do" (a read of config and `storage_summary`, a new
+`Database` method returning session/pending-task/memory counts scoped to no particular chat,
+since this view isn't chat-specific the way `/status` in Telegram is), while `doctor` answers
+"does it actually work" — it sends a real request to the model provider and connects to every
+configured MCP server rather than just checking that they're present in the config, since a wrong
+API key or a broken MCP server command is invisible to a check that only reads `kumo.toml`.
+`doctor` exits non-zero on any failure specifically so it can be used as a pre-flight check
+(e.g. in a systemd `ExecStartPre`) rather than only being read by a human.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)

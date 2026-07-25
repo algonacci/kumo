@@ -74,6 +74,12 @@ async fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    if matches!(command, Command::Status) {
+        return print_status().await;
+    }
+    if matches!(command, Command::Doctor) {
+        return run_doctor().await;
+    }
 
     let existing = Config::exists()?.then(Config::load).transpose()?;
     let needs_onboarding = matches!(command, Command::Onboard)
@@ -1102,6 +1108,8 @@ async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
 enum Command {
     Run,
     Onboard,
+    Status,
+    Doctor,
     Help,
 }
 
@@ -1110,6 +1118,8 @@ fn parse_command() -> Result<Command> {
     let command = match args.next().as_deref() {
         None => Command::Run,
         Some("onboard") => Command::Onboard,
+        Some("status") => Command::Status,
+        Some("doctor") => Command::Doctor,
         Some("-h" | "--help") => Command::Help,
         Some(value) => bail!("unknown command '{value}'\n\nRun `kumo --help` for usage."),
     };
@@ -1120,12 +1130,190 @@ fn parse_command() -> Result<Command> {
     Ok(command)
 }
 
+/// `kumo status`: read configuration and the local database directly and print a summary,
+/// without connecting to Telegram, the model provider, or any MCP server. Meant for checking on
+/// Kumo from a terminal (e.g. over SSH) without needing to go through the bot itself.
+async fn print_status() -> Result<()> {
+    println!("Kumo v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    match Config::exists()? {
+        false => {
+            println!("Config:    not set up yet (run `kumo` or `kumo onboard`)");
+            return Ok(());
+        }
+        true => {
+            let path = config::path()?;
+            println!("Config:    {}", path.display());
+            let config = Config::load()?;
+            println!("Telegram:  connected as @{}", config.telegram.bot_username);
+            match &config.provider {
+                Some(provider) => println!(
+                    "Provider:  {} ({})",
+                    provider.active_model, provider.base_url
+                ),
+                None => println!("Provider:  not configured (run `kumo onboard`)"),
+            }
+            match &config.tools {
+                Some(tools) => println!("Workspace: {}", tools.workspace.display()),
+                None => println!("Workspace: not configured (run `kumo onboard`)"),
+            }
+            println!("Timezone:  {}", config.timezone());
+            if config.mcp.is_empty() {
+                println!("MCP:       none configured");
+            } else {
+                println!("MCP:       {} server(s) configured", config.mcp.len());
+                for name in config.mcp.keys() {
+                    println!("             - {name}");
+                }
+            }
+        }
+    }
+
+    let database = Database::open()?;
+    println!("Database:  {}", database.path().display());
+    let summary = database.storage_summary()?;
+    println!("Sessions:  {}", summary.session_count);
+    println!(
+        "Pending scheduled tasks: {}",
+        summary.pending_scheduled_tasks
+    );
+    println!("Remembered facts:        {}", summary.memory_entries);
+
+    Ok(())
+}
+
+/// `kumo doctor`: check configuration, provider connectivity, MCP servers, and optional
+/// dependencies one at a time, printing a pass/fail line for each with actionable guidance on
+/// failure, rather than kumo status's plain summary. Exits with an error if anything failed, so
+/// it is usable as a pre-flight check in a script.
+async fn run_doctor() -> Result<()> {
+    println!("Kumo doctor");
+    println!();
+    let mut failures = 0usize;
+
+    let config = match Config::exists() {
+        Ok(true) => match Config::load() {
+            Ok(config) => {
+                check_ok("Config file parses");
+                Some(config)
+            }
+            Err(error) => {
+                check_fail(&format!("Config file is invalid: {error:#}"));
+                failures += 1;
+                None
+            }
+        },
+        Ok(false) => {
+            check_fail("No config file yet — run `kumo onboard` first");
+            failures += 1;
+            None
+        }
+        Err(error) => {
+            check_fail(&format!("Could not locate the config directory: {error:#}"));
+            failures += 1;
+            None
+        }
+    };
+
+    if let Some(config) = &config {
+        match &config.provider {
+            Some(provider_config) => {
+                check_ok("Provider is configured");
+                let provider = Provider::new(provider_config.clone());
+                match provider.chat(&[ProviderMessage::user("ping")], &[]).await {
+                    Ok(_) => check_ok("Provider responds to a test request"),
+                    Err(error) => {
+                        check_fail(&format!("Provider request failed: {error:#}"));
+                        failures += 1;
+                    }
+                }
+            }
+            None => {
+                check_fail("Provider is not configured — run `kumo onboard`");
+                failures += 1;
+            }
+        }
+
+        match &config.tools {
+            Some(tools) => {
+                if tools.workspace.is_dir() {
+                    check_ok(&format!("Workspace exists: {}", tools.workspace.display()));
+                } else {
+                    check_fail(&format!(
+                        "Workspace directory does not exist: {}",
+                        tools.workspace.display()
+                    ));
+                    failures += 1;
+                }
+            }
+            None => {
+                check_fail("Workspace is not configured — run `kumo onboard`");
+                failures += 1;
+            }
+        }
+
+        if config.mcp.is_empty() {
+            check_ok("No MCP servers configured (nothing to check)");
+        } else {
+            let mcp = mcp::connect_all(&config.mcp).await;
+            for status in &mcp.statuses {
+                match &status.error {
+                    Some(error) => {
+                        check_fail(&format!("MCP server '{}' failed: {error}", status.name));
+                        failures += 1;
+                    }
+                    None => check_ok(&format!(
+                        "MCP server '{}' connected ({} tool(s))",
+                        status.name, status.tool_count
+                    )),
+                }
+            }
+        }
+    }
+
+    if tools::kamui_available() {
+        check_ok("kamui binary found on PATH (delegate_to_kamui is available)");
+    } else {
+        println!(
+            "  i  kamui binary not found on PATH — delegate_to_kamui will not be offered to the model \
+             (this is optional, not an error)"
+        );
+    }
+
+    match Database::open() {
+        Ok(_) => check_ok("Database opens successfully"),
+        Err(error) => {
+            check_fail(&format!("Database could not be opened: {error:#}"));
+            failures += 1;
+        }
+    }
+
+    println!();
+    if failures == 0 {
+        println!("All checks passed.");
+        Ok(())
+    } else {
+        bail!("{failures} check(s) failed");
+    }
+}
+
+fn check_ok(message: &str) {
+    println!("  \u{2713} {message}");
+}
+
+fn check_fail(message: &str) {
+    println!("  \u{2717} {message}");
+}
+
 fn print_help() {
     println!("Kumo personal agent gateway");
     println!();
     println!("Usage:");
     println!("  kumo            Start the gateway (onboards on first run)");
     println!("  kumo onboard    Configure the model provider and workspace");
+    println!("  kumo status     Show configuration and storage status, no Telegram connection");
+    println!("  kumo doctor     Check configuration, provider, MCP servers, and dependencies");
     println!("  kumo --help     Show this help");
 }
 
