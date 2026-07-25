@@ -1,5 +1,6 @@
 mod compaction;
 mod config;
+mod markdown;
 mod mcp;
 mod onboarding;
 mod provider;
@@ -16,7 +17,7 @@ use teloxide::{
     dispatching::Dispatcher,
     payloads::SendMessageSetters,
     prelude::*,
-    types::{CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tools::ToolRegistry;
@@ -261,7 +262,7 @@ async fn handle_message(
     match run_agent(&bot, message.chat.id, &state, &approvals, history, text).await {
         Ok(turn) => {
             for chunk in message_chunks(&turn.answer, 4000) {
-                bot.send_message(message.chat.id, chunk).await?;
+                send_formatted(&bot, message.chat.id, &chunk).await?;
             }
             database.lock().await.save_turn(
                 message.chat.id.0,
@@ -538,6 +539,24 @@ async fn handle_approval_callback(
         let _ = sender.send(approved);
     }
     Ok(())
+}
+
+/// Send one message chunk rendered as MarkdownV2. Falls back to plain text if Telegram rejects the
+/// formatted version (e.g. an entity split across a chunk boundary), so the reply is never lost.
+async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> Result<()> {
+    let formatted = markdown::to_telegram_markdown_v2(chunk);
+    let sent = bot
+        .send_message(chat_id, formatted)
+        .parse_mode(ParseMode::MarkdownV2)
+        .await;
+    match sent {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            eprintln!("Markdown formatting failed, sending plain text: {error:#}");
+            bot.send_message(chat_id, chunk).await?;
+            Ok(())
+        }
+    }
 }
 
 fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {

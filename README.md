@@ -65,6 +65,12 @@ Normal text messages continue the active session for that Telegram chat. Complet
 in SQLite, including tool requests, tool results, and token usage. A session is created lazily only
 after the first complete answer is delivered. Failed or partially delivered turns are not stored.
 
+The model's answer is rendered with Telegram's MarkdownV2 formatting: `**bold**`, `_italic_`,
+`` `inline code` ``, fenced code blocks, and `[links](url)` all render as Telegram entities instead
+of raw punctuation. If Telegram rejects the formatted message (for example, an entity split across a
+message-length chunk boundary), Kumo falls back to sending that chunk as plain text rather than
+losing the reply.
+
 The database lives in the OS local data directory as `kumo/kumo.db`. Set `KUMO_DATA_DIR` to override
 the directory for containers or servers. Schema changes use sequential `PRAGMA user_version`
 migrations; Kumo refuses to open databases created by a newer unsupported version.
