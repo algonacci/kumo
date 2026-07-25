@@ -41,7 +41,7 @@ struct AgentTurn {
 const MAX_TOOL_ROUNDS: usize = 8;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
-const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it.";
+const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. If delegate_to_kamui is available and the task involves editing files or a multi-step coding change, prefer it over run_command: it runs a dedicated coding agent with a proper diff-reviewed file editor, rather than an ad hoc shell command.";
 type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
 #[tokio::main]

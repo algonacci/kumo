@@ -15,6 +15,9 @@ const MAX_FILE_SIZE: u64 = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 200;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
+/// Coding tasks delegated to Kamui can run a whole agent loop (read, edit, test), so they get more
+/// headroom than a single shell command.
+const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -89,12 +92,33 @@ impl ToolRegistry {
                 }),
             },
         ];
+        if kamui_available() {
+            definitions.push(ToolDefinition {
+                name: "delegate_to_kamui".to_owned(),
+                description: "Delegate a coding task (reading, editing, or running commands \
+                              against files in the workspace) to Kamui, an independent coding \
+                              agent. Use this instead of run_command for anything that involves \
+                              editing files. The user must approve the task before it runs."
+                    .to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "A clear, self-contained description of the coding task for Kamui to perform, e.g. \"add input validation to the login handler and run the tests\"."
+                        }
+                    },
+                    "required": ["task"]
+                }),
+            });
+        }
         definitions.extend(self.extra.iter().map(|tool| tool.definition()));
         definitions
     }
 
     pub fn requires_confirmation(&self, name: &str) -> bool {
         name == "run_command"
+            || name == "delegate_to_kamui"
             || self
                 .extra
                 .iter()
@@ -107,6 +131,10 @@ impl ToolRegistry {
             parse_command(&call.arguments)
                 .ok()
                 .map(|command| format!("Command: {command}"))
+        } else if call.name == "delegate_to_kamui" {
+            parse_task(&call.arguments)
+                .ok()
+                .map(|task| format!("Kamui task: {task}"))
         } else {
             self.extra
                 .iter()
@@ -120,6 +148,7 @@ impl ToolRegistry {
             "read_file" => self.read_file(&call.arguments),
             "list_directory" => self.list_directory(&call.arguments),
             "run_command" => self.run_command(&call.arguments).await,
+            "delegate_to_kamui" => self.delegate_to_kamui(&call.arguments).await,
             _ => match self.extra.iter().find(|tool| tool.name() == call.name) {
                 Some(tool) => tool.run(&call.arguments).await,
                 None => Err(anyhow::anyhow!("unknown tool '{}'", call.name)),
@@ -216,6 +245,52 @@ impl ToolRegistry {
             )),
         }
     }
+
+    /// Run a coding task through Kamui's non-interactive mode (`kamui -p <task> --auto-approve`)
+    /// in the configured workspace. Kumo already gated this call on Telegram approval before
+    /// dispatch, so Kamui's own tool approvals are bypassed with `--auto-approve` rather than
+    /// asking twice for the same task.
+    async fn delegate_to_kamui(&self, arguments: &str) -> Result<String> {
+        let task = parse_task(arguments)?;
+        let child = tokio::process::Command::new("kamui")
+            .arg("-p")
+            .arg(&task)
+            .arg("--auto-approve")
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to start kamui")?;
+
+        match tokio::time::timeout(KAMUI_TIMEOUT, child.wait_with_output()).await {
+            Ok(result) => {
+                let output = result.context("failed to run kamui")?;
+                Ok(format_command_output(&output))
+            }
+            Err(_) => Ok(format!(
+                "Error: kamui timed out after {} seconds and was terminated",
+                KAMUI_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+/// Whether the `kamui` binary is reachable on `PATH`. Detected once per process; delegation is an
+/// optional capability, never a requirement for Kumo's built-in tools.
+fn kamui_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("kamui")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Deserialize)]
@@ -228,6 +303,11 @@ struct CommandArguments {
     command: String,
 }
 
+#[derive(Deserialize)]
+struct TaskArguments {
+    task: String,
+}
+
 fn parse_command(arguments: &str) -> Result<String> {
     let arguments: CommandArguments =
         serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
@@ -236,6 +316,16 @@ fn parse_command(arguments: &str) -> Result<String> {
         bail!("run_command requires a non-empty 'command' argument");
     }
     Ok(command.to_owned())
+}
+
+fn parse_task(arguments: &str) -> Result<String> {
+    let arguments: TaskArguments =
+        serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+    let task = arguments.task.trim();
+    if task.is_empty() {
+        bail!("delegate_to_kamui requires a non-empty 'task' argument");
+    }
+    Ok(task.to_owned())
 }
 
 fn format_command_output(output: &std::process::Output) -> String {
@@ -410,5 +500,56 @@ mod tests {
         assert_eq!(tools.preview(&call).as_deref(), Some("Fake {}"));
         assert_eq!(tools.dispatch(&call).await, "pong");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_task_rejects_empty_or_blank_input() {
+        assert!(parse_task(r#"{"task":""}"#).is_err());
+        assert!(parse_task(r#"{"task":"   "}"#).is_err());
+        assert!(parse_task("not json").is_err());
+    }
+
+    #[test]
+    fn parse_task_trims_and_returns_the_task() {
+        assert_eq!(
+            parse_task(r#"{"task":"  add a test  "}"#).unwrap(),
+            "add a test"
+        );
+    }
+
+    #[test]
+    fn delegate_to_kamui_always_requires_confirmation() {
+        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        assert!(tools.requires_confirmation("delegate_to_kamui"));
+    }
+
+    #[test]
+    fn delegate_to_kamui_preview_shows_the_task() {
+        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "delegate_to_kamui".into(),
+            arguments: r#"{"task":"fix the failing test"}"#.into(),
+        };
+
+        assert_eq!(
+            tools.preview(&call).as_deref(),
+            Some("Kamui task: fix the failing test")
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_to_kamui_rejects_a_blank_task_before_spawning_kamui() {
+        // Whether `kamui` is actually installed on the machine running the suite varies, so this
+        // only exercises the argument-validation path shared with parse_task, which runs before
+        // any process is spawned and is deterministic either way.
+        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "delegate_to_kamui".into(),
+            arguments: r#"{"task":""}"#.into(),
+        };
+
+        assert!(tools.dispatch(&call).await.starts_with("Error:"));
     }
 }

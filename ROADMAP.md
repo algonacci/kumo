@@ -8,11 +8,11 @@ need, not by matching what a bigger gateway (OpenClaw, Hermes) happens to ship.
 
 Status: Kumo is a working single-user gateway. Onboarding pairs a Telegram bot to one owner without
 a manual ID lookup or a `.env` file, an agent loop answers messages with `read_file`, `list_directory`,
-and approval-gated `run_command`, MCP servers can contribute more tools over stdio, and long
-conversations compact into a rolling summary. Every turn is persisted to SQLite. What is missing
-relative to that description is deliberate: there is no file-mutation tool yet, no way to browse or
-resume a past session, and no support for more than one Telegram user, more than one workspace, or
-more than one model provider connection.
+approval-gated `run_command`, and approval-gated `delegate_to_kamui` for file edits, MCP servers can
+contribute more tools over stdio, and long conversations compact into a rolling summary. Every turn
+is persisted to SQLite. What is missing relative to that description is deliberate: there is no way
+to browse or resume a past session, and no support for more than one Telegram user, more than one
+workspace, or more than one model provider connection.
 
 ## Phase 1: Gateway Foundation
 
@@ -44,23 +44,30 @@ configured context window (or a 48 KiB default), without ever deleting the origi
 
 ## Phase 2: Coding Agent Parity
 
-- [ ] File mutation tool (`patch_file`, exact-match replace-or-create, diff preview before approval)
-- [ ] Multi-file editing within one turn
-- [ ] Tool-call round limit review (currently 8, Kamui uses 25 — revisit once mutation exists)
+- [x] Delegate file editing to Kamui (`delegate_to_kamui`, via `kamui -p <task> --auto-approve`)
+- [ ] Structured result rendering for a Kamui delegation (today it is raw stdout/stderr, like
+      `run_command`; a summary of files touched would read better in Telegram)
+- [ ] Tool-call round limit review (currently 8; a delegation itself uses one round from Kumo's
+      point of view, so this matters less than it would have for an in-process editor)
 - [ ] Optional RTK execution backend for `run_command` output compression
 
-This is the most visible gap relative to Kamui. The README already says it plainly: "Kumo cannot
-edit files yet." Today the only way the model can change anything on disk is by asking `run_command`
-to shell out (`sed`, `>`, a script), which is generic, has no diff preview, and puts the burden of
-reviewing a raw shell string on the person tapping **Approve** in Telegram — a much worse review
-surface than a rendered diff. Porting Kamui's `patch_file` design (exact `old_text` match required,
-empty `old_text` creates a new file, atomic write via temp-file-and-rename, same containment checks
-as `read_file`) gives Kumo a real editing capability with a reviewable preview instead of a blank
-check on arbitrary shell.
+This was the most visible gap relative to Kamui: the README used to say plainly "Kumo cannot edit
+files yet." Rather than reimplementing Kamui's `patch_file` (exact-match replace-or-create, diff
+preview, atomic write) inside Kumo, editing is delegated to Kamui itself through its non-interactive
+`-p` mode. This matches the project's own stated architecture — "Kamui remains an independent coding
+agent and does not need to know about Telegram" — and avoids maintaining two copies of the same
+path-safety and file-editing logic. Kumo's role stays limited to gatekeeping: `delegate_to_kamui`
+requires the same Telegram approval as `run_command`, and once approved, Kamui's own tool approvals
+are bypassed with `--auto-approve` rather than asking twice for one task. The tool is only offered to
+the model when a `kamui` binary is found on `PATH` at startup (detected once, like Kamui's own RTK
+check), so a Kumo installation without Kamui available degrades to its existing read/run-only
+behavior instead of offering a tool that would always fail.
 
-The 8-round tool cap was reasonable for a read-and-run-commands loop; a multi-file edit turn (several
-`patch_file` calls in sequence, each individually approved over Telegram) may need more headroom.
-Revisit the limit once mutation lands rather than raising it preemptively.
+What delegation does not give Kumo: turn-by-turn visibility into what Kamui is doing (Telegram sees
+only the final combined output, not each of Kamui's own tool calls), and no way to approve or deny an
+individual file edit inside a delegated task — the approval is "let Kamui attempt this task" as a
+whole. If that granularity turns out to matter in practice, an in-process editor (this phase's
+original plan) remains an option, at the cost of the duplication described above.
 
 RTK is optional and orthogonal to permission policy (see Kamui's RTK Decision for the same framing):
 it would compress `run_command` output before it reaches the model, nothing more. Skip it until

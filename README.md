@@ -16,7 +16,7 @@ capabilities. Kamui remains an independent coding agent and does not need to kno
 
 Kumo currently provides a single-user Telegram bot backed by an OpenAI-compatible model provider,
 with persistent conversation sessions, workspace inspection, and approval-gated command execution.
-Mutation tools are not implemented yet.
+File editing is delegated to Kamui (see Host tools below) rather than implemented directly in Kumo.
 
 ## Onboarding
 
@@ -87,18 +87,26 @@ context_window = 128000
 
 ## Host tools
 
-The model may call two tools while answering:
+The model may call these tools while answering:
 
 - `read_file` reads UTF-8 files up to 64 KiB inside the configured workspace.
 - `list_directory` lists up to 200 entries inside the configured workspace.
 - `run_command` runs a shell command in the workspace only after explicit Telegram approval.
+- `delegate_to_kamui` hands a coding task to [Kamui](https://github.com/algonacci/kamui) — reading,
+  editing, or running commands against files in the workspace — only after explicit Telegram
+  approval. Kamui runs its own agent loop (`kamui -p <task> --auto-approve`) with a proper
+  diff-reviewed file editor, so this is the right tool for anything that involves changing files;
+  `run_command` remains for one-off shell commands. Only offered to the model when a `kamui` binary
+  is found on `PATH` at startup, and bounded to a 5-minute timeout.
 
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
 the workspace, including through symlinks.
 
-Every command request displays **Allow once** and **Deny** buttons in Telegram. Approval expires after
-two minutes and cannot be replayed. Commands run with stdin disabled, a 30-second timeout, and a 16
-KiB combined output limit. A timed-out command is terminated. Kumo cannot edit files yet.
+Every command or Kamui delegation request displays **Allow once** and **Deny** buttons in Telegram.
+Approval expires after two minutes and cannot be replayed. Commands run with stdin disabled, a
+30-second timeout, and a 16 KiB combined output limit; a Kamui delegation gets a 5-minute timeout
+instead, since a coding task can involve several tool rounds inside Kamui's own agent loop. A
+timed-out command or delegation is terminated.
 
 ## MCP servers
 
