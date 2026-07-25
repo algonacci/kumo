@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 4;
+const CURRENT_VERSION: i64 = 5;
 
 pub struct Database {
     connection: Connection,
@@ -43,6 +43,10 @@ pub struct SessionSummary {
     pub updated_at: i64,
 }
 
+pub struct MemoryEntry {
+    pub content: String,
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let directory = data_dir()?;
@@ -74,6 +78,9 @@ impl Database {
         }
         if version < 4 {
             migrate_to_v4(&connection)?;
+        }
+        if version < 5 {
+            migrate_to_v5(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -299,6 +306,82 @@ impl Database {
         self.connection
             .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
         Ok(())
+    }
+
+    /// Every stored memory entry, oldest first (the order they were learned in).
+    pub fn list_memory(&self) -> Result<Vec<MemoryEntry>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT content FROM memory ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(MemoryEntry {
+                content: row.get(0)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Total bytes across all memory content, used to enforce `MAX_MEMORY_BYTES` before adding
+    /// more (see `tools::remember`); cheaper than loading every row just to sum lengths.
+    pub fn total_memory_bytes(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM memory",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Append a new memory entry and return its id.
+    pub fn remember(&self, content: &str) -> Result<i64> {
+        self.connection
+            .execute("INSERT INTO memory (content) VALUES (?1)", params![content])?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Replace the content of an unambiguous entry matched by a case-insensitive substring, so a
+    /// superseded fact (e.g. an old job title) can be corrected in place instead of left to
+    /// contradict a newer one. Returns `Ok(false)` for no match or an ambiguous (multi-match)
+    /// substring, so the caller can ask for something more specific rather than guess.
+    pub fn update_memory(&self, substring: &str, new_content: &str) -> Result<bool> {
+        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
+        let matches: Vec<i64> = self
+            .connection
+            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
+            .query_map([&pattern], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if matches.len() != 1 {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "UPDATE memory SET content = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![matches[0], new_content],
+        )?;
+        Ok(true)
+    }
+
+    /// Delete an unambiguous entry matched by a case-insensitive substring. Same ambiguity
+    /// handling as `update_memory`.
+    pub fn forget(&self, substring: &str) -> Result<bool> {
+        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
+        let matches: Vec<i64> = self
+            .connection
+            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
+            .query_map([&pattern], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if matches.len() != 1 {
+            return Ok(false);
+        }
+        self.connection
+            .execute("DELETE FROM memory WHERE id = ?1", [matches[0]])?;
+        Ok(true)
+    }
+
+    /// Delete every memory entry (used by the `/forget all` Telegram command).
+    pub fn clear_memory(&self) -> Result<usize> {
+        Ok(self.connection.execute("DELETE FROM memory", [])?)
     }
 
     fn active_session_id(&self, chat_id: i64) -> Result<Option<String>> {
@@ -530,6 +613,26 @@ fn migrate_to_v4(connection: &Connection) -> Result<()> {
          ALTER TABLE scheduled_tasks_v4 RENAME TO scheduled_tasks;
          CREATE INDEX scheduled_tasks_due ON scheduled_tasks(status, run_at);
          PRAGMA user_version = 4;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Global, permanent facts the model has been explicitly asked to remember. Unlike `messages`,
+/// this table is not scoped to a session or chat: it is read once at startup and injected into
+/// every conversation's system prompt for the life of the process, so it survives `/new`, session
+/// switches, and (after a restart) the process itself. Kumo is single-user, so there is no
+/// per-chat or per-user scoping to add here.
+fn migrate_to_v5(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE memory (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             content TEXT NOT NULL,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         PRAGMA user_version = 5;
          COMMIT;",
     )?;
     Ok(())
@@ -788,6 +891,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(message_count, 0);
+    }
+
+    #[test]
+    fn remember_and_list_memory_round_trip_in_insertion_order() {
+        let database = database();
+        database.remember("The user is a researcher.").unwrap();
+        database.remember("Prefers concise answers.").unwrap();
+
+        let entries = database.list_memory().unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "The user is a researcher.");
+        assert_eq!(entries[1].content, "Prefers concise answers.");
+    }
+
+    #[test]
+    fn total_memory_bytes_sums_all_entries() {
+        let database = database();
+        database.remember("abc").unwrap();
+        database.remember("de").unwrap();
+
+        assert_eq!(database.total_memory_bytes().unwrap(), 5);
+    }
+
+    #[test]
+    fn update_memory_replaces_an_unambiguous_match() {
+        let database = database();
+        database.remember("The user is a researcher.").unwrap();
+
+        let updated = database
+            .update_memory("is a researcher", "is a software engineer.")
+            .unwrap();
+
+        assert!(updated);
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "is a software engineer.");
+    }
+
+    #[test]
+    fn update_memory_fails_on_no_match_or_ambiguous_match() {
+        let database = database();
+        database.remember("The user likes tea.").unwrap();
+        database.remember("The user likes coffee.").unwrap();
+
+        assert!(!database.update_memory("nonexistent", "x").unwrap());
+        // Both entries contain "The user likes", so this is ambiguous.
+        assert!(!database.update_memory("The user likes", "x").unwrap());
+        // Neither original entry should have been touched.
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn forget_removes_an_unambiguous_match() {
+        let database = database();
+        database.remember("The user is a researcher.").unwrap();
+        database.remember("The user likes tea.").unwrap();
+
+        assert!(database.forget("researcher").unwrap());
+
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "The user likes tea.");
+    }
+
+    #[test]
+    fn forget_fails_on_no_match_or_ambiguous_match() {
+        let database = database();
+        database.remember("The user likes tea.").unwrap();
+        database.remember("The user likes coffee.").unwrap();
+
+        assert!(!database.forget("nonexistent").unwrap());
+        assert!(!database.forget("The user likes").unwrap());
+        assert_eq!(database.list_memory().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn clear_memory_removes_every_entry_and_reports_the_count() {
+        let database = database();
+        database.remember("one").unwrap();
+        database.remember("two").unwrap();
+
+        assert_eq!(database.clear_memory().unwrap(), 2);
+        assert!(database.list_memory().unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_matching_is_case_insensitive_and_escapes_like_wildcards() {
+        let database = database();
+        database.remember("100% sure about this_thing").unwrap();
+
+        // '%' and '_' are SQL LIKE wildcards; a literal search for them must not match everything.
+        assert!(!database.forget("50%").unwrap());
+        assert!(database.forget("100% SURE").unwrap());
+    }
+
+    #[test]
+    fn migration_to_v5_adds_an_empty_memory_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        migrate_to_v2(&connection).unwrap();
+        migrate_to_v3(&connection).unwrap();
+        migrate_to_v4(&connection).unwrap();
+        migrate_to_v5(&connection).unwrap();
+
+        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        assert!(database.list_memory().unwrap().is_empty());
+        database.remember("test").unwrap();
+        assert_eq!(database.list_memory().unwrap().len(), 1);
     }
 
     #[test]

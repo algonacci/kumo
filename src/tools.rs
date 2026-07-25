@@ -27,6 +27,9 @@ const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
 /// How far into the future a scheduled task may be set, as a sanity bound against the model
 /// misparsing a relative date (e.g. the wrong year).
 const MAX_SCHEDULE_HORIZON: chrono::Duration = chrono::Duration::days(366);
+/// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping the
+/// system prompt (which carries every entry on every request) from growing unbounded.
+const MAX_MEMORY_BYTES: i64 = 4 * 1024;
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -156,6 +159,65 @@ impl ToolRegistry {
                 "required": ["prompt", "run_at"]
             }),
         });
+        definitions.push(ToolDefinition {
+            name: "remember".to_owned(),
+            description: "Save a fact about the user or their preferences permanently. Unlike \
+                          conversation history, this persists across /new, session switches, and \
+                          restarts, and is visible in every future conversation. Use it only when \
+                          explicitly asked to remember something, or when the user states a clear, \
+                          durable preference or fact about themselves. If a similar fact is already \
+                          remembered, use update_memory instead of adding a duplicate."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "A short, self-contained fact, e.g. \"The user is a researcher.\" or \"Prefers concise answers.\""
+                    }
+                },
+                "required": ["fact"]
+            }),
+        });
+        definitions.push(ToolDefinition {
+            name: "update_memory".to_owned(),
+            description: "Replace a previously remembered fact that is now outdated or wrong. \
+                          Find it by an unambiguous substring of its exact wording; if more than \
+                          one remembered fact matches, this fails and you should use a longer, \
+                          more specific substring."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "matching": {
+                        "type": "string",
+                        "description": "A substring that uniquely identifies the fact to replace, e.g. \"is a researcher\"."
+                    },
+                    "fact": {
+                        "type": "string",
+                        "description": "The corrected fact to store in its place."
+                    }
+                },
+                "required": ["matching", "fact"]
+            }),
+        });
+        definitions.push(ToolDefinition {
+            name: "forget".to_owned(),
+            description: "Permanently delete a previously remembered fact, found by an \
+                          unambiguous substring of its exact wording (same matching rule as \
+                          update_memory)."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "matching": {
+                        "type": "string",
+                        "description": "A substring that uniquely identifies the fact to delete."
+                    }
+                },
+                "required": ["matching"]
+            }),
+        });
         definitions.extend(self.extra.iter().map(|tool| tool.definition()));
         definitions
     }
@@ -196,6 +258,9 @@ impl ToolRegistry {
             "run_command" => self.run_command(&call.arguments).await,
             "delegate_to_kamui" => self.delegate_to_kamui(&call.arguments).await,
             "schedule_task" => self.schedule_task(chat_id, &call.arguments).await,
+            "remember" => self.remember(&call.arguments).await,
+            "update_memory" => self.update_memory(&call.arguments).await,
+            "forget" => self.forget(&call.arguments).await,
             _ => match self.extra.iter().find(|tool| tool.name() == call.name) {
                 Some(tool) => tool.run(&call.arguments).await,
                 None => Err(anyhow::anyhow!("unknown tool '{}'", call.name)),
@@ -362,6 +427,69 @@ impl ToolRegistry {
             self.timezone
         ))
     }
+
+    /// Append a new global memory entry, capped so the system prompt (which carries every stored
+    /// fact on every request) cannot grow unbounded.
+    async fn remember(&self, arguments: &str) -> Result<String> {
+        let arguments: FactArguments =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let fact = arguments.fact.trim();
+        if fact.is_empty() {
+            bail!("remember requires a non-empty 'fact' argument");
+        }
+
+        let database = self.database.lock().await;
+        let existing = database.total_memory_bytes()?;
+        if existing + fact.len() as i64 > MAX_MEMORY_BYTES {
+            bail!(
+                "memory is full ({existing}/{MAX_MEMORY_BYTES} bytes); use update_memory or forget \
+                 to make room before adding more"
+            );
+        }
+        database.remember(fact)?;
+        Ok(format!("remembered: {fact}"))
+    }
+
+    /// Replace an existing memory entry matched by an unambiguous substring.
+    async fn update_memory(&self, arguments: &str) -> Result<String> {
+        let arguments: UpdateMemoryArguments =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let matching = arguments.matching.trim();
+        let fact = arguments.fact.trim();
+        if matching.is_empty() || fact.is_empty() {
+            bail!("update_memory requires non-empty 'matching' and 'fact' arguments");
+        }
+
+        let updated = self.database.lock().await.update_memory(matching, fact)?;
+        if updated {
+            Ok(format!("updated memory matching \"{matching}\" to: {fact}"))
+        } else {
+            bail!(
+                "no single remembered fact matches \"{matching}\"; it may not exist, or the \
+                 substring matches more than one entry"
+            )
+        }
+    }
+
+    /// Delete an existing memory entry matched by an unambiguous substring.
+    async fn forget(&self, arguments: &str) -> Result<String> {
+        let arguments: ForgetArguments =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let matching = arguments.matching.trim();
+        if matching.is_empty() {
+            bail!("forget requires a non-empty 'matching' argument");
+        }
+
+        let forgotten = self.database.lock().await.forget(matching)?;
+        if forgotten {
+            Ok(format!("forgot the fact matching \"{matching}\""))
+        } else {
+            bail!(
+                "no single remembered fact matches \"{matching}\"; it may not exist, or the \
+                 substring matches more than one entry"
+            )
+        }
+    }
 }
 
 /// Whether the `kamui` binary is reachable on `PATH`. Detected once per process; delegation is an
@@ -399,6 +527,22 @@ struct TaskArguments {
 struct ScheduleArguments {
     prompt: String,
     run_at: String,
+}
+
+#[derive(Deserialize)]
+struct FactArguments {
+    fact: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateMemoryArguments {
+    matching: String,
+    fact: String,
+}
+
+#[derive(Deserialize)]
+struct ForgetArguments {
+    matching: String,
 }
 
 fn parse_command(arguments: &str) -> Result<String> {
@@ -740,5 +884,174 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].prompt, "check the weather");
         assert_eq!(due[0].telegram_chat_id, 42);
+    }
+
+    fn memory_call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tools_never_require_confirmation() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        assert!(!tools.requires_confirmation("remember"));
+        assert!(!tools.requires_confirmation("update_memory"));
+        assert!(!tools.requires_confirmation("forget"));
+    }
+
+    #[tokio::test]
+    async fn remember_persists_a_fact() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call(
+                    "remember",
+                    serde_json::json!({ "fact": "The user is a researcher." }),
+                ),
+            )
+            .await;
+
+        assert!(output.starts_with("remembered:"), "{output}");
+        let entries = database.lock().await.list_memory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "The user is a researcher.");
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_a_blank_fact() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call("remember", serde_json::json!({ "fact": "  " })),
+            )
+            .await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn remember_refuses_once_the_memory_cap_is_reached() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        database
+            .lock()
+            .await
+            .remember(&"x".repeat(MAX_MEMORY_BYTES as usize))
+            .unwrap();
+
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call("remember", serde_json::json!({ "fact": "one more" })),
+            )
+            .await;
+
+        assert!(
+            output.starts_with("Error:") && output.contains("full"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_memory_replaces_a_matched_fact() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        database
+            .lock()
+            .await
+            .remember("The user is a researcher.")
+            .unwrap();
+
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call(
+                    "update_memory",
+                    serde_json::json!({ "matching": "is a researcher", "fact": "is a software engineer." }),
+                ),
+            )
+            .await;
+
+        assert!(output.starts_with("updated memory"), "{output}");
+        let entries = database.lock().await.list_memory().unwrap();
+        assert_eq!(entries[0].content, "is a software engineer.");
+    }
+
+    #[tokio::test]
+    async fn update_memory_reports_an_error_when_nothing_matches() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call(
+                    "update_memory",
+                    serde_json::json!({ "matching": "nonexistent", "fact": "x" }),
+                ),
+            )
+            .await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn forget_removes_a_matched_fact() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        database
+            .lock()
+            .await
+            .remember("The user is a researcher.")
+            .unwrap();
+
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call("forget", serde_json::json!({ "matching": "researcher" })),
+            )
+            .await;
+
+        assert!(output.starts_with("forgot"), "{output}");
+        assert!(database.lock().await.list_memory().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_reports_an_error_when_nothing_matches() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call("forget", serde_json::json!({ "matching": "nonexistent" })),
+            )
+            .await;
+        assert!(output.starts_with("Error:"), "{output}");
     }
 }

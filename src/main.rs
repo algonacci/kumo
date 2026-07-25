@@ -29,6 +29,11 @@ pub(crate) struct AppState {
     provider: Provider,
     tools: ToolRegistry,
     mcp_statuses: Vec<String>,
+    /// A frozen-at-startup rendering of every remembered fact, appended to the system prompt for
+    /// every request. Frozen (rather than re-read per turn) so it stays consistent across a turn
+    /// and does not defeat provider-side prompt caching; a `remember`/`update_memory`/`forget`
+    /// call updates storage immediately but only appears in the prompt after Kumo restarts.
+    memory_snapshot: String,
 }
 
 pub(crate) struct AgentTurn {
@@ -115,6 +120,7 @@ async fn run_gateway(config: Config) -> Result<()> {
     if reset_count > 0 {
         println!("Recovered {reset_count} scheduled task(s) interrupted by a previous shutdown.");
     }
+    let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     let database = Arc::new(Mutex::new(database));
     let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?;
     let turn_lock = Arc::new(Mutex::new(()));
@@ -124,6 +130,7 @@ async fn run_gateway(config: Config) -> Result<()> {
         provider,
         tools,
         mcp_statuses,
+        memory_snapshot,
     }));
 
     let current = state.read().await;
@@ -266,6 +273,16 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if text == "/memory" {
+        let response = memory_message(&database).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(argument) = text.strip_prefix("/forget ").map(str::trim) {
+        let response = forget_command(&database, argument).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if text == "/models" {
         let response = models_message(&state.read().await.config);
         bot.send_message(message.chat.id, response).await?;
@@ -323,13 +340,14 @@ pub(crate) async fn run_agent(
     history: storage::History,
     prompt: &str,
 ) -> Result<AgentTurn> {
-    let (provider, tool_definitions, model, timezone) = {
+    let (provider, tool_definitions, model, timezone, memory_snapshot) = {
         let state = state.read().await;
         (
             state.provider.clone(),
             state.tools.definitions(),
             state.provider.active_model().to_owned(),
             state.config.timezone(),
+            state.memory_snapshot.clone(),
         )
     };
     let user_message = ProviderMessage::user(prompt);
@@ -339,6 +357,10 @@ pub(crate) async fn run_agent(
         "\n\nCurrent date and time: {} ({timezone}).",
         now.format("%Y-%m-%d %H:%M:%S %:z")
     ));
+    if !memory_snapshot.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&memory_snapshot);
+    }
     if let Some(summary) = &history.summary {
         system.push_str("\n\nSummary of the earlier conversation:\n\n");
         system.push_str(summary);
@@ -567,6 +589,51 @@ async fn delete_session(
     Ok(format!("Deleted session {}.", &session_id[..8]))
 }
 
+/// Show what is currently remembered on disk. Note this reads the database directly, so it can
+/// briefly disagree with what a live conversation actually sees in its system prompt: the
+/// snapshot injected into every turn is frozen at startup (see `AppState::memory_snapshot`), so a
+/// `remember`/`update_memory`/`forget` call made just now will show up here immediately but only
+/// take effect in conversation after Kumo restarts.
+async fn memory_message(database: &Mutex<Database>) -> Result<String> {
+    let entries = database.lock().await.list_memory()?;
+    if entries.is_empty() {
+        return Ok("Nothing remembered yet.".to_owned());
+    }
+    let mut lines = vec!["Remembered facts:".to_owned()];
+    for entry in &entries {
+        lines.push(format!("- {}", entry.content));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Changes here take effect in conversation after Kumo restarts. Use /forget <text> or /forget all."
+            .to_owned(),
+    );
+    Ok(lines.join("\n"))
+}
+
+/// `/forget all` clears every remembered fact; `/forget <text>` removes one matched by an
+/// unambiguous substring, the same rule the `forget` tool uses.
+async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<String> {
+    if argument.is_empty() {
+        return Ok(
+            "Usage: /forget <text> or /forget all. Use /memory to list what is remembered."
+                .to_owned(),
+        );
+    }
+    let database = database.lock().await;
+    if argument.eq_ignore_ascii_case("all") {
+        let count = database.clear_memory()?;
+        return Ok(format!("Forgot all {count} remembered fact(s)."));
+    }
+    if database.forget(argument)? {
+        Ok(format!("Forgot the fact matching \"{argument}\"."))
+    } else {
+        Ok(format!(
+            "No remembered fact matches \"{argument}\", or the text matches more than one. Use /memory to see exact wording."
+        ))
+    }
+}
+
 fn truncate(text: &str, max: usize) -> String {
     let mut result: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -579,6 +646,20 @@ fn format_timestamp(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp, 0)
         .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "unknown time".to_owned())
+}
+
+/// Render every remembered fact as a system-prompt block, or an empty string when there is
+/// nothing remembered yet (so callers can skip adding an empty section).
+fn render_memory_snapshot(entries: &[storage::MemoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut text = "Remembered facts about the user (persist across conversations):".to_owned();
+    for entry in entries {
+        text.push_str("\n- ");
+        text.push_str(&entry.content);
+    }
+    text
 }
 
 async fn request_approval(
@@ -914,5 +995,86 @@ mod tests {
 
         assert!(response.contains(&id[..8]));
         assert!(database.lock().await.list_sessions(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_memory_snapshot_is_empty_with_no_entries() {
+        assert_eq!(render_memory_snapshot(&[]), "");
+    }
+
+    #[test]
+    fn render_memory_snapshot_lists_every_fact() {
+        let entries = vec![
+            storage::MemoryEntry {
+                content: "The user is a researcher.".to_owned(),
+            },
+            storage::MemoryEntry {
+                content: "Prefers concise answers.".to_owned(),
+            },
+        ];
+
+        let rendered = render_memory_snapshot(&entries);
+
+        assert!(rendered.contains("The user is a researcher."));
+        assert!(rendered.contains("Prefers concise answers."));
+    }
+
+    #[tokio::test]
+    async fn memory_message_reports_nothing_remembered_when_empty() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        assert_eq!(
+            memory_message(&database).await.unwrap(),
+            "Nothing remembered yet."
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_message_lists_stored_facts() {
+        let db = Database::open_in_memory_for_tests();
+        db.remember("The user is a researcher.").unwrap();
+        let database = Mutex::new(db);
+
+        let response = memory_message(&database).await.unwrap();
+
+        assert!(response.contains("The user is a researcher."));
+    }
+
+    #[tokio::test]
+    async fn forget_command_reports_usage_on_an_empty_argument() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        let response = forget_command(&database, "").await.unwrap();
+        assert!(response.starts_with("Usage:"));
+    }
+
+    #[tokio::test]
+    async fn forget_command_all_clears_every_fact() {
+        let db = Database::open_in_memory_for_tests();
+        db.remember("one").unwrap();
+        db.remember("two").unwrap();
+        let database = Mutex::new(db);
+
+        let response = forget_command(&database, "all").await.unwrap();
+
+        assert!(response.contains('2'));
+        assert!(database.lock().await.list_memory().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_command_removes_a_matched_fact() {
+        let db = Database::open_in_memory_for_tests();
+        db.remember("The user is a researcher.").unwrap();
+        let database = Mutex::new(db);
+
+        let response = forget_command(&database, "researcher").await.unwrap();
+
+        assert!(response.contains("Forgot"));
+        assert!(database.lock().await.list_memory().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_command_reports_no_match_without_erroring() {
+        let database = Mutex::new(Database::open_in_memory_for_tests());
+        let response = forget_command(&database, "nonexistent").await.unwrap();
+        assert!(response.contains("No remembered fact matches"));
     }
 }

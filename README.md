@@ -62,6 +62,8 @@ left empty for local OpenAI-compatible servers that do not require authenticatio
 - `/resume <id>` switches the active session back to a previous one, identified by an unambiguous
   ID prefix (as shown by `/sessions`).
 - `/delete <id>` permanently deletes a session and its messages.
+- `/memory` lists every fact Kumo currently remembers about you (see Memory below).
+- `/forget <text>` or `/forget all` removes one or all remembered facts.
 - `/model` shows the active model.
 - `/models` lists models discovered during onboarding.
 - `/model <id>` switches the active model and saves the choice.
@@ -112,6 +114,8 @@ The model may call these tools while answering:
   normal message — with all the same tools, subject to the same approvals — and delivers the result
   to the chat that scheduled it, prefixed with "⏰ Scheduled task:". Does not require approval to
   schedule; approval still applies to whatever tools the task itself calls when it runs.
+- `remember`, `update_memory`, and `forget` manage permanent, global memory (see Memory below). None
+  require approval — they only store or remove text.
 
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
 the workspace, including through symlinks.
@@ -138,6 +142,34 @@ task that is claimed for execution moves to a `running` state before it starts, 
 `running` (only possible after such a crash — a clean shutdown never leaves one there) is reset back
 to pending. A task that fails while running (a provider error, an unreachable MCP server, and so on)
 is reported to the chat with the error, not just logged to the terminal.
+
+## Memory
+
+Kumo can remember facts about you across every conversation, not just the current session. Ask it
+directly:
+
+```
+inget yaa, aku kerjanya research analyst
+```
+
+The model calls `remember` to store the fact permanently. Unlike session history, memory is not
+scoped to a chat or a session — it is global and outlives `/new`, `/resume`, and `/delete`. It is
+loaded once when Kumo starts and injected into every conversation's system prompt for the life of
+the process, so **a change made mid-conversation only takes effect after Kumo restarts** — this
+keeps the prompt stable within a running process rather than changing underneath an in-progress
+turn.
+
+- `/memory` shows everything currently stored on disk (this reads the database directly, so it can
+  briefly show a fact a live conversation doesn't know about yet, until the next restart).
+- `/forget <text>` removes one fact matched by an unambiguous substring of its exact wording.
+- `/forget all` clears everything.
+
+The model can also correct or remove a fact itself — `update_memory` replaces an existing entry
+matched the same way `/forget` does, so a stated preference or fact can be corrected in place
+instead of contradicting an older one; `forget` removes one. Both fail with a clear error if the
+text matches more than one stored fact, asking for something more specific rather than guessing.
+Total stored memory is capped at 4 KiB, since every byte of it is sent with every request; once
+full, `remember` refuses new facts until something is consolidated or removed.
 
 ## MCP servers
 

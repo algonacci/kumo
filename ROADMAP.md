@@ -170,6 +170,52 @@ The approval flow is currently "allow once" for every single confirmable call, w
 `trusted` in `kumo.toml`. A scoped, session-lifetime allow (not persisted past `/new`) would cut
 repeated approval prompts for a chatty multi-step task without weakening the default posture.
 
+## Phase 4b: Memory
+
+- [x] `remember`/`update_memory`/`forget` tools: global facts, not scoped to any session or chat
+- [x] `/memory` and `/forget <text>`/`/forget all` Telegram commands
+- [x] 4 KiB cap on total stored memory, enforced by `remember`
+- [ ] A way to correct an ambiguous match without knowing the exact stored wording (today
+      `update_memory`/`forget` require a substring unique enough to resolve to one entry)
+
+This was directly inspired by Hermes Agent's memory feature, but deliberately built as a much
+smaller slice of it. Hermes runs a background LLM review after every turn to auto-extract lessons
+into two files, supports nine external memory-provider backends (vector databases, knowledge
+graphs, hybrid search), and gates writes behind a staged-approval queue. None of that matches
+Kumo's reason for existing — a small, auditable, personal tool, not a memory product. What Kumo
+took from it: explicit-only writes (the model saves a fact because it was asked to, not via a
+silent background pass), a hard byte cap so the prompt cannot grow unbounded, and a single
+SQLite table rather than a vector store, since semantic search over dozens of personal facts is not
+a real need at this scale.
+
+The three tools map onto plain SQL against one `memory` table (`user_version = 5`): `remember`
+appends, refusing once `total_memory_bytes()` plus the new fact would exceed `MAX_MEMORY_BYTES` (4
+KiB); `update_memory` and `forget` both resolve their target the same way — a case-insensitive
+`LIKE` substring match that must resolve to exactly one row, failing loudly (rather than guessing)
+on zero or multiple matches. This is the piece the earlier "update vs. append" design question
+resolved: a stated fact ("the user is a researcher") can later be corrected in place ("is a
+software engineer") instead of sitting alongside a contradicting older one forever, since memory
+here is genuinely permanent and global — unlike session history, it survives `/new`, `/resume`,
+`/delete`, and a Kumo restart, and is visible in every conversation regardless of which session is
+active.
+
+The most important design choice is when a memory change actually takes effect. `AppState` carries
+a `memory_snapshot: String` rendered once at startup and appended to every turn's system prompt for
+the rest of the process's life; a `remember`/`update_memory`/`forget` call updates SQLite
+immediately (so `/memory` reflects it right away), but the running conversation does not see the
+change until Kumo restarts. This mirrors Hermes's own "frozen snapshot" choice and for the same
+two reasons: an in-flight turn should not have its own system prompt change out from under it
+mid-turn, and re-reading memory on every request would defeat provider-side prompt-prefix caching
+for no real benefit, since a personal fact changing moment-to-moment is not a real scenario. The
+tradeoff is explicit in `/memory`'s own output and in this project's user, who confirmed restarting
+after a memory change is an acceptable cost for a personal single-user gateway — that would be a
+much harder tradeoff to accept for a multi-user product.
+
+What is intentionally out of scope: nothing resembling Hermes's provider ecosystem, background
+review, or write-approval queue. If memory usage in practice reveals a real need for one of those
+(for example, contradictions piling up because `update_memory` is too strict about exact-match
+substrings), revisit narrowly rather than importing Hermes's design wholesale.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
