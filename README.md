@@ -76,6 +76,13 @@ Normal text messages continue the active session for that Telegram chat. Complet
 in SQLite, including tool requests, tool results, and token usage. A session is created lazily only
 after the first complete answer is delivered. Failed or partially delivered turns are not stored.
 
+A photo (with or without a caption) is downloaded and attached to the request as an image, so a
+vision-capable model can see it directly — no separate image-understanding tool or MCP server
+involved. Whether the active model can actually see it is not something Kumo checks in advance: the
+image is sent either way, and an unsupported model's rejection surfaces as a normal request error.
+Photos are capped at 5 MiB and, like a text message, are not part of any stored conversation history
+beyond the turn they were sent in.
+
 The model's answer is rendered with Telegram's MarkdownV2 formatting: `**bold**`, `_italic_`,
 `` `inline code` ``, fenced code blocks, and `[links](url)` all render as Telegram entities instead
 of raw punctuation. If Telegram rejects the formatted message (for example, an entity split across a

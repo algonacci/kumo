@@ -15,8 +15,18 @@ pub struct Provider {
 pub struct Message {
     pub(crate) role: Role,
     pub(crate) content: String,
+    pub(crate) images: Vec<ImageAttachment>,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) tool_call_id: Option<String>,
+}
+
+/// An image attached to a user message, carried as base64 so it stays provider-independent until
+/// the wire layer encodes it as a data URL.
+#[derive(Clone, Debug)]
+pub struct ImageAttachment {
+    /// MIME type, e.g. `image/jpeg`.
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +46,18 @@ impl Message {
         Self::text(Role::User, content)
     }
 
+    /// A user message with one or more images attached (e.g. a Telegram photo). `content` may be
+    /// empty when the user sent an image with no caption.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::text(Role::Assistant, content)
     }
@@ -44,6 +66,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            images: Vec::new(),
             tool_calls,
             tool_call_id: None,
         }
@@ -53,6 +76,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -62,6 +86,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -92,6 +117,9 @@ impl Message {
         Ok(Self {
             role,
             content,
+            // Images are per-request only, never persisted (see save_turn); a message loaded back
+            // from storage never carries any.
+            images: Vec::new(),
             tool_calls,
             tool_call_id,
         })
@@ -261,22 +289,62 @@ struct ChatRequest<'a> {
 struct WireMessage<'a> {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
+    content: Option<WireContent<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireToolCall<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
 }
 
+/// Message content is a plain string unless images are attached, in which case OpenAI expects an
+/// array of typed parts.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireContent<'a> {
+    Text(&'a str),
+    Parts(Vec<WirePart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum WirePart<'a> {
+    #[serde(rename = "text")]
+    Text { text: &'a str },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: WireImageUrl },
+}
+
+#[derive(Serialize)]
+struct WireImageUrl {
+    url: String,
+}
+
 impl<'a> From<&'a Message> for WireMessage<'a> {
     fn from(message: &'a Message) -> Self {
+        let content = if !message.images.is_empty() {
+            // With images, content becomes an array of text and image parts.
+            let mut parts = Vec::with_capacity(message.images.len() + 1);
+            if !message.content.is_empty() {
+                parts.push(WirePart::Text {
+                    text: &message.content,
+                });
+            }
+            for image in &message.images {
+                parts.push(WirePart::ImageUrl {
+                    image_url: WireImageUrl {
+                        url: format!("data:{};base64,{}", image.media_type, image.data),
+                    },
+                });
+            }
+            Some(WireContent::Parts(parts))
+        } else if message.content.is_empty() && !message.tool_calls.is_empty() {
+            None
+        } else {
+            Some(WireContent::Text(&message.content))
+        };
         Self {
             role: message.role_name(),
-            content: if message.content.is_empty() && !message.tool_calls.is_empty() {
-                None
-            } else {
-                Some(&message.content)
-            },
+            content,
             tool_calls: message.tool_calls.iter().map(WireToolCall::from).collect(),
             tool_call_id: message.tool_call_id.as_deref(),
         }
@@ -425,5 +493,49 @@ mod tests {
 
         assert!(value.get("content").is_none());
         assert_eq!(value["tool_calls"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn plain_text_message_serializes_content_as_a_string() {
+        let message = Message::user("hello");
+        let value = serde_json::to_value(WireMessage::from(&message)).unwrap();
+
+        assert_eq!(value["content"], "hello");
+    }
+
+    #[test]
+    fn serializes_images_as_content_parts() {
+        let message = Message::user_with_images(
+            "what is this?",
+            vec![ImageAttachment {
+                media_type: "image/jpeg".into(),
+                data: "AAAA".into(),
+            }],
+        );
+        let value = serde_json::to_value(WireMessage::from(&message)).unwrap();
+
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "what is this?");
+        assert_eq!(value["content"][1]["type"], "image_url");
+        assert_eq!(
+            value["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_caption_omits_the_text_part() {
+        let message = Message::user_with_images(
+            "",
+            vec![ImageAttachment {
+                media_type: "image/jpeg".into(),
+                data: "AAAA".into(),
+            }],
+        );
+        let value = serde_json::to_value(WireMessage::from(&message)).unwrap();
+
+        // Only the image part should be present, no leading empty text part.
+        assert_eq!(value["content"].as_array().unwrap().len(), 1);
+        assert_eq!(value["content"][0]["type"], "image_url");
     }
 }

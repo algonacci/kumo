@@ -12,10 +12,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use config::Config;
-use provider::{Message as ProviderMessage, Provider, Usage};
+use provider::{ImageAttachment, Message as ProviderMessage, Provider, Usage};
 use storage::Database;
 use teloxide::{
     dispatching::Dispatcher,
+    net::Download,
     payloads::SendMessageSetters,
     prelude::*,
     types::{CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
@@ -230,13 +231,21 @@ async fn handle_message(
     let Some(user) = message.from.as_ref() else {
         return Ok(());
     };
+    if user.id.0 != allowed_user_id {
+        return Ok(());
+    }
+
+    // A photo has no `.text()` (only an optional `.caption()`) and never carries a slash command,
+    // so it takes a separate, simpler path straight to the agent loop instead of the text command
+    // routing below.
+    if message.photo().is_some() {
+        let _turn_guard = turn_lock.lock().await;
+        return handle_photo_message(bot, message, state, approvals, database).await;
+    }
 
     let Some(text) = message.text() else {
         return Ok(());
     };
-    if user.id.0 != allowed_user_id {
-        return Ok(());
-    }
     let _turn_guard = turn_lock.lock().await;
 
     println!("Received a message from Telegram user {}", user.id.0);
@@ -306,13 +315,95 @@ async fn handle_message(
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
     let history = prepare_history(&state, &database, message.chat.id.0).await?;
-    match run_agent(&bot, message.chat.id, &state, &approvals, history, text).await {
+    let user_message = ProviderMessage::user(text);
+    deliver_agent_turn(
+        &bot,
+        message.chat.id,
+        &state,
+        &approvals,
+        &database,
+        history,
+        user_message,
+    )
+    .await
+}
+
+/// Maximum size of a downloaded Telegram photo, matching Kamui's `@file` image cap: generous
+/// enough for a phone photo, small enough to keep one request's payload reasonable.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Handle a message containing a photo: download the highest-resolution size Telegram sent,
+/// attach it to a user message (with the caption as text, if any), and run it through the same
+/// agent loop as a text message. Whether the active model can actually see the image is left to
+/// the provider — if it rejects or ignores the attachment, that surfaces as a normal request
+/// error rather than something Kumo tries to predict up front.
+async fn handle_photo_message(
+    bot: Bot,
+    message: Message,
+    state: Arc<RwLock<AppState>>,
+    approvals: PendingApprovals,
+    database: Arc<Mutex<Database>>,
+) -> Result<()> {
+    // Telegram sends several resolutions of the same photo; the last is the largest.
+    let photo = message
+        .photo()
+        .and_then(|sizes| sizes.last())
+        .context("photo message unexpectedly had no sizes")?;
+    let file = bot.get_file(photo.file.id.clone()).await?;
+    if file.size > 0 && u64::from(file.size) > MAX_IMAGE_BYTES {
+        bot.send_message(
+            message.chat.id,
+            format!(
+                "That photo is too large ({} bytes); the limit is {MAX_IMAGE_BYTES} bytes.",
+                file.size
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut bytes = Vec::new();
+    bot.download_file(&file.path, &mut bytes).await?;
+    let image = ImageAttachment {
+        media_type: "image/jpeg".to_owned(), // Telegram always transcodes photos to JPEG.
+        data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+    };
+    let caption = message.caption().unwrap_or_default();
+    let user_message = ProviderMessage::user_with_images(caption, vec![image]);
+
+    bot.send_chat_action(message.chat.id, ChatAction::Typing)
+        .await?;
+    let history = prepare_history(&state, &database, message.chat.id.0).await?;
+    deliver_agent_turn(
+        &bot,
+        message.chat.id,
+        &state,
+        &approvals,
+        &database,
+        history,
+        user_message,
+    )
+    .await
+}
+
+/// Shared tail of both the text and photo message paths: run the agent loop, deliver the answer
+/// (or a generic failure notice) to the chat, and persist a successful turn.
+async fn deliver_agent_turn(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &RwLock<AppState>,
+    approvals: &PendingApprovals,
+    database: &Mutex<Database>,
+    history: storage::History,
+    user_message: ProviderMessage,
+) -> Result<()> {
+    match run_agent(bot, chat_id, state, approvals, history, user_message).await {
         Ok(turn) => {
             for chunk in message_chunks(&turn.answer, 4000) {
-                send_formatted(&bot, message.chat.id, &chunk).await?;
+                send_formatted(bot, chat_id, &chunk).await?;
             }
             database.lock().await.save_turn(
-                message.chat.id.0,
+                chat_id.0,
                 &turn.model,
                 &turn.record,
                 &turn.usage,
@@ -322,13 +413,12 @@ async fn handle_message(
         Err(error) => {
             eprintln!("Model request failed: {error:#}");
             bot.send_message(
-                message.chat.id,
+                chat_id,
                 "The model provider could not answer. Check the Kumo terminal for details.",
             )
             .await?;
         }
     }
-
     Ok(())
 }
 
@@ -338,7 +428,7 @@ pub(crate) async fn run_agent(
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
     history: storage::History,
-    prompt: &str,
+    user_message: ProviderMessage,
 ) -> Result<AgentTurn> {
     let (provider, tool_definitions, model, timezone, memory_snapshot) = {
         let state = state.read().await;
@@ -350,7 +440,6 @@ pub(crate) async fn run_agent(
             state.memory_snapshot.clone(),
         )
     };
-    let user_message = ProviderMessage::user(prompt);
     let mut system = SYSTEM_PROMPT.to_owned();
     let now = chrono::Utc::now().with_timezone(&timezone);
     system.push_str(&format!(

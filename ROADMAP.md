@@ -216,6 +216,42 @@ review, or write-approval queue. If memory usage in practice reveals a real need
 (for example, contradictions piling up because `update_memory` is too strict about exact-match
 substrings), revisit narrowly rather than importing Hermes's design wholesale.
 
+## Phase 4c: Image Input
+
+- [x] Native photo handling: download a Telegram photo, attach it to the request as an image
+- [ ] Voice note input (deferred — see Not Planned)
+
+This follows directly from a broader decision about where Kumo's own capabilities end and MCP
+begins: MCP already covers arbitrary added capabilities (search, databases, price lookups, and so
+on — see MCP servers below), so a new *skill* should default to an MCP tool rather than more
+Kumo-native code. Understanding an image is not that kind of skill, though — Kamui already
+establishes the pattern (`@screenshot.png` attaches to a vision-capable model's request directly,
+no tool call involved), and a Telegram photo can follow the identical path, since receiving the
+photo itself is something only Kumo can do (an MCP server cannot intercept a Telegram message).
+So the split for this phase is: *receiving* an image is necessarily native (nothing else sees the
+Telegram update), but *interpreting* it is left entirely to the model's own vision capability, not
+a Kumo-side or MCP-side captioning/OCR step layered on top.
+
+`handle_photo_message` (`src/main.rs`) takes the largest `PhotoSize` Telegram sent, downloads it via
+`Bot::download_file` (capped at 5 MiB, matching Kamui's own image limit), base64-encodes it, and
+builds a `Message::user_with_images` carrying the photo's caption as text (empty if there wasn't
+one). `provider::Message` and the OpenAI wire layer gained the same `images`/content-parts shape
+Kamui's provider adapter already has — a message with images serializes as an array of `text` and
+`image_url` parts instead of a plain string, so a text-only request's wire shape is unchanged.
+
+Whether the active model can actually see the image is deliberately not checked in advance: there
+is no reliable way to know a model's vision support from an OpenAI-compatible API's model listing,
+and hardcoding a name-based heuristic ("contains gpt-4o", "contains vision") would need constant
+upkeep as new models ship. The image is sent either way; an incompatible model's rejection (or,
+depending on the provider, being silently ignored) surfaces as an ordinary request error, and the
+user can switch to a vision-capable model with `/model <id>`.
+
+Voice notes are deliberately not built alongside this. Downloading Telegram voice audio would be
+the same kind of native-only step photos needed, but turning that audio into text (speech-to-text)
+is exactly the kind of processing capability that should be an MCP tool, not code inside Kumo — and
+there is not yet a concrete transcription MCP server in place to call. Revisit once one exists,
+rather than building a native transcription path now.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
@@ -246,8 +282,8 @@ a schedule.
 
 - [ ] Other messaging platforms (Slack, Discord, WhatsApp, Matrix) — Kumo is a Telegram gateway by
   design, not a multi-platform bot framework; a second platform is a different project
-- [ ] Image or voice input — no multimodal path exists in `provider::Message` today; Telegram
-  messages without `.text()` are already ignored
+- [ ] Voice note input — deferred until there is a concrete MCP transcription server to call;
+  Kumo's own role would still only be downloading the audio, not running speech-to-text itself
 - [ ] A plugin system beyond MCP — MCP already gives Kumo an extension point (any stdio server's
   tools flow through the same registry and approval path as the built-ins); a second, Kumo-specific
   plugin API would duplicate it

@@ -8,7 +8,8 @@ use teloxide::prelude::*;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    AppState, PendingApprovals, prepare_history, run_agent, send_formatted, storage::Database,
+    AppState, PendingApprovals, prepare_history, provider::Message as ProviderMessage, run_agent,
+    send_formatted, storage::Database,
 };
 
 /// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
@@ -112,7 +113,15 @@ async fn run_scheduled_task(
     prompt: &str,
 ) -> Result<()> {
     let history = prepare_history(state, database, chat_id.0).await?;
-    let turn = run_agent(bot, chat_id, state, approvals, history, prompt).await?;
+    let turn = run_agent(
+        bot,
+        chat_id,
+        state,
+        approvals,
+        history,
+        ProviderMessage::user(prompt),
+    )
+    .await?;
 
     bot.send_message(chat_id, "\u{23f0} Scheduled task:")
         .await?;
