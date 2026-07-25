@@ -19,6 +19,7 @@ rmcp = { version = "0.8", features = ["client", "transport-child-process"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 teloxide = "0.17"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"

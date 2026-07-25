@@ -1,10 +1,12 @@
 mod compaction;
 mod config;
+mod daemon;
 mod markdown;
 mod mcp;
 mod onboarding;
 mod provider;
 mod scheduler;
+mod service;
 mod storage;
 mod tools;
 
@@ -74,11 +76,31 @@ async fn main() -> Result<()> {
         print_help();
         return Ok(());
     }
+    if matches!(command, Command::Version) {
+        println!("kumo {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if matches!(command, Command::Status) {
         return print_status().await;
     }
     if matches!(command, Command::Doctor) {
         return run_doctor().await;
+    }
+    if matches!(command, Command::Start) {
+        return daemon::start();
+    }
+    if matches!(command, Command::Stop) {
+        return daemon::stop();
+    }
+    if matches!(command, Command::Restart) {
+        daemon::stop()?;
+        return daemon::start();
+    }
+    if matches!(command, Command::Enable) {
+        return service::enable();
+    }
+    if matches!(command, Command::Disable) {
+        return service::disable();
     }
 
     let existing = Config::exists()?.then(Config::load).transpose()?;
@@ -1107,20 +1129,33 @@ async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
 #[derive(Clone, Copy)]
 enum Command {
     Run,
+    Start,
+    Stop,
+    Restart,
     Onboard,
     Status,
     Doctor,
+    Enable,
+    Disable,
     Help,
+    Version,
 }
 
 fn parse_command() -> Result<Command> {
     let mut args = std::env::args().skip(1);
     let command = match args.next().as_deref() {
         None => Command::Run,
+        Some("run") => Command::Run,
+        Some("start") => Command::Start,
+        Some("stop") => Command::Stop,
+        Some("restart") => Command::Restart,
         Some("onboard") => Command::Onboard,
         Some("status") => Command::Status,
         Some("doctor") => Command::Doctor,
+        Some("enable") => Command::Enable,
+        Some("disable") => Command::Disable,
         Some("-h" | "--help") => Command::Help,
+        Some("-V" | "--version") => Command::Version,
         Some(value) => bail!("unknown command '{value}'\n\nRun `kumo --help` for usage."),
     };
 
@@ -1136,6 +1171,11 @@ fn parse_command() -> Result<Command> {
 async fn print_status() -> Result<()> {
     println!("Kumo v{}", env!("CARGO_PKG_VERSION"));
     println!();
+
+    match daemon::running_pid()? {
+        Some(pid) => println!("Process:   running in the background (pid {pid})"),
+        None => println!("Process:   not running (use `kumo start` or `kumo run`)"),
+    }
 
     match Config::exists()? {
         false => {
@@ -1310,11 +1350,18 @@ fn print_help() {
     println!("Kumo personal agent gateway");
     println!();
     println!("Usage:");
-    println!("  kumo            Start the gateway (onboards on first run)");
+    println!("  kumo            Run the gateway in the foreground (onboards on first run)");
+    println!("  kumo run        Same as plain `kumo`, explicit for use as a service ExecStart");
+    println!("  kumo start      Run the gateway detached in the background");
+    println!("  kumo stop       Stop a background instance started with `kumo start`");
+    println!("  kumo restart    Stop then start the background instance");
     println!("  kumo onboard    Configure the model provider and workspace");
     println!("  kumo status     Show configuration and storage status, no Telegram connection");
     println!("  kumo doctor     Check configuration, provider, MCP servers, and dependencies");
+    println!("  kumo enable     Install as a user service that starts on login (Linux/macOS only)");
+    println!("  kumo disable    Remove the user service installed by `kumo enable`");
     println!("  kumo --help     Show this help");
+    println!("  kumo --version  Print the version");
 }
 
 #[cfg(test)]

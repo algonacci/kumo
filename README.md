@@ -18,6 +18,37 @@ Kumo currently provides a single-user Telegram bot backed by an OpenAI-compatibl
 with persistent conversation sessions, workspace inspection, and approval-gated command execution.
 File editing is delegated to Kamui (see Host tools below) rather than implemented directly in Kumo.
 
+## Install
+
+Prebuilt binaries for Linux, macOS, and Windows are attached to each
+[GitHub release](https://github.com/algonacci/kumo/releases).
+
+macOS or Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/algonacci/kumo/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/algonacci/kumo/main/install.ps1 | iex
+```
+
+Both scripts download the release archive for your platform, verify its SHA-256 checksum, and
+install `kumo` to `~/.local/bin` (Unix) or `%LOCALAPPDATA%\Programs\kumo\bin` (Windows), adding it
+to your `PATH` if needed. Check the installed version with `kumo --version` and list command-line
+options with `kumo --help`.
+
+For development, install the current checkout into Cargo's binary directory:
+
+```sh
+cargo install --path .
+```
+
+This compiles once and installs `kumo` in `~/.cargo/bin`. It does not compile again each time the
+command runs. Use `cargo install --path . --force` after local source changes.
+
 ## Onboarding
 
 Run Kumo without arguments:
@@ -54,20 +85,61 @@ The bot token and provider API key are stored in the user's global `kumo.toml`. 
 restricts this file to the current user (`0600`). Never publish or commit this file. API keys may be
 left empty for local OpenAI-compatible servers that do not require authentication.
 
-## CLI commands
+## Running Kumo
 
-Two commands check on Kumo without going through Telegram at all, useful when you're at the
-terminal (over SSH, in a script) rather than the bot itself:
+Kumo is a long-running gateway, not a one-shot CLI, so it needs to keep running after you close the
+terminal. Once onboarding is done (`kumo` with no arguments the first time), run it in the
+background instead:
 
 ```sh
-cargo run -- status
-cargo run -- doctor
+kumo start     # runs detached, returns you to the shell immediately
+kumo status    # check whether it's running, plus config/storage details
+kumo stop      # ask it to shut down gracefully
+kumo restart   # stop, then start again
+```
+
+`kumo start` re-spawns itself as `kumo run` (the plain foreground gateway) with stdout/stderr
+redirected to a log file, then exits immediately — the same "detached child process" approach
+Docker Desktop's CLI uses, since Rust has no cross-platform `fork()`. On Linux and macOS the child
+starts a new session (`setsid`) so closing the terminal that ran `kumo start` never affects it; on
+Windows it's created with no console attached at all. `kumo stop` sends the same signal `Ctrl+C`
+sends in the foreground, waiting up to 10 seconds for a graceful shutdown before force-killing it.
+Logs land in the OS data directory next to the database (see `kumo status` for the exact path).
+
+To have Kumo start automatically when you log in — not just "stays running until you stop it" —
+install it as a user-level service:
+
+```sh
+kumo enable     # installs and starts it (systemd on Linux, launchd on macOS)
+kumo disable    # stops it and removes the service
+```
+
+This uses each OS's native service manager, scoped to your user account (no root/admin needed): a
+systemd user unit at `~/.config/systemd/user/kumo.service` on Linux, or a launchd agent at
+`~/Library/LaunchAgents/com.kumo.agent.plist` on macOS. Both restart Kumo automatically if it
+crashes. **Not supported on Windows** — a proper equivalent means either a Windows Service or a
+Task Scheduler task, both a fair bit more involved than systemd/launchd and not implemented; use
+`kumo start` each session there instead. Note that on Linux, a systemd *user* service normally only
+runs while you're logged in — to have it start even before login, run
+`sudo loginctl enable-linger $USER` once (`kumo enable` prints this same reminder).
+
+`kumo status` reports whether a background instance is running (whether it was started by `kumo
+start` or by the installed service) either way, since it checks by scanning for the running
+process itself rather than only trusting a PID file.
+
+## CLI commands
+
+Two more commands check on Kumo's configuration without going through Telegram at all:
+
+```sh
+kumo status
+kumo doctor
 ```
 
 `status` reads the config file and local database directly and prints a summary — active model,
 workspace, timezone, configured MCP servers, database path, session count, pending scheduled
 tasks, and remembered facts. It makes no network calls and does not connect to Telegram, the model
-provider, or any MCP server.
+provider, or any MCP server (it does check the process table for a running instance, see above).
 
 `doctor` is the opposite: it actively checks that things work, not just that they're configured.
 It parses the config, sends a real test request to the model provider, connects to every

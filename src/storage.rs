@@ -690,7 +690,10 @@ fn make_title(content: &str) -> String {
     title
 }
 
-fn data_dir() -> Result<PathBuf> {
+/// The directory Kumo stores its database (and, for the daemon commands, its PID and log files)
+/// in. Exposed so `daemon.rs` can locate the PID/log files alongside the database without
+/// duplicating the `KUMO_DATA_DIR` override logic.
+pub fn data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("KUMO_DATA_DIR") {
         return Ok(PathBuf::from(path));
     }

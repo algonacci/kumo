@@ -314,6 +314,59 @@ API key or a broken MCP server command is invisible to a check that only reads `
 `doctor` exits non-zero on any failure specifically so it can be used as a pre-flight check
 (e.g. in a systemd `ExecStartPre`) rather than only being read by a human.
 
+## Phase 4f: Distribution and Background Operation
+
+- [x] `kumo start`/`stop`/`restart`: detached background process, matching Kamui's release
+      pipeline in spirit but adding a process-management layer Kamui (a one-shot CLI) never needed
+- [x] `kumo enable`/`disable`: systemd user unit (Linux) / launchd agent (macOS), auto-restart on
+      crash, no root/admin required
+- [x] `kumo status` detects a service-managed instance, not just one started by `kumo start`
+- [x] Prebuilt binaries for Windows, Linux (x64/ARM64), and macOS (Intel/Apple Silicon), plus
+      `install.sh`/`install.ps1` — copied from Kamui's release workflow and installers with only
+      the binary/repository names changed
+
+This closed the biggest gap between the two projects' maturity: Kamui already had a full
+GitHub Actions release pipeline (5 platform targets, checksummed archives, a GitHub Release) and
+matching installer scripts; Kumo had neither. The release workflow and installers themselves
+needed no real redesign — Cargo release binaries don't care whether the program is a one-shot CLI
+or a gateway — but shipping a *gateway* as a binary raised a question Kamui never had to answer:
+what does "run" mean when the whole point is that it keeps running?
+
+Kumo was, until this phase, only runnable in the foreground — the terminal that started it had to
+stay open. That is fine for developing against it, but not for actually using it day to day, and
+not what a peer like OpenClaw or Hermes Agent looks like in practice (install it, and it's just
+running). Rather than a real Unix `fork()`+`setsid()` (`daemonize`-style crates exist, but have no
+Windows story), `kumo start` re-spawns itself as `kumo run` — the existing foreground gateway,
+unchanged — as a detached child process with stdout/stderr redirected to a log file, then the
+`start` command exits immediately. This is the same pattern tools like Docker Desktop's CLI use,
+and it works identically on Linux, macOS, and Windows without any platform-specific process logic
+of our own beyond the detach step itself (`setsid()` on Unix so the child has no controlling
+terminal; `DETACHED_PROCESS` on Windows so it has no console at all). `kumo stop` sends the same
+signal Kumo's own `Ctrl+C` handler already reacts to, waiting up to 10 seconds for a graceful exit
+before escalating to a hard kill.
+
+`kumo enable`/`disable` go one step further: not just "runs in the background until you stop it or
+reboot," but "starts automatically on login and restarts itself if it crashes," using each OS's
+own service manager rather than reinventing one. Both are deliberately user-scoped (a systemd user
+unit, a launchd *agent* rather than a system daemon) since Kumo is explicitly a personal,
+single-user tool — no root or admin privileges are needed to install or remove either one. Windows
+has no equivalent shipped: a proper one means either a Windows Service (its own installer, a
+different process model `kumo run` was never written to implement — the Service Control Manager's
+start/stop protocol) or a Task Scheduler XML task, and neither was worth the complexity without a
+concrete need; `kumo start` still works fine there, just without the "restarts on boot" part.
+
+Making `kumo status` find a service-managed instance took an extra step: `kumo enable`'s unit
+files launch `kumo run` directly, so no PID file exists the way `kumo start` writes one. The fix is
+`daemon::running_pid()` falling back to scanning every running process for one whose executable
+path matches this same `kumo` binary. That scan turned out to need a concession to macOS
+specifically: reading another process's argument list needs elevated privileges there, so
+`Process::cmd()` (from the `sysinfo` crate) silently comes back empty for anything not spawned by
+this same process, even though the executable path still resolves fine. Matching on the
+executable path alone, without also confirming `run` is among its arguments, is safe in practice
+regardless — every other `kumo` subcommand finishes in well under a second, so any other
+`kumo`-executable process still alive at the moment of the scan is, for all practical purposes,
+the long-running gateway.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
