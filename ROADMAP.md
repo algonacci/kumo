@@ -8,11 +8,11 @@ need, not by matching what a bigger gateway (OpenClaw, Hermes) happens to ship.
 
 Status: Kumo is a working single-user gateway. Onboarding pairs a Telegram bot to one owner without
 a manual ID lookup or a `.env` file, an agent loop answers messages with `read_file`, `list_directory`,
-approval-gated `run_command`, and approval-gated `delegate_to_kamui` for file edits, MCP servers can
-contribute more tools over stdio, and long conversations compact into a rolling summary. Every turn
-is persisted to SQLite. What is missing relative to that description is deliberate: there is no way
-to browse or resume a past session, and no support for more than one Telegram user, more than one
-workspace, or more than one model provider connection.
+approval-gated `run_command`, approval-gated `delegate_to_kamui` for file edits, and `schedule_task`
+for one-shot future prompts, MCP servers can contribute more tools over stdio, and long conversations
+compact into a rolling summary. Every turn is persisted to SQLite. What is missing relative to that
+description is deliberate: there is no way to browse or resume a past session, and no support for
+more than one Telegram user, more than one workspace, or more than one model provider connection.
 
 ## Phase 1: Gateway Foundation
 
@@ -73,7 +73,44 @@ RTK is optional and orthogonal to permission policy (see Kamui's RTK Decision fo
 it would compress `run_command` output before it reaches the model, nothing more. Skip it until
 `run_command` output volume is actually a problem in practice.
 
-## Phase 3: Session and Approval Quality
+## Phase 3: Scheduled Tasks
+
+- [x] `schedule_task` tool: one-shot future prompt, run through the same agent loop
+- [x] Timezone-aware scheduling (onboarding asks for an IANA timezone, stored in `kumo.toml`)
+- [x] Background scheduler polling loop, sharing the turn lock with live messages
+- [ ] Recurring tasks (daily/weekly), not just one-shot
+- [ ] A way to list or cancel a pending scheduled task from Telegram
+
+This was previously listed under Not Planned, reasoning that "every turn is triggered by an inbound
+message" and a scheduler was a large, separate effort. In practice the scope was smaller than
+expected because `run_agent` already took no Telegram-specific state as input (`bot`, `chat_id`,
+`state`, `approvals`, `history`, `prompt` — all plain values), so a background poller
+(`src/scheduler.rs`) can call the exact same function a live message does; no second code path for
+"answering a prompt" was needed.
+
+A `scheduled_tasks` SQLite table (`user_version = 3`) holds one-shot rows: `telegram_chat_id`,
+`prompt`, `run_at` (unix seconds), and a `status` that starts `pending` and ends `completed` or
+`failed`. The model requests a schedule via the `schedule_task` tool, passing an RFC 3339 timestamp
+with a UTC offset that it computes from the current date/time and the user's configured timezone,
+both given in the system prompt; Kumo validates the timestamp is in the future and less than a year
+out (a sanity bound against a misparsed year) before persisting it. Scheduling itself does not
+require approval — recording a future intent is not a side effect — but when the task actually runs,
+any tool it requests that needs confirmation (`run_command`, an untrusted MCP tool) still goes
+through the normal Telegram Allow once/Deny flow with the same 2-minute timeout, so an unattended run
+can still wait for the owner rather than silently doing something irreversible.
+
+The scheduler polls every 30 seconds and takes the same `turn_lock` mutex as incoming messages, so a
+scheduled task's agent loop and a live conversation's agent loop never interleave. Timezone support
+(`chrono-tz`, `Config::timezone()`, falling back to UTC for installs from before this field existed)
+exists specifically to make "in 2 minutes" or "tomorrow at 9am" resolve correctly without the model
+having to guess an offset.
+
+What is intentionally out of scope for now: recurring schedules (a `repeat_interval` column would be
+the natural extension, but one-shot covers the common "remind me" case first) and any Telegram UI to
+inspect or cancel a pending task before it fires — today `/status` does not surface pending scheduled
+tasks at all. Both are reasonable follow-ups once one-shot scheduling sees real use.
+
+## Phase 4: Session and Approval Quality
 
 - [ ] `/sessions` — list saved sessions for the current chat
 - [ ] `/resume <id>` — switch the active session back to a past one
@@ -93,7 +130,7 @@ The approval flow is currently "allow once" for every single confirmable call, w
 `trusted` in `kumo.toml`. A scoped, session-lifetime allow (not persisted past `/new`) would cut
 repeated approval prompts for a chatty multi-step task without weakening the default posture.
 
-## Phase 4: Gateway Hardening
+## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
 - [ ] Per-chat workspace selection (today one `workspace: PathBuf` serves the whole process)
@@ -123,8 +160,6 @@ a schedule.
 
 - [ ] Other messaging platforms (Slack, Discord, WhatsApp, Matrix) — Kumo is a Telegram gateway by
   design, not a multi-platform bot framework; a second platform is a different project
-- [ ] Scheduled or background tasks / a job queue — every turn is triggered by an inbound message;
-  Kumo does not initiate conversations on its own, and adding a scheduler is a large, separate effort
 - [ ] Image or voice input — no multimodal path exists in `provider::Message` today; Telegram
   messages without `.text()` are already ignored
 - [ ] A plugin system beyond MCP — MCP already gives Kumo an extension point (any stdio server's

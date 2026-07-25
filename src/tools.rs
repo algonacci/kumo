@@ -1,15 +1,21 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex;
 
-use crate::provider::{ToolCall, ToolDefinition};
+use crate::{
+    provider::{ToolCall, ToolDefinition},
+    storage::Database,
+};
 
 const MAX_FILE_SIZE: u64 = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 200;
@@ -18,11 +24,16 @@ const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
 /// Coding tasks delegated to Kamui can run a whole agent loop (read, edit, test), so they get more
 /// headroom than a single shell command.
 const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
+/// How far into the future a scheduled task may be set, as a sanity bound against the model
+/// misparsing a relative date (e.g. the wrong year).
+const MAX_SCHEDULE_HORIZON: chrono::Duration = chrono::Duration::days(366);
 
 #[derive(Clone)]
 pub struct ToolRegistry {
     root: PathBuf,
-    extra: Vec<std::sync::Arc<dyn ExternalTool>>,
+    extra: Vec<Arc<dyn ExternalTool>>,
+    database: Arc<Mutex<Database>>,
+    timezone: chrono_tz::Tz,
 }
 
 #[async_trait]
@@ -35,14 +46,24 @@ pub trait ExternalTool: Send + Sync {
 }
 
 impl ToolRegistry {
-    pub fn new(root: PathBuf, extra: Vec<std::sync::Arc<dyn ExternalTool>>) -> Result<Self> {
+    pub fn new(
+        root: PathBuf,
+        extra: Vec<Arc<dyn ExternalTool>>,
+        database: Arc<Mutex<Database>>,
+        timezone: chrono_tz::Tz,
+    ) -> Result<Self> {
         let root = root
             .canonicalize()
             .with_context(|| format!("could not resolve workspace {}", root.display()))?;
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
         }
-        Ok(Self { root, extra })
+        Ok(Self {
+            root,
+            extra,
+            database,
+            timezone,
+        })
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -112,6 +133,29 @@ impl ToolRegistry {
                 }),
             });
         }
+        definitions.push(ToolDefinition {
+            name: "schedule_task".to_owned(),
+            description: "Schedule a one-shot message to yourself for a future time. At the \
+                          scheduled time, the given prompt is sent through your own agent loop \
+                          (with all the same tools) as if the user had just sent it, and the \
+                          result is delivered to the user in this chat. Use the user's configured \
+                          timezone (given in the system prompt) to compute run_at."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The instruction to run at the scheduled time, e.g. \"check BTC price and summarize the last 24h\"."
+                    },
+                    "run_at": {
+                        "type": "string",
+                        "description": "When to run, as RFC 3339 with a UTC offset, e.g. \"2026-07-27T09:00:00+07:00\"."
+                    }
+                },
+                "required": ["prompt", "run_at"]
+            }),
+        });
         definitions.extend(self.extra.iter().map(|tool| tool.definition()));
         definitions
     }
@@ -143,12 +187,15 @@ impl ToolRegistry {
         }
     }
 
-    pub async fn dispatch(&self, call: &ToolCall) -> String {
+    /// Dispatch a tool call made while answering `chat_id`. Only `schedule_task` needs the chat
+    /// ID today (to know where to deliver the result later); every other tool ignores it.
+    pub async fn dispatch(&self, chat_id: i64, call: &ToolCall) -> String {
         let result = match call.name.as_str() {
             "read_file" => self.read_file(&call.arguments),
             "list_directory" => self.list_directory(&call.arguments),
             "run_command" => self.run_command(&call.arguments).await,
             "delegate_to_kamui" => self.delegate_to_kamui(&call.arguments).await,
+            "schedule_task" => self.schedule_task(chat_id, &call.arguments).await,
             _ => match self.extra.iter().find(|tool| tool.name() == call.name) {
                 Some(tool) => tool.run(&call.arguments).await,
                 None => Err(anyhow::anyhow!("unknown tool '{}'", call.name)),
@@ -275,6 +322,46 @@ impl ToolRegistry {
             )),
         }
     }
+
+    /// Record a one-shot scheduled task. Actually running it later is the scheduler loop's job
+    /// (`src/scheduler.rs`); this only validates and persists the request.
+    async fn schedule_task(&self, chat_id: i64, arguments: &str) -> Result<String> {
+        let arguments: ScheduleArguments =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let prompt = arguments.prompt.trim();
+        if prompt.is_empty() {
+            bail!("schedule_task requires a non-empty 'prompt' argument");
+        }
+        let run_at = DateTime::parse_from_rfc3339(&arguments.run_at).with_context(|| {
+            format!(
+                "run_at was not a valid RFC 3339 timestamp: {}",
+                arguments.run_at
+            )
+        })?;
+        let now = chrono::Utc::now();
+        if run_at < now {
+            bail!("run_at ({}) is in the past", arguments.run_at);
+        }
+        if run_at.signed_duration_since(now) > MAX_SCHEDULE_HORIZON {
+            bail!(
+                "run_at is more than {} days in the future; double-check the year",
+                MAX_SCHEDULE_HORIZON.num_days()
+            );
+        }
+
+        let id = self.database.lock().await.create_scheduled_task(
+            chat_id,
+            prompt,
+            run_at.timestamp(),
+        )?;
+        let local_time = run_at.with_timezone(&self.timezone);
+        Ok(format!(
+            "scheduled ({}): will run at {} ({})",
+            &id[..8],
+            local_time.format("%Y-%m-%d %H:%M %Z"),
+            self.timezone
+        ))
+    }
 }
 
 /// Whether the `kamui` binary is reachable on `PATH`. Detected once per process; delegation is an
@@ -306,6 +393,12 @@ struct CommandArguments {
 #[derive(Deserialize)]
 struct TaskArguments {
     task: String,
+}
+
+#[derive(Deserialize)]
+struct ScheduleArguments {
+    prompt: String,
+    run_at: String,
 }
 
 fn parse_command(arguments: &str) -> Result<String> {
@@ -399,28 +492,42 @@ mod tests {
         root
     }
 
+    fn test_database() -> Arc<Mutex<Database>> {
+        Arc::new(Mutex::new(Database::open_in_memory_for_tests()))
+    }
+
+    fn registry(root: PathBuf, extra: Vec<Arc<dyn ExternalTool>>) -> ToolRegistry {
+        ToolRegistry::new(root, extra, test_database(), chrono_tz::UTC).unwrap()
+    }
+
     #[tokio::test]
     async fn reads_and_lists_workspace_content() {
         let root = workspace();
-        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
+        let tools = registry(root.clone(), Vec::new());
 
         assert_eq!(
             tools
-                .dispatch(&ToolCall {
-                    id: "1".into(),
-                    name: "read_file".into(),
-                    arguments: r#"{"path":"hello.txt"}"#.into(),
-                })
+                .dispatch(
+                    42,
+                    &ToolCall {
+                        id: "1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"hello.txt"}"#.into(),
+                    }
+                )
                 .await,
             "hello"
         );
         assert!(
             tools
-                .dispatch(&ToolCall {
-                    id: "2".into(),
-                    name: "list_directory".into(),
-                    arguments: r#"{"path":"."}"#.into(),
-                })
+                .dispatch(
+                    42,
+                    &ToolCall {
+                        id: "2".into(),
+                        name: "list_directory".into(),
+                        arguments: r#"{"path":"."}"#.into(),
+                    }
+                )
                 .await
                 .contains("hello.txt")
         );
@@ -434,13 +541,16 @@ mod tests {
         let outside_name = format!("kumo-outside-{}.txt", Uuid::new_v4());
         let outside = root.parent().unwrap().join(&outside_name);
         std::fs::write(&outside, "secret").unwrap();
-        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
+        let tools = registry(root.clone(), Vec::new());
         let output = tools
-            .dispatch(&ToolCall {
-                id: "1".into(),
-                name: "read_file".into(),
-                arguments: format!(r#"{{"path":"../{outside_name}"}}"#),
-            })
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"../{outside_name}"}}"#),
+                },
+            )
             .await;
 
         assert!(output.contains("escapes the configured workspace"));
@@ -451,18 +561,21 @@ mod tests {
     #[tokio::test]
     async fn runs_commands_in_workspace() {
         let root = workspace();
-        let tools = ToolRegistry::new(root.clone(), Vec::new()).unwrap();
+        let tools = registry(root.clone(), Vec::new());
         let command = if cfg!(windows) {
             "type hello.txt"
         } else {
             "cat hello.txt"
         };
         let output = tools
-            .dispatch(&ToolCall {
-                id: "1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({ "command": command }).to_string(),
-            })
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command }).to_string(),
+                },
+            )
             .await;
 
         assert!(output.starts_with("exit code: 0"));
@@ -482,8 +595,7 @@ mod tests {
     #[tokio::test]
     async fn routes_external_tools_through_shared_policy() {
         let root = workspace();
-        let tools =
-            ToolRegistry::new(root.clone(), vec![std::sync::Arc::new(FakeExternalTool)]).unwrap();
+        let tools = registry(root.clone(), vec![Arc::new(FakeExternalTool)]);
         let call = ToolCall {
             id: "1".into(),
             name: "fake__ping".into(),
@@ -498,7 +610,7 @@ mod tests {
         );
         assert!(tools.requires_confirmation(&call.name));
         assert_eq!(tools.preview(&call).as_deref(), Some("Fake {}"));
-        assert_eq!(tools.dispatch(&call).await, "pong");
+        assert_eq!(tools.dispatch(42, &call).await, "pong");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -519,13 +631,13 @@ mod tests {
 
     #[test]
     fn delegate_to_kamui_always_requires_confirmation() {
-        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        let tools = registry(std::env::temp_dir(), Vec::new());
         assert!(tools.requires_confirmation("delegate_to_kamui"));
     }
 
     #[test]
     fn delegate_to_kamui_preview_shows_the_task() {
-        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        let tools = registry(std::env::temp_dir(), Vec::new());
         let call = ToolCall {
             id: "1".into(),
             name: "delegate_to_kamui".into(),
@@ -543,13 +655,90 @@ mod tests {
         // Whether `kamui` is actually installed on the machine running the suite varies, so this
         // only exercises the argument-validation path shared with parse_task, which runs before
         // any process is spawned and is deterministic either way.
-        let tools = ToolRegistry::new(std::env::temp_dir(), Vec::new()).unwrap();
+        let tools = registry(std::env::temp_dir(), Vec::new());
         let call = ToolCall {
             id: "1".into(),
             name: "delegate_to_kamui".into(),
             arguments: r#"{"task":""}"#.into(),
         };
 
-        assert!(tools.dispatch(&call).await.starts_with("Error:"));
+        assert!(tools.dispatch(42, &call).await.starts_with("Error:"));
+    }
+
+    #[test]
+    fn schedule_task_never_requires_confirmation() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        assert!(!tools.requires_confirmation("schedule_task"));
+    }
+
+    #[tokio::test]
+    async fn schedule_task_rejects_an_invalid_timestamp() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: r#"{"prompt":"ping","run_at":"not a date"}"#.into(),
+        };
+
+        assert!(tools.dispatch(42, &call).await.starts_with("Error:"));
+    }
+
+    #[tokio::test]
+    async fn schedule_task_rejects_a_time_in_the_past() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: r#"{"prompt":"ping","run_at":"2000-01-01T00:00:00+00:00"}"#.into(),
+        };
+
+        let output = tools.dispatch(42, &call).await;
+        assert!(output.starts_with("Error:"), "{output}");
+        assert!(output.contains("past"));
+    }
+
+    #[tokio::test]
+    async fn schedule_task_rejects_a_time_too_far_in_the_future() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: r#"{"prompt":"ping","run_at":"2099-01-01T00:00:00+00:00"}"#.into(),
+        };
+
+        let output = tools.dispatch(42, &call).await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn schedule_task_persists_a_valid_future_task() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        let next_year = chrono::Utc::now() + chrono::Duration::days(30);
+        let run_at = next_year.to_rfc3339();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: serde_json::json!({ "prompt": "check the weather", "run_at": run_at })
+                .to_string(),
+        };
+
+        let output = tools.dispatch(42, &call).await;
+        assert!(output.starts_with("scheduled ("), "{output}");
+
+        let due = database
+            .lock()
+            .await
+            .due_scheduled_tasks(next_year.timestamp() + 1)
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].prompt, "check the weather");
+        assert_eq!(due[0].telegram_chat_id, 42);
     }
 }

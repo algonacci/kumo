@@ -4,6 +4,7 @@ mod markdown;
 mod mcp;
 mod onboarding;
 mod provider;
+mod scheduler;
 mod storage;
 mod tools;
 
@@ -23,26 +24,26 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tools::ToolRegistry;
 use uuid::Uuid;
 
-struct AppState {
+pub(crate) struct AppState {
     config: Config,
     provider: Provider,
     tools: ToolRegistry,
     mcp_statuses: Vec<String>,
 }
 
-struct AgentTurn {
-    answer: String,
-    record: Vec<ProviderMessage>,
-    usage: Usage,
-    finish_reason: String,
-    model: String,
+pub(crate) struct AgentTurn {
+    pub(crate) answer: String,
+    pub(crate) record: Vec<ProviderMessage>,
+    pub(crate) usage: Usage,
+    pub(crate) finish_reason: String,
+    pub(crate) model: String,
 }
 
 const MAX_TOOL_ROUNDS: usize = 8;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
 const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. If delegate_to_kamui is available and the task involves editing files or a multi-step coding change, prefer it over run_command: it runs a dedicated coding agent with a proper diff-reviewed file editor, rather than an ad hoc shell command.";
-type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,9 +56,9 @@ async fn main() -> Result<()> {
 
     let existing = Config::exists()?.then(Config::load).transpose()?;
     let needs_onboarding = matches!(command, Command::Onboard)
-        || existing
-            .as_ref()
-            .is_none_or(|config| config.provider.is_none() || config.tools.is_none());
+        || existing.as_ref().is_none_or(|config| {
+            config.provider.is_none() || config.tools.is_none() || config.timezone.is_none()
+        });
     let config = if needs_onboarding {
         let reconfigure_provider = matches!(command, Command::Onboard);
         let config = onboarding::run(existing, reconfigure_provider).await?;
@@ -109,8 +110,8 @@ async fn run_gateway(config: Config) -> Result<()> {
             ),
         }
     }
-    let tools = ToolRegistry::new(workspace, mcp.tools)?;
     let database = Arc::new(Mutex::new(Database::open()?));
+    let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?;
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let state = Arc::new(RwLock::new(AppState {
@@ -138,6 +139,14 @@ async fn run_gateway(config: Config) -> Result<()> {
     );
     drop(current);
     println!("Press Ctrl+C to stop.");
+
+    let scheduler_task = tokio::spawn(scheduler::run(
+        bot.clone(),
+        state.clone(),
+        approvals.clone(),
+        database.clone(),
+        turn_lock.clone(),
+    ));
 
     let handler = teloxide::dptree::entry()
         .branch(Update::filter_message().endpoint(
@@ -192,6 +201,7 @@ async fn run_gateway(config: Config) -> Result<()> {
             println!("Kumo stopped.");
         }
     }
+    scheduler_task.abort();
 
     Ok(())
 }
@@ -285,7 +295,7 @@ async fn handle_message(
     Ok(())
 }
 
-async fn run_agent(
+pub(crate) async fn run_agent(
     bot: &Bot,
     chat_id: ChatId,
     state: &RwLock<AppState>,
@@ -293,16 +303,22 @@ async fn run_agent(
     history: storage::History,
     prompt: &str,
 ) -> Result<AgentTurn> {
-    let (provider, tool_definitions, model) = {
+    let (provider, tool_definitions, model, timezone) = {
         let state = state.read().await;
         (
             state.provider.clone(),
             state.tools.definitions(),
             state.provider.active_model().to_owned(),
+            state.config.timezone(),
         )
     };
     let user_message = ProviderMessage::user(prompt);
     let mut system = SYSTEM_PROMPT.to_owned();
+    let now = chrono::Utc::now().with_timezone(&timezone);
+    system.push_str(&format!(
+        "\n\nCurrent date and time: {} ({timezone}).",
+        now.format("%Y-%m-%d %H:%M:%S %:z")
+    ));
     if let Some(summary) = &history.summary {
         system.push_str("\n\nSummary of the earlier conversation:\n\n");
         system.push_str(summary);
@@ -350,13 +366,13 @@ async fn run_agent(
                     Some(preview)
                         if request_approval(bot, chat_id, approvals, &preview).await? =>
                     {
-                        tools.dispatch(&call).await
+                        tools.dispatch(chat_id.0, &call).await
                     }
                     Some(_) => "User denied this command. Do not run it.".to_owned(),
                     None => "Error: invalid command arguments".to_owned(),
                 }
             } else {
-                tools.dispatch(&call).await
+                tools.dispatch(chat_id.0, &call).await
             };
             let result_message = ProviderMessage::tool_result(call.id, output);
             messages.push(result_message.clone());
@@ -367,7 +383,7 @@ async fn run_agent(
     bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
 }
 
-async fn prepare_history(
+pub(crate) async fn prepare_history(
     state: &RwLock<AppState>,
     database: &Mutex<Database>,
     chat_id: i64,
@@ -543,7 +559,7 @@ async fn handle_approval_callback(
 
 /// Send one message chunk rendered as MarkdownV2. Falls back to plain text if Telegram rejects the
 /// formatted version (e.g. an entity split across a chunk boundary), so the reply is never lost.
-async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> Result<()> {
+pub(crate) async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> Result<()> {
     let formatted = markdown::to_telegram_markdown_v2(chunk);
     let sent = bot
         .send_message(chat_id, formatted)
@@ -559,7 +575,7 @@ async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> Result<()> {
     }
 }
 
-fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
+pub(crate) fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
     if message.is_empty() {
         return Vec::new();
     }

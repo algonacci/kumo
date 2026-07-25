@@ -1,0 +1,97 @@
+//! Polls for due scheduled tasks and runs each one through the same agent loop as an ordinary
+//! Telegram message, delivering the result to the chat that scheduled it.
+
+use std::{sync::Arc, time::Duration};
+
+use anyhow::Result;
+use teloxide::prelude::*;
+use tokio::sync::{Mutex, RwLock};
+
+use crate::{
+    AppState, PendingApprovals, prepare_history, run_agent, send_formatted, storage::Database,
+};
+
+/// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
+/// a personal-assistant feature, not a precision timer, so this is a deliberate simplicity trade.
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Runs until the process exits; intended to be spawned once alongside the Telegram dispatcher.
+/// Shares `turn_lock` with `handle_message` so a scheduled task and an incoming message never run
+/// their agent loops concurrently and contend over the same approval slot.
+pub async fn run(
+    bot: Bot,
+    state: Arc<RwLock<AppState>>,
+    approvals: PendingApprovals,
+    database: Arc<Mutex<Database>>,
+    turn_lock: Arc<Mutex<()>>,
+) {
+    let mut interval = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        interval.tick().await;
+        if let Err(error) = run_due_tasks(&bot, &state, &approvals, &database, &turn_lock).await {
+            eprintln!("Scheduler error: {error:#}");
+        }
+    }
+}
+
+async fn run_due_tasks(
+    bot: &Bot,
+    state: &Arc<RwLock<AppState>>,
+    approvals: &PendingApprovals,
+    database: &Arc<Mutex<Database>>,
+    turn_lock: &Arc<Mutex<()>>,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let due = database.lock().await.due_scheduled_tasks(now)?;
+
+    for task in due {
+        let _turn_guard = turn_lock.lock().await;
+        let chat_id = ChatId(task.telegram_chat_id);
+        println!(
+            "Running scheduled task {} for chat {chat_id} (was due at {})",
+            &task.id[..8],
+            task.run_at
+        );
+
+        let outcome =
+            run_scheduled_task(bot, chat_id, state, approvals, database, &task.prompt).await;
+        let status = match &outcome {
+            Ok(()) => "completed",
+            Err(error) => {
+                eprintln!("Scheduled task {} failed: {error:#}", &task.id[..8]);
+                "failed"
+            }
+        };
+        database
+            .lock()
+            .await
+            .complete_scheduled_task(&task.id, status)?;
+    }
+    Ok(())
+}
+
+async fn run_scheduled_task(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &Arc<RwLock<AppState>>,
+    approvals: &PendingApprovals,
+    database: &Arc<Mutex<Database>>,
+    prompt: &str,
+) -> Result<()> {
+    let history = prepare_history(state, database, chat_id.0).await?;
+    let turn = run_agent(bot, chat_id, state, approvals, history, prompt).await?;
+
+    bot.send_message(chat_id, "\u{23f0} Scheduled task:")
+        .await?;
+    for chunk in crate::message_chunks(&turn.answer, 4000) {
+        send_formatted(bot, chat_id, &chunk).await?;
+    }
+    database.lock().await.save_turn(
+        chat_id.0,
+        &turn.model,
+        &turn.record,
+        &turn.usage,
+        &turn.finish_reason,
+    )?;
+    Ok(())
+}

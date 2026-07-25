@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 2;
+const CURRENT_VERSION: i64 = 3;
 
 pub struct Database {
     connection: Connection,
@@ -27,6 +27,13 @@ pub struct ActiveSession {
 pub struct History {
     pub messages: Vec<Message>,
     pub summary: Option<String>,
+}
+
+pub struct ScheduledTask {
+    pub id: String,
+    pub telegram_chat_id: i64,
+    pub prompt: String,
+    pub run_at: i64,
 }
 
 impl Database {
@@ -55,11 +62,23 @@ impl Database {
         if version < 2 {
             migrate_to_v2(&connection)?;
         }
+        if version < 3 {
+            migrate_to_v3(&connection)?;
+        }
         Ok(Self { connection, path })
     }
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory_for_tests() -> Self {
+        Self::initialize(
+            Connection::open_in_memory().unwrap(),
+            PathBuf::from(":memory:"),
+        )
+        .unwrap()
     }
 
     pub fn load_active_history(&self, chat_id: i64) -> Result<History> {
@@ -247,6 +266,45 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Schedule a one-shot prompt to run against `chat_id`'s agent loop at `run_at` (unix seconds).
+    pub fn create_scheduled_task(&self, chat_id: i64, prompt: &str, run_at: i64) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO scheduled_tasks (id, telegram_chat_id, prompt, run_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, chat_id, prompt, run_at],
+        )?;
+        Ok(id)
+    }
+
+    /// Pending tasks whose `run_at` has passed, oldest first, ready to be dispatched.
+    pub fn due_scheduled_tasks(&self, now: i64) -> Result<Vec<ScheduledTask>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, telegram_chat_id, prompt, run_at FROM scheduled_tasks
+             WHERE status = 'pending' AND run_at <= ?1
+             ORDER BY run_at",
+        )?;
+        let rows = statement.query_map([now], |row| {
+            Ok(ScheduledTask {
+                id: row.get(0)?,
+                telegram_chat_id: row.get(1)?,
+                prompt: row.get(2)?,
+                run_at: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Mark a task's terminal outcome so it is never picked up again by `due_scheduled_tasks`.
+    pub fn complete_scheduled_task(&self, id: &str, status: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE scheduled_tasks SET status = ?2 WHERE id = ?1",
+            params![id, status],
+        )?;
+        Ok(())
+    }
 }
 
 fn migrate_to_v1(connection: &Connection) -> Result<()> {
@@ -296,6 +354,25 @@ fn migrate_to_v2(connection: &Connection) -> Result<()> {
          ALTER TABLE sessions ADD COLUMN summary TEXT;
          ALTER TABLE sessions ADD COLUMN summarized_message_id INTEGER NOT NULL DEFAULT 0;
          PRAGMA user_version = 2;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v3(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE scheduled_tasks (
+             id TEXT PRIMARY KEY,
+             telegram_chat_id INTEGER NOT NULL,
+             prompt TEXT NOT NULL,
+             run_at INTEGER NOT NULL,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed', 'cancelled'))
+                 DEFAULT 'pending'
+         );
+         CREATE INDEX scheduled_tasks_due ON scheduled_tasks(status, run_at);
+         PRAGMA user_version = 3;
          COMMIT;",
     )?;
     Ok(())
@@ -497,5 +574,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(full_count, 8);
+    }
+
+    #[test]
+    fn due_scheduled_tasks_returns_only_pending_tasks_at_or_before_now() {
+        let database = database();
+        let past = database
+            .create_scheduled_task(42, "check the weather", 100)
+            .unwrap();
+        let future = database
+            .create_scheduled_task(42, "check it later", 1_000_000)
+            .unwrap();
+
+        let due = database.due_scheduled_tasks(500).unwrap();
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, past);
+        assert_eq!(due[0].prompt, "check the weather");
+        assert_ne!(due[0].id, future);
+    }
+
+    #[test]
+    fn completed_tasks_are_not_returned_as_due_again() {
+        let database = database();
+        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+
+        database.complete_scheduled_task(&id, "completed").unwrap();
+
+        assert!(database.due_scheduled_tasks(500).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_to_v3_adds_the_scheduled_tasks_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        migrate_to_v2(&connection).unwrap();
+        migrate_to_v3(&connection).unwrap();
+
+        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        let id = database.create_scheduled_task(1, "test", 0).unwrap();
+
+        assert_eq!(database.due_scheduled_tasks(0).unwrap()[0].id, id);
     }
 }

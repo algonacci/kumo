@@ -36,6 +36,7 @@ On first run, Kumo starts an interactive setup that:
 - asks for an OpenAI-compatible provider URL and API key;
 - discovers the provider's available models and lets the user choose one;
 - asks which workspace Kumo may inspect;
+- asks for the user's timezone (used to interpret times for scheduled tasks);
 - saves everything to the OS config directory as `kumo/kumo.toml`.
 
 No `.env` file or manual user ID lookup is required. The pairing nonce ensures that an unrelated
@@ -98,6 +99,11 @@ The model may call these tools while answering:
   diff-reviewed file editor, so this is the right tool for anything that involves changing files;
   `run_command` remains for one-off shell commands. Only offered to the model when a `kamui` binary
   is found on `PATH` at startup, and bounded to a 5-minute timeout.
+- `schedule_task` schedules a one-shot prompt for a future time, computed from the user's
+  configured timezone. At the scheduled time, Kumo runs the prompt through the same agent loop as a
+  normal message — with all the same tools, subject to the same approvals — and delivers the result
+  to the chat that scheduled it, prefixed with "⏰ Scheduled task:". Does not require approval to
+  schedule; approval still applies to whatever tools the task itself calls when it runs.
 
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
 the workspace, including through symlinks.
@@ -106,7 +112,14 @@ Every command or Kamui delegation request displays **Allow once** and **Deny** b
 Approval expires after two minutes and cannot be replayed. Commands run with stdin disabled, a
 30-second timeout, and a 16 KiB combined output limit; a Kamui delegation gets a 5-minute timeout
 instead, since a coding task can involve several tool rounds inside Kamui's own agent loop. A
-timed-out command or delegation is terminated.
+timed-out command or delegation is terminated. A scheduled task that requests an approval-gated tool
+sends the same Allow once/Deny prompt when it runs, so an unattended task can still wait (up to the
+usual 2-minute approval window) for the owner to respond.
+
+A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
+incoming messages, so a scheduled task and a live conversation never run their agent loops at the
+same time. Scheduling itself is a plain SQLite row — no separate process or external scheduler is
+required.
 
 ## MCP servers
 

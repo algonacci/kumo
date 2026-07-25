@@ -13,6 +13,10 @@ pub struct Config {
     pub provider: Option<ProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
+    /// IANA timezone name (e.g. "Asia/Jakarta"), used to interpret relative times in scheduled
+    /// tasks. Missing on installs that predate scheduling; `Config::timezone` falls back to UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerConfig>,
 }
@@ -80,6 +84,15 @@ impl Config {
             .as_ref()
             .context("model provider is not configured; run `kumo onboard`")
     }
+
+    /// The configured IANA timezone, or UTC on installs from before scheduling existed. The
+    /// timezone name is validated at onboarding time, so a stored value always parses here.
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.timezone
+            .as_deref()
+            .and_then(|name| name.parse().ok())
+            .unwrap_or(chrono_tz::UTC)
+    }
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -123,6 +136,7 @@ mod tests {
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
             }),
+            timezone: Some("Asia/Jakarta".into()),
             mcp: BTreeMap::from([(
                 "files".into(),
                 McpServerConfig {
@@ -145,6 +159,7 @@ mod tests {
             PathBuf::from("/tmp/workspace")
         );
         assert!(decoded.mcp["files"].trusted);
+        assert_eq!(decoded.timezone.as_deref(), Some("Asia/Jakarta"));
     }
 
     #[test]
@@ -157,5 +172,17 @@ mod tests {
         assert!(decoded.provider.is_none());
         assert!(decoded.tools.is_none());
         assert!(decoded.mcp.is_empty());
+        assert!(decoded.timezone.is_none());
+        assert_eq!(decoded.timezone(), chrono_tz::UTC);
+    }
+
+    #[test]
+    fn timezone_resolves_a_configured_iana_name() {
+        let decoded: Config = toml::from_str(
+            "timezone = \"Asia/Jakarta\"\n[telegram]\nbot_token = \"t\"\nbot_username = \"b\"\nowner_user_id = 1",
+        )
+        .unwrap();
+
+        assert_eq!(decoded.timezone(), chrono_tz::Asia::Jakarta);
     }
 }

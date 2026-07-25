@@ -10,6 +10,8 @@ use crate::{
     provider,
 };
 
+use chrono_tz::TZ_VARIANTS;
+
 const BOTFATHER_URL: &str = "https://t.me/BotFather";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
@@ -19,13 +21,18 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
     println!("===============");
     println!();
 
-    let (telegram, existing_provider, mcp) = match existing {
+    let (telegram, existing_provider, existing_timezone, mcp) = match existing {
         Some(config) => {
             println!(
                 "Telegram is already connected as @{}.",
                 config.telegram.bot_username
             );
-            (config.telegram, config.provider, config.mcp)
+            (
+                config.telegram,
+                config.provider,
+                config.timezone,
+                config.mcp,
+            )
         }
         None => {
             let telegram = setup_telegram().await?;
@@ -33,10 +40,11 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
                 telegram: telegram.clone(),
                 provider: None,
                 tools: None,
+                timezone: None,
                 mcp: Default::default(),
             }
             .save()?;
-            (telegram, None, Default::default())
+            (telegram, None, None, Default::default())
         }
     };
     let provider = match existing_provider {
@@ -44,10 +52,15 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
         _ => setup_provider().await?,
     };
     let tools = setup_tools()?;
+    let timezone = match existing_timezone {
+        Some(timezone) => timezone,
+        None => setup_timezone()?,
+    };
     let config = Config {
         telegram,
         provider: Some(provider),
         tools: Some(tools),
+        timezone: Some(timezone),
         mcp,
     };
     let path = config.save()?;
@@ -56,6 +69,24 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
     println!("Setup complete.");
     println!("Configuration saved to {}", path.display());
     Ok(config)
+}
+
+fn setup_timezone() -> Result<String> {
+    let theme = ColorfulTheme::default();
+    println!();
+    println!("Choose your timezone, used to interpret times for scheduled tasks.");
+
+    let names: Vec<&str> = TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+    let default = names
+        .iter()
+        .position(|name| *name == "UTC")
+        .unwrap_or_default();
+    let selected = FuzzySelect::with_theme(&theme)
+        .with_prompt("Timezone (type to search, e.g. Jakarta)")
+        .items(&names)
+        .default(default)
+        .interact()?;
+    Ok(names[selected].to_owned())
 }
 
 fn setup_tools() -> Result<ToolsConfig> {
