@@ -123,6 +123,11 @@ The model may call these tools while answering:
   schedule; approval still applies to whatever tools the task itself calls when it runs.
 - `remember`, `update_memory`, and `forget` manage permanent, global memory (see Memory below). None
   require approval — they only store or remove text.
+- `ask_user` pauses the turn to ask a clarifying question, with up to 4 suggested answers shown as
+  Telegram buttons. This is not an approval prompt (those still happen automatically for
+  `run_command`/`delegate_to_kamui`/untrusted MCP tools) — it's for when the model genuinely needs
+  more information to continue, like which of several matches was meant. The user can tap a button
+  or just reply with free text; either way resolves the question and the agent loop continues.
 
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
 the workspace, including through symlinks.
@@ -133,7 +138,9 @@ Approval expires after two minutes and cannot be replayed. Commands run with std
 instead, since a coding task can involve several tool rounds inside Kamui's own agent loop. A
 timed-out command or delegation is terminated. A scheduled task that requests an approval-gated tool
 sends the same Allow once/Deny prompt when it runs, so an unattended task can still wait (up to the
-usual 2-minute approval window) for the owner to respond.
+usual 2-minute approval window) for the owner to respond. `ask_user` waits the same two minutes; if
+nobody answers in time, the question is withdrawn (its buttons stop working) and the model is told
+the user didn't answer, so the turn can still finish rather than hanging indefinitely.
 
 A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
 incoming messages, so a scheduled task and a live conversation never run their agent loops at the

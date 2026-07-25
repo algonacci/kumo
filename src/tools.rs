@@ -218,6 +218,34 @@ impl ToolRegistry {
                 "required": ["matching"]
             }),
         });
+        definitions.push(ToolDefinition {
+            name: "ask_user".to_owned(),
+            description: "Pause and ask the user a clarifying question before proceeding, when \
+                          a task is ambiguous or has multiple reasonable interpretations. This is \
+                          not for approval of a risky action (run_command and delegate_to_kamui \
+                          already ask for that automatically) — use it when you genuinely need \
+                          more information to continue, e.g. which of several matching files was \
+                          meant, or a preference between reasonable options. The user can tap one \
+                          of the offered options or reply with free text instead."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask, e.g. \"Which file did you mean?\""
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "2-4 short suggested answers shown as buttons, e.g. [\"src/main.rs\", \"src/lib.rs\"]. Optional — omit for an open-ended question with no natural fixed choices."
+                    }
+                },
+                "required": ["question"]
+            }),
+        });
+        // ask_user is dispatched specially by run_agent (it needs the bot and chat, which
+        // ToolRegistry does not have), so it is not listed in requires_confirmation/dispatch below.
         definitions.extend(self.extra.iter().map(|tool| tool.definition()));
         definitions
     }

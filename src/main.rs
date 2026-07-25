@@ -51,6 +51,21 @@ const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
 const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. If delegate_to_kamui is available and the task involves editing files or a multi-step coding change, prefer it over run_command: it runs a dedicated coding agent with a proper diff-reviewed file editor, rather than an ad hoc shell command.";
 pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
+/// State for one in-flight `ask_user` question: which chat it was asked in (so `handle_message`
+/// can tell whether incoming text should answer it instead of starting a new turn), the offered
+/// button labels (so a callback's option *index* — kept short to fit Telegram's 64-byte callback
+/// data limit — can be turned back into the actual answer text), and the sender that delivers the
+/// final answer back to `ask_user`.
+pub(crate) struct PendingQuestion {
+    chat_id: ChatId,
+    options: Vec<String>,
+    sender: oneshot::Sender<String>,
+}
+
+/// Nonce -> pending question. A question's answer is free text: either the label of a button the
+/// user tapped, or a plain text message they sent instead of tapping anything.
+pub(crate) type PendingQuestions = Arc<Mutex<HashMap<String, PendingQuestion>>>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let command = parse_command()?;
@@ -126,6 +141,7 @@ async fn run_gateway(config: Config) -> Result<()> {
     let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?;
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+    let questions: PendingQuestions = Arc::new(Mutex::new(HashMap::new()));
     let state = Arc::new(RwLock::new(AppState {
         config,
         provider,
@@ -157,6 +173,7 @@ async fn run_gateway(config: Config) -> Result<()> {
         bot.clone(),
         state.clone(),
         approvals.clone(),
+        questions.clone(),
         database.clone(),
         turn_lock.clone(),
     ));
@@ -167,6 +184,7 @@ async fn run_gateway(config: Config) -> Result<()> {
                   message: Message,
                   state: Arc<RwLock<AppState>>,
                   approvals: PendingApprovals,
+                  questions: PendingQuestions,
                   database: Arc<Mutex<Database>>,
                   turn_lock: Arc<Mutex<()>>| async move {
                 handle_message(
@@ -175,6 +193,7 @@ async fn run_gateway(config: Config) -> Result<()> {
                     allowed_user_id,
                     state,
                     approvals,
+                    questions,
                     database,
                     turn_lock,
                 )
@@ -182,14 +201,18 @@ async fn run_gateway(config: Config) -> Result<()> {
             },
         ))
         .branch(Update::filter_callback_query().endpoint(
-            move |bot: Bot, query: CallbackQuery, approvals: PendingApprovals| async move {
-                handle_approval_callback(bot, query, allowed_user_id, approvals).await
+            move |bot: Bot,
+                  query: CallbackQuery,
+                  approvals: PendingApprovals,
+                  questions: PendingQuestions| async move {
+                handle_callback(bot, query, allowed_user_id, approvals, questions).await
             },
         ));
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(teloxide::dptree::deps![
             state,
             approvals.clone(),
+            questions.clone(),
             database,
             turn_lock
         ])
@@ -207,6 +230,7 @@ async fn run_gateway(config: Config) -> Result<()> {
             println!();
             println!("Shutting down Kumo...");
             approvals.lock().await.clear();
+            questions.lock().await.clear();
             if let Ok(shutdown) = shutdown_token.shutdown() {
                 shutdown.await;
             }
@@ -219,12 +243,14 @@ async fn run_gateway(config: Config) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     bot: Bot,
     message: Message,
     allowed_user_id: u64,
     state: Arc<RwLock<AppState>>,
     approvals: PendingApprovals,
+    questions: PendingQuestions,
     database: Arc<Mutex<Database>>,
     turn_lock: Arc<Mutex<()>>,
 ) -> Result<()> {
@@ -235,12 +261,32 @@ async fn handle_message(
         return Ok(());
     }
 
+    // If an ask_user question is waiting on this chat, any text the user sends next answers it
+    // (a free-text reply instead of tapping one of the offered buttons) rather than starting a
+    // new command or agent turn. This check happens before the turn lock, since answering a
+    // question does not itself start a new turn — the turn that asked it is already holding the
+    // lock and waiting on this very answer.
+    if let Some(text) = message.text() {
+        let nonce = questions
+            .lock()
+            .await
+            .iter()
+            .find(|(_, pending)| pending.chat_id == message.chat.id)
+            .map(|(nonce, _)| nonce.clone());
+        if let Some(nonce) = nonce
+            && let Some(pending) = questions.lock().await.remove(&nonce)
+        {
+            let _ = pending.sender.send(text.to_owned());
+            return Ok(());
+        }
+    }
+
     // A photo has no `.text()` (only an optional `.caption()`) and never carries a slash command,
     // so it takes a separate, simpler path straight to the agent loop instead of the text command
     // routing below.
     if message.photo().is_some() {
         let _turn_guard = turn_lock.lock().await;
-        return handle_photo_message(bot, message, state, approvals, database).await;
+        return handle_photo_message(bot, message, state, approvals, questions, database).await;
     }
 
     let Some(text) = message.text() else {
@@ -321,6 +367,7 @@ async fn handle_message(
         message.chat.id,
         &state,
         &approvals,
+        &questions,
         &database,
         history,
         user_message,
@@ -342,6 +389,7 @@ async fn handle_photo_message(
     message: Message,
     state: Arc<RwLock<AppState>>,
     approvals: PendingApprovals,
+    questions: PendingQuestions,
     database: Arc<Mutex<Database>>,
 ) -> Result<()> {
     // Telegram sends several resolutions of the same photo; the last is the largest.
@@ -379,6 +427,7 @@ async fn handle_photo_message(
         message.chat.id,
         &state,
         &approvals,
+        &questions,
         &database,
         history,
         user_message,
@@ -388,16 +437,28 @@ async fn handle_photo_message(
 
 /// Shared tail of both the text and photo message paths: run the agent loop, deliver the answer
 /// (or a generic failure notice) to the chat, and persist a successful turn.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_agent_turn(
     bot: &Bot,
     chat_id: ChatId,
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
+    questions: &PendingQuestions,
     database: &Mutex<Database>,
     history: storage::History,
     user_message: ProviderMessage,
 ) -> Result<()> {
-    match run_agent(bot, chat_id, state, approvals, history, user_message).await {
+    match run_agent(
+        bot,
+        chat_id,
+        state,
+        approvals,
+        questions,
+        history,
+        user_message,
+    )
+    .await
+    {
         Ok(turn) => {
             for chunk in message_chunks(&turn.answer, 4000) {
                 send_formatted(bot, chat_id, &chunk).await?;
@@ -427,6 +488,7 @@ pub(crate) async fn run_agent(
     chat_id: ChatId,
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
+    questions: &PendingQuestions,
     history: storage::History,
     user_message: ProviderMessage,
 ) -> Result<AgentTurn> {
@@ -491,19 +553,23 @@ pub(crate) async fn run_agent(
         trail.push(request_message);
         for call in response.tool_calls {
             println!("Tool: {}", call.name);
-            let tools = state.read().await.tools.clone();
-            let output = if tools.requires_confirmation(&call.name) {
-                match tools.preview(&call) {
-                    Some(preview)
-                        if request_approval(bot, chat_id, approvals, &preview).await? =>
-                    {
-                        tools.dispatch(chat_id.0, &call).await
-                    }
-                    Some(_) => "User denied this command. Do not run it.".to_owned(),
-                    None => "Error: invalid command arguments".to_owned(),
-                }
+            let output = if call.name == "ask_user" {
+                ask_user(bot, chat_id, questions, &call.arguments).await?
             } else {
-                tools.dispatch(chat_id.0, &call).await
+                let tools = state.read().await.tools.clone();
+                if tools.requires_confirmation(&call.name) {
+                    match tools.preview(&call) {
+                        Some(preview)
+                            if request_approval(bot, chat_id, approvals, &preview).await? =>
+                        {
+                            tools.dispatch(chat_id.0, &call).await
+                        }
+                        Some(_) => "User denied this command. Do not run it.".to_owned(),
+                        None => "Error: invalid command arguments".to_owned(),
+                    }
+                } else {
+                    tools.dispatch(chat_id.0, &call).await
+                }
             };
             let result_message = ProviderMessage::tool_result(call.id, output);
             messages.push(result_message.clone());
@@ -801,11 +867,15 @@ async fn request_approval(
     Ok(approved)
 }
 
-async fn handle_approval_callback(
+/// Dispatches a Telegram inline-button tap to whichever pending prompt it answers: an
+/// `approval:<nonce>:<allow|deny>` callback from `request_approval`, or a
+/// `question:<nonce>:<index>` callback from `ask_user`.
+async fn handle_callback(
     bot: Bot,
     query: CallbackQuery,
     allowed_user_id: u64,
     approvals: PendingApprovals,
+    questions: PendingQuestions,
 ) -> Result<()> {
     bot.answer_callback_query(query.id.clone()).await?;
     if query.from.id.0 != allowed_user_id {
@@ -814,22 +884,139 @@ async fn handle_approval_callback(
     let Some(data) = query.data.as_deref() else {
         return Ok(());
     };
-    let Some(rest) = data.strip_prefix("approval:") else {
+
+    if let Some(decision) = parse_approval_callback(data) {
+        if let Some(sender) = approvals.lock().await.remove(decision.nonce) {
+            let _ = sender.send(decision.approved);
+        }
         return Ok(());
-    };
-    let Some((nonce, decision)) = rest.rsplit_once(':') else {
-        return Ok(());
-    };
+    }
+
+    if let Some(answer) = parse_question_callback(data) {
+        if let Some(pending) = questions.lock().await.remove(answer.nonce)
+            && let Some(text) = pending.options.get(answer.option_index)
+        {
+            let _ = pending.sender.send(text.clone());
+        }
+    }
+    Ok(())
+}
+
+struct ApprovalDecision<'a> {
+    nonce: &'a str,
+    approved: bool,
+}
+
+/// Parse an `approval:<nonce>:<allow|deny>` callback payload. Pure and side-effect-free so it can
+/// be unit-tested without a real `Bot`/`CallbackQuery`.
+fn parse_approval_callback(data: &str) -> Option<ApprovalDecision<'_>> {
+    let rest = data.strip_prefix("approval:")?;
+    let (nonce, decision) = rest.rsplit_once(':')?;
     let approved = match decision {
         "allow" => true,
         "deny" => false,
-        _ => return Ok(()),
+        _ => return None,
+    };
+    Some(ApprovalDecision { nonce, approved })
+}
+
+struct QuestionAnswer<'a> {
+    nonce: &'a str,
+    option_index: usize,
+}
+
+/// Parse a `question:<nonce>:<option index>` callback payload. Pure for the same reason as
+/// `parse_approval_callback`.
+fn parse_question_callback(data: &str) -> Option<QuestionAnswer<'_>> {
+    let rest = data.strip_prefix("question:")?;
+    let (nonce, index) = rest.split_once(':')?;
+    let option_index = index.parse().ok()?;
+    Some(QuestionAnswer {
+        nonce,
+        option_index,
+    })
+}
+
+/// Maximum number of buttons `ask_user` offers before falling back to a plain text prompt (a
+/// Telegram inline keyboard row is unwieldy past a handful of options, and the model is asked for
+/// at most 4 anyway per its tool description).
+const MAX_ASK_USER_OPTIONS: usize = 4;
+
+/// Ask the user a clarifying question mid-turn and wait (bounded by `APPROVAL_TIMEOUT`, the same
+/// window `request_approval` uses) for either a tapped option or a free-text reply, whichever
+/// comes first. `handle_message` is what resolves a free-text reply — it checks `questions` for a
+/// pending entry on this chat before treating incoming text as a new command or prompt.
+async fn ask_user(
+    bot: &Bot,
+    chat_id: ChatId,
+    questions: &PendingQuestions,
+    arguments: &str,
+) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Arguments {
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+    }
+    let arguments: Arguments = match serde_json::from_str(arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return Ok(format!("Error: invalid ask_user arguments: {error}")),
+    };
+    if arguments.question.trim().is_empty() {
+        return Ok("Error: ask_user requires a non-empty 'question' argument".to_owned());
+    }
+
+    let nonce = Uuid::new_v4().simple().to_string();
+    let options: Vec<String> = arguments
+        .options
+        .into_iter()
+        .take(MAX_ASK_USER_OPTIONS)
+        .collect();
+    // The callback carries only the option's index, not its text: Telegram's callback data is
+    // capped at 64 bytes with no escaping convention, which a long option label could easily
+    // exceed. The actual text is looked back up from PendingQuestion::options when the tap or a
+    // free-text reply resolves the question.
+    let keyboard = (!options.is_empty()).then(|| {
+        InlineKeyboardMarkup::new(options.iter().enumerate().map(|(index, option)| {
+            [InlineKeyboardButton::callback(
+                option,
+                format!("question:{nonce}:{index}"),
+            )]
+        }))
+    });
+
+    let (sender, receiver) = oneshot::channel();
+    questions.lock().await.insert(
+        nonce.clone(),
+        PendingQuestion {
+            chat_id,
+            options,
+            sender,
+        },
+    );
+
+    let mut send = bot.send_message(chat_id, arguments.question.clone());
+    if let Some(keyboard) = keyboard {
+        send = send.reply_markup(keyboard);
+    }
+    let prompt = match send.await {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            questions.lock().await.remove(&nonce);
+            return Err(error).context("could not send ask_user prompt");
+        }
     };
 
-    if let Some(sender) = approvals.lock().await.remove(nonce) {
-        let _ = sender.send(approved);
-    }
-    Ok(())
+    let answer = match tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => "The user did not answer.".to_owned(),
+        Err(_) => {
+            questions.lock().await.remove(&nonce);
+            "The user did not answer in time.".to_owned()
+        }
+    };
+    let _ = bot.edit_message_reply_markup(chat_id, prompt.id).await;
+    Ok(answer)
 }
 
 /// Send one message chunk rendered as MarkdownV2. Falls back to plain text if Telegram rejects the
@@ -1165,5 +1352,69 @@ mod tests {
         let database = Mutex::new(Database::open_in_memory_for_tests());
         let response = forget_command(&database, "nonexistent").await.unwrap();
         assert!(response.contains("No remembered fact matches"));
+    }
+
+    #[test]
+    fn parse_approval_callback_reads_allow_and_deny() {
+        let allow = parse_approval_callback("approval:abc123:allow").unwrap();
+        assert_eq!(allow.nonce, "abc123");
+        assert!(allow.approved);
+
+        let deny = parse_approval_callback("approval:abc123:deny").unwrap();
+        assert_eq!(deny.nonce, "abc123");
+        assert!(!deny.approved);
+    }
+
+    #[test]
+    fn parse_approval_callback_rejects_malformed_or_unrelated_data() {
+        assert!(parse_approval_callback("question:abc123:0").is_none());
+        assert!(parse_approval_callback("approval:abc123:maybe").is_none());
+        assert!(parse_approval_callback("not a callback at all").is_none());
+    }
+
+    #[test]
+    fn parse_question_callback_reads_the_nonce_and_option_index() {
+        let answer = parse_question_callback("question:abc123:2").unwrap();
+        assert_eq!(answer.nonce, "abc123");
+        assert_eq!(answer.option_index, 2);
+    }
+
+    #[test]
+    fn parse_question_callback_rejects_malformed_or_unrelated_data() {
+        assert!(parse_question_callback("approval:abc123:allow").is_none());
+        assert!(parse_question_callback("question:abc123:not-a-number").is_none());
+        assert!(parse_question_callback("question:abc123").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tapped_option_resolves_to_its_text_via_the_pending_question() {
+        let questions: PendingQuestions = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = oneshot::channel();
+        questions.lock().await.insert(
+            "abc123".to_owned(),
+            PendingQuestion {
+                chat_id: ChatId(1),
+                options: vec!["yes".to_owned(), "no".to_owned()],
+                sender,
+            },
+        );
+
+        let answer = parse_question_callback("question:abc123:1").unwrap();
+        let pending = questions.lock().await.remove(answer.nonce).unwrap();
+        let text = pending.options.get(answer.option_index).unwrap().clone();
+        pending.sender.send(text).unwrap();
+
+        assert_eq!(receiver.await.unwrap(), "no");
+        assert!(questions.lock().await.is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_option_index_parses_but_does_not_match_any_option() {
+        // handle_callback only removes/answers a PendingQuestion once `options.get(index)`
+        // succeeds, so a stale or malformed index (e.g. a button from an earlier, differently
+        // sized question) leaves the entry untouched rather than panicking or answering wrongly.
+        let answer = parse_question_callback("question:abc123:5").unwrap();
+        let options = ["yes".to_owned()];
+        assert!(options.get(answer.option_index).is_none());
     }
 }

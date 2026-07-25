@@ -252,6 +252,41 @@ is exactly the kind of processing capability that should be an MCP tool, not cod
 there is not yet a concrete transcription MCP server in place to call. Revisit once one exists,
 rather than building a native transcription path now.
 
+## Phase 4d: Mid-turn Clarification (`ask_user`)
+
+- [x] `ask_user` tool: pause a turn to ask the user a question, with up to 4 suggested answers
+- [x] Answerable either by tapping a button or replying with free text
+- [x] Same 2-minute timeout as approval, so an unanswered question cannot hang a turn forever
+
+Inspired by OpenClaw's `ask_user` tool ("pause for a structured decision owned by the user") after
+a broader look at OpenClaw and Hermes for native capabilities worth bringing over. Most of what
+either project ships natively didn't clear that bar for Kumo — OpenClaw's device-control tools
+(camera, screen capture, location) assume the gateway runs on a physical device, which Kumo does
+not, and its media-generation tools (`image_generate`, `music_generate`, `tts`) and web tools
+(`web_search`, `browser`) are exactly the kind of external capability this project's stated
+direction says should be an MCP tool instead of native Kumo code, same as email/calendar. `ask_user`
+was the one exception: it's a conversation-state-machine feature, not a capability tied to an
+external service, so it belongs next to the approval flow that already exists rather than behind
+an MCP call.
+
+This is deliberately not a new approval mechanism — `run_command`, `delegate_to_kamui`, and
+untrusted MCP tools still get their own automatic Allow once/Deny prompt with no model
+involvement. `ask_user` is for the opposite situation: the model itself decides it needs more
+information to proceed (which of several matching files, a preference between reasonable options)
+and pauses to ask, something nothing in Kumo previously let it do mid-turn.
+
+The implementation reuses the same shape as `request_approval` — an inline keyboard, a `oneshot`
+channel keyed by a nonce, a bounded wait — generalized to carry a free-text answer instead of a
+bool. Two things needed solving that plain approval didn't: Telegram's 64-byte callback-data limit
+meant a long option's text couldn't safely ride inside the callback payload itself, so a tapped
+button's callback carries only its index, and the offered option strings are stored alongside the
+pending question (`PendingQuestion::options`) to be looked back up by that index when the tap (or
+a matching free-text reply) arrives. The free-text path required `handle_message` to check, before
+treating an incoming message as a new command or prompt, whether the sending chat currently has a
+question open — if so, the text answers it instead of starting a new turn, since answering a
+question is not itself a new turn (the turn that asked it is already in progress, waiting on this
+very answer).
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)

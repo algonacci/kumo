@@ -8,8 +8,8 @@ use teloxide::prelude::*;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    AppState, PendingApprovals, prepare_history, provider::Message as ProviderMessage, run_agent,
-    send_formatted, storage::Database,
+    AppState, PendingApprovals, PendingQuestions, prepare_history,
+    provider::Message as ProviderMessage, run_agent, send_formatted, storage::Database,
 };
 
 /// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
@@ -22,26 +22,32 @@ const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Runs until the process exits; intended to be spawned once alongside the Telegram dispatcher.
 /// Shares `turn_lock` with `handle_message` so a scheduled task and an incoming message never run
 /// their agent loops concurrently and contend over the same approval slot.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bot: Bot,
     state: Arc<RwLock<AppState>>,
     approvals: PendingApprovals,
+    questions: PendingQuestions,
     database: Arc<Mutex<Database>>,
     turn_lock: Arc<Mutex<()>>,
 ) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         interval.tick().await;
-        if let Err(error) = run_due_tasks(&bot, &state, &approvals, &database, &turn_lock).await {
+        if let Err(error) =
+            run_due_tasks(&bot, &state, &approvals, &questions, &database, &turn_lock).await
+        {
             eprintln!("Scheduler error: {error:#}");
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_due_tasks(
     bot: &Bot,
     state: &Arc<RwLock<AppState>>,
     approvals: &PendingApprovals,
+    questions: &PendingQuestions,
     database: &Arc<Mutex<Database>>,
     turn_lock: &Arc<Mutex<()>>,
 ) -> Result<()> {
@@ -77,8 +83,16 @@ async fn run_due_tasks(
             task.run_at
         );
 
-        let outcome =
-            run_scheduled_task(bot, chat_id, state, approvals, database, &task.prompt).await;
+        let outcome = run_scheduled_task(
+            bot,
+            chat_id,
+            state,
+            approvals,
+            questions,
+            database,
+            &task.prompt,
+        )
+        .await;
         let status = match &outcome {
             Ok(()) => "completed",
             Err(error) => {
@@ -109,6 +123,7 @@ async fn run_scheduled_task(
     chat_id: ChatId,
     state: &Arc<RwLock<AppState>>,
     approvals: &PendingApprovals,
+    questions: &PendingQuestions,
     database: &Arc<Mutex<Database>>,
     prompt: &str,
 ) -> Result<()> {
@@ -118,6 +133,7 @@ async fn run_scheduled_task(
         chat_id,
         state,
         approvals,
+        questions,
         history,
         ProviderMessage::user(prompt),
     )
