@@ -149,8 +149,13 @@ status if anything failed, so it's usable as a pre-flight check in a script.
 
 ## Telegram commands
 
-- `/new` starts a fresh conversation while retaining the previous session in storage.
+- `/new` starts a fresh conversation while retaining the previous session in storage. Also clears
+  any standing "Always allow" tool grants for the chat (see Host tools below).
 - `/status` shows the active session, model, workspace, MCP status, usage, and database path.
+- `/reminders` lists this chat's pending scheduled tasks with their next run time and, for
+  recurring ones, the repeat interval.
+- `/reminders cancel <id>` cancels a pending scheduled task by an unambiguous ID prefix (as shown by
+  `/reminders`).
 - `/sessions` lists every saved session for this chat, newest first, marking the active one.
 - `/resume <id>` switches the active session back to a previous one, identified by an unambiguous
   ID prefix (as shown by `/sessions`).
@@ -208,12 +213,18 @@ The model may call these tools while answering:
   approval. Kamui runs its own agent loop (`kamui -p <task> --auto-approve`) with a proper
   diff-reviewed file editor, so this is the right tool for anything that involves changing files;
   `run_command` remains for one-off shell commands. Only offered to the model when a `kamui` binary
-  is found on `PATH` at startup, and bounded to a 5-minute timeout.
-- `schedule_task` schedules a one-shot prompt for a future time, computed from the user's
-  configured timezone. At the scheduled time, Kumo runs the prompt through the same agent loop as a
-  normal message — with all the same tools, subject to the same approvals — and delivers the result
-  to the chat that scheduled it, prefixed with "⏰ Scheduled task:". Does not require approval to
-  schedule; approval still applies to whatever tools the task itself calls when it runs.
+  is found on `PATH` at startup, and bounded to a 5-minute timeout. The chat sees a short summary —
+  how many tools Kamui called and any errors, followed by its final answer — instead of the raw
+  interleaved stdout of the underlying process.
+- `schedule_task` schedules a prompt for a future time, computed from the user's configured
+  timezone, either once or repeating on a fixed interval (`repeat_interval_seconds`, minimum 60
+  seconds). At each scheduled time, Kumo runs the prompt through the same agent loop as a normal
+  message — with all the same tools, subject to the same approvals — and delivers the result to the
+  chat that scheduled it, prefixed with "⏰ Scheduled task:". A recurring task reschedules itself
+  (`run_at` advanced by the interval) on success; if it fails, it is marked failed and not retried
+  automatically. Does not require approval to schedule; approval still applies to whatever tools the
+  task itself calls when it runs. Use `/reminders` to list pending tasks for the chat and
+  `/reminders cancel <id>` to cancel one by its (possibly abbreviated) ID.
 - `remember`, `update_memory`, and `forget` manage permanent, global memory (see Memory below). None
   require approval — they only store or remove text.
 - `ask_user` pauses the turn to ask a clarifying question, with up to 4 suggested answers shown as
@@ -225,15 +236,19 @@ The model may call these tools while answering:
 Tool calls are bounded to eight rounds per message. Paths are canonicalized and must remain inside
 the workspace, including through symlinks.
 
-Every command or Kamui delegation request displays **Allow once** and **Deny** buttons in Telegram.
-Approval expires after two minutes and cannot be replayed. Commands run with stdin disabled, a
-30-second timeout, and a 16 KiB combined output limit; a Kamui delegation gets a 5-minute timeout
-instead, since a coding task can involve several tool rounds inside Kamui's own agent loop. A
-timed-out command or delegation is terminated. A scheduled task that requests an approval-gated tool
-sends the same Allow once/Deny prompt when it runs, so an unattended task can still wait (up to the
-usual 2-minute approval window) for the owner to respond. `ask_user` waits the same two minutes; if
-nobody answers in time, the question is withdrawn (its buttons stop working) and the model is told
-the user didn't answer, so the turn can still finish rather than hanging indefinitely.
+Every command or Kamui delegation request displays **Allow once**, **Always allow**, and **Deny**
+buttons in Telegram. Approval expires after two minutes and cannot be replayed. **Always allow**
+grants that tool (not that specific command — any future call to the same tool, e.g. every
+`run_command` invocation) a standing pass for the rest of the chat's active session: further calls
+to it skip the approval prompt entirely until `/new` starts a fresh session, which clears all
+standing grants for that chat. Commands run with stdin disabled, a 30-second timeout, and a 16 KiB
+combined output limit; a Kamui delegation gets a 5-minute timeout instead, since a coding task can
+involve several tool rounds inside Kamui's own agent loop. A timed-out command or delegation is
+terminated. A scheduled task that requests an approval-gated tool sends the same approval prompt
+when it runs (respecting any standing Always-allow grant), so an unattended task can still wait (up
+to the usual 2-minute approval window) for the owner to respond. `ask_user` waits the same two
+minutes; if nobody answers in time, the question is withdrawn (its buttons stop working) and the
+model is told the user didn't answer, so the turn can still finish rather than hanging indefinitely.
 
 A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
 incoming messages, so a scheduled task and a live conversation never run their agent loops at the

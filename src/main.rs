@@ -51,7 +51,17 @@ const MAX_TOOL_ROUNDS: usize = 8;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
 const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. If delegate_to_kamui is available and the task involves editing files or a multi-step coding change, prefer it over run_command: it runs a dedicated coding agent with a proper diff-reviewed file editor, rather than an ad hoc shell command.";
-pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+/// A user's answer to an approval prompt. `AlwaysAllow` is distinct from `AllowOnce`: it also
+/// grants the calling tool blanket approval for the rest of this conversation (see
+/// `Database::always_allow_tool`), not just this one call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ApprovalOutcome {
+    AllowOnce,
+    AlwaysAllow,
+    Deny,
+}
+
+pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>>;
 
 /// State for one in-flight `ask_user` question: which chat it was asked in (so `handle_message`
 /// can tell whether incoming text should answer it instead of starting a new turn), the offered
@@ -324,10 +334,11 @@ async fn handle_message(
 
     println!("Received a message from Telegram user {}", user.id.0);
     if text == "/new" {
-        let cleared = database
-            .lock()
-            .await
-            .clear_active_session(message.chat.id.0)?;
+        let database = database.lock().await;
+        let cleared = database.clear_active_session(message.chat.id.0)?;
+        // A fresh conversation starts with the normal per-call approval prompts again, not
+        // whatever tools were "always allow"-ed in the conversation being left behind.
+        database.clear_always_allowed(message.chat.id.0)?;
         let response = if cleared {
             "Started a new conversation. Your previous history is still stored."
         } else {
@@ -363,6 +374,16 @@ async fn handle_message(
     }
     if let Some(argument) = text.strip_prefix("/forget ").map(str::trim) {
         let response = forget_command(&database, argument).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/reminders" {
+        let response = reminders_message(&database, &state, message.chat.id.0).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(id_prefix) = text.strip_prefix("/reminders cancel ").map(str::trim) {
+        let response = cancel_reminder(&database, message.chat.id.0, id_prefix).await?;
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
@@ -482,6 +503,7 @@ async fn deliver_agent_turn(
         state,
         approvals,
         questions,
+        database,
         history,
         user_message,
     )
@@ -511,12 +533,14 @@ async fn deliver_agent_turn(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     bot: &Bot,
     chat_id: ChatId,
     state: &RwLock<AppState>,
     approvals: &PendingApprovals,
     questions: &PendingQuestions,
+    database: &Mutex<Database>,
     history: storage::History,
     user_message: ProviderMessage,
 ) -> Result<AgentTurn> {
@@ -585,14 +609,30 @@ pub(crate) async fn run_agent(
                 ask_user(bot, chat_id, questions, &call.arguments).await?
             } else {
                 let tools = state.read().await.tools.clone();
-                if tools.requires_confirmation(&call.name) {
+                let always_allowed = tools.requires_confirmation(&call.name)
+                    && database
+                        .lock()
+                        .await
+                        .is_tool_always_allowed(chat_id.0, &call.name)?;
+                if tools.requires_confirmation(&call.name) && !always_allowed {
                     match tools.preview(&call) {
-                        Some(preview)
-                            if request_approval(bot, chat_id, approvals, &preview).await? =>
-                        {
-                            tools.dispatch(chat_id.0, &call).await
+                        Some(preview) => {
+                            match request_approval(bot, chat_id, approvals, &preview).await? {
+                                ApprovalOutcome::AllowOnce => {
+                                    tools.dispatch(chat_id.0, &call).await
+                                }
+                                ApprovalOutcome::AlwaysAllow => {
+                                    database
+                                        .lock()
+                                        .await
+                                        .always_allow_tool(chat_id.0, &call.name)?;
+                                    tools.dispatch(chat_id.0, &call).await
+                                }
+                                ApprovalOutcome::Deny => {
+                                    "User denied this command. Do not run it.".to_owned()
+                                }
+                            }
                         }
-                        Some(_) => "User denied this command. Do not run it.".to_owned(),
                         None => "Error: invalid command arguments".to_owned(),
                     }
                 } else {
@@ -817,6 +857,67 @@ async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<St
     }
 }
 
+/// `/reminders`: list this chat's pending scheduled tasks (one-shot and recurring), with the
+/// unambiguous ID prefix `/reminders cancel <id>` accepts.
+async fn reminders_message(
+    database: &Mutex<Database>,
+    state: &RwLock<AppState>,
+    chat_id: i64,
+) -> Result<String> {
+    let tasks = database.lock().await.list_scheduled_tasks(chat_id)?;
+    if tasks.is_empty() {
+        return Ok("No scheduled reminders.".to_owned());
+    }
+    let timezone = state.read().await.config.timezone();
+
+    let mut lines = vec!["Scheduled reminders:".to_owned()];
+    for task in &tasks {
+        let local_time = chrono::DateTime::from_timestamp(task.run_at, 0)
+            .map(|value| {
+                value
+                    .with_timezone(&timezone)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown time".to_owned());
+        let recurrence = match task.repeat_interval_seconds {
+            Some(interval) => format!(" (repeats every {interval}s)"),
+            None => String::new(),
+        };
+        lines.push(format!(
+            "- {}  {local_time}{recurrence}  \"{}\"",
+            &task.id[..8],
+            truncate(&task.prompt, 60)
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Use /reminders cancel <id> to cancel one.".to_owned());
+    Ok(lines.join("\n"))
+}
+
+/// `/reminders cancel <id>`: cancel a pending reminder by an unambiguous ID prefix scoped to this
+/// chat, the same resolution rule `/resume`/`/delete` use for sessions.
+async fn cancel_reminder(
+    database: &Mutex<Database>,
+    chat_id: i64,
+    id_prefix: &str,
+) -> Result<String> {
+    if id_prefix.is_empty() {
+        return Ok("Usage: /reminders cancel <id>. Use /reminders to list them.".to_owned());
+    }
+    if database
+        .lock()
+        .await
+        .cancel_scheduled_task(chat_id, id_prefix)?
+    {
+        Ok(format!("Cancelled reminder {id_prefix}."))
+    } else {
+        Ok(format!(
+            "No reminder matches '{id_prefix}', or the prefix is ambiguous. Use /reminders to list them."
+        ))
+    }
+}
+
 fn truncate(text: &str, max: usize) -> String {
     let mut result: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -850,10 +951,11 @@ async fn request_approval(
     chat_id: ChatId,
     approvals: &PendingApprovals,
     action: &str,
-) -> Result<bool> {
+) -> Result<ApprovalOutcome> {
     let nonce = Uuid::new_v4().simple().to_string();
     let keyboard = InlineKeyboardMarkup::new([[
         InlineKeyboardButton::callback("Allow once", format!("approval:{nonce}:allow")),
+        InlineKeyboardButton::callback("Always allow", format!("approval:{nonce}:always")),
         InlineKeyboardButton::callback("Deny", format!("approval:{nonce}:deny")),
     ]]);
     let (sender, receiver) = oneshot::channel();
@@ -871,7 +973,10 @@ async fn request_approval(
     let prompt = match bot
         .send_message(
             chat_id,
-            format!("Kumo wants to run this host action:\n\n{preview}"),
+            format!(
+                "Kumo wants to run this host action:\n\n{preview}\n\n\"Always allow\" skips this \
+                 prompt for this tool for the rest of the conversation, until /new."
+            ),
         )
         .reply_markup(keyboard)
         .await
@@ -883,16 +988,16 @@ async fn request_approval(
         }
     };
 
-    let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await {
-        Ok(Ok(approved)) => approved,
-        Ok(Err(_)) => false,
+    let outcome = match tokio::time::timeout(APPROVAL_TIMEOUT, receiver).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => ApprovalOutcome::Deny,
         Err(_) => {
             approvals.lock().await.remove(&nonce);
-            false
+            ApprovalOutcome::Deny
         }
     };
     let _ = bot.edit_message_reply_markup(chat_id, prompt.id).await;
-    Ok(approved)
+    Ok(outcome)
 }
 
 /// Dispatches a Telegram inline-button tap to whichever pending prompt it answers: an
@@ -915,7 +1020,7 @@ async fn handle_callback(
 
     if let Some(decision) = parse_approval_callback(data) {
         if let Some(sender) = approvals.lock().await.remove(decision.nonce) {
-            let _ = sender.send(decision.approved);
+            let _ = sender.send(decision.outcome);
         }
         return Ok(());
     }
@@ -932,20 +1037,21 @@ async fn handle_callback(
 
 struct ApprovalDecision<'a> {
     nonce: &'a str,
-    approved: bool,
+    outcome: ApprovalOutcome,
 }
 
-/// Parse an `approval:<nonce>:<allow|deny>` callback payload. Pure and side-effect-free so it can
-/// be unit-tested without a real `Bot`/`CallbackQuery`.
+/// Parse an `approval:<nonce>:<allow|always|deny>` callback payload. Pure and side-effect-free so
+/// it can be unit-tested without a real `Bot`/`CallbackQuery`.
 fn parse_approval_callback(data: &str) -> Option<ApprovalDecision<'_>> {
     let rest = data.strip_prefix("approval:")?;
     let (nonce, decision) = rest.rsplit_once(':')?;
-    let approved = match decision {
-        "allow" => true,
-        "deny" => false,
+    let outcome = match decision {
+        "allow" => ApprovalOutcome::AllowOnce,
+        "always" => ApprovalOutcome::AlwaysAllow,
+        "deny" => ApprovalOutcome::Deny,
         _ => return None,
     };
-    Some(ApprovalDecision { nonce, approved })
+    Some(ApprovalDecision { nonce, outcome })
 }
 
 struct QuestionAnswer<'a> {
@@ -1590,14 +1696,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_approval_callback_reads_allow_and_deny() {
+    fn parse_approval_callback_reads_allow_always_and_deny() {
         let allow = parse_approval_callback("approval:abc123:allow").unwrap();
         assert_eq!(allow.nonce, "abc123");
-        assert!(allow.approved);
+        assert_eq!(allow.outcome, ApprovalOutcome::AllowOnce);
+
+        let always = parse_approval_callback("approval:abc123:always").unwrap();
+        assert_eq!(always.outcome, ApprovalOutcome::AlwaysAllow);
 
         let deny = parse_approval_callback("approval:abc123:deny").unwrap();
         assert_eq!(deny.nonce, "abc123");
-        assert!(!deny.approved);
+        assert_eq!(deny.outcome, ApprovalOutcome::Deny);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 5;
+const CURRENT_VERSION: i64 = 6;
 
 pub struct Database {
     connection: Connection,
@@ -34,6 +34,9 @@ pub struct ScheduledTask {
     pub telegram_chat_id: i64,
     pub prompt: String,
     pub run_at: i64,
+    /// `Some(seconds)` for a recurring task (rescheduled `run_at + seconds` after each run instead
+    /// of being marked `completed`); `None` for a one-shot task.
+    pub repeat_interval_seconds: Option<i64>,
 }
 
 pub struct SessionSummary {
@@ -87,6 +90,9 @@ impl Database {
         }
         if version < 5 {
             migrate_to_v5(&connection)?;
+        }
+        if version < 6 {
+            migrate_to_v6(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -452,15 +458,60 @@ impl Database {
         Ok(())
     }
 
-    /// Schedule a one-shot prompt to run against `chat_id`'s agent loop at `run_at` (unix seconds).
-    pub fn create_scheduled_task(&self, chat_id: i64, prompt: &str, run_at: i64) -> Result<String> {
+    /// Schedule a prompt to run against `chat_id`'s agent loop at `run_at` (unix seconds).
+    /// `repeat_interval_seconds` makes it recurring: each run reschedules `run_at + interval`
+    /// instead of the task finishing, rather than a one-shot task's `completed`/`failed`.
+    pub fn create_scheduled_task(
+        &self,
+        chat_id: i64,
+        prompt: &str,
+        run_at: i64,
+        repeat_interval_seconds: Option<i64>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.connection.execute(
-            "INSERT INTO scheduled_tasks (id, telegram_chat_id, prompt, run_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, chat_id, prompt, run_at],
+            "INSERT INTO scheduled_tasks (id, telegram_chat_id, prompt, run_at, repeat_interval_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, chat_id, prompt, run_at, repeat_interval_seconds],
         )?;
         Ok(id)
+    }
+
+    /// Every task still pending for `chat_id`, soonest first, for `/reminders`.
+    pub fn list_scheduled_tasks(&self, chat_id: i64) -> Result<Vec<ScheduledTask>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, telegram_chat_id, prompt, run_at, repeat_interval_seconds
+             FROM scheduled_tasks
+             WHERE telegram_chat_id = ?1 AND status = 'pending'
+             ORDER BY run_at",
+        )?;
+        let rows = statement.query_map([chat_id], scheduled_task_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Cancel a pending task scoped to `chat_id` (so one chat cannot cancel another's reminder by
+    /// guessing an ID prefix), resolved the same unambiguous-prefix way sessions are. Returns
+    /// `Ok(false)` for no match or an ambiguous prefix, matching `find_session_by_prefix`'s
+    /// convention.
+    pub fn cancel_scheduled_task(&self, chat_id: i64, id_prefix: &str) -> Result<bool> {
+        let pattern = format!("{id_prefix}%");
+        let matches: Vec<String> = self
+            .connection
+            .prepare(
+                "SELECT id FROM scheduled_tasks
+                 WHERE telegram_chat_id = ?1 AND status = 'pending' AND id LIKE ?2",
+            )?
+            .query_map(params![chat_id, pattern], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if matches.len() != 1 {
+            return Ok(false);
+        }
+        self.connection.execute(
+            "UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ?1",
+            [&matches[0]],
+        )?;
+        Ok(true)
     }
 
     /// Mark `pending` tasks more than `stale_after` seconds past their `run_at` as `expired`
@@ -473,18 +524,12 @@ impl Database {
     ) -> Result<Vec<ScheduledTask>> {
         let cutoff = now - stale_after;
         let mut statement = self.connection.prepare(
-            "SELECT id, telegram_chat_id, prompt, run_at FROM scheduled_tasks
+            "SELECT id, telegram_chat_id, prompt, run_at, repeat_interval_seconds
+             FROM scheduled_tasks
              WHERE status = 'pending' AND run_at < ?1
              ORDER BY run_at",
         )?;
-        let rows = statement.query_map([cutoff], |row| {
-            Ok(ScheduledTask {
-                id: row.get(0)?,
-                telegram_chat_id: row.get(1)?,
-                prompt: row.get(2)?,
-                run_at: row.get(3)?,
-            })
-        })?;
+        let rows = statement.query_map([cutoff], scheduled_task_from_row)?;
         let stale = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         for task in &stale {
             self.connection.execute(
@@ -503,18 +548,12 @@ impl Database {
         let transaction = self.connection.transaction()?;
         let due = {
             let mut statement = transaction.prepare(
-                "SELECT id, telegram_chat_id, prompt, run_at FROM scheduled_tasks
+                "SELECT id, telegram_chat_id, prompt, run_at, repeat_interval_seconds
+                 FROM scheduled_tasks
                  WHERE status = 'pending' AND run_at <= ?1
                  ORDER BY run_at",
             )?;
-            let rows = statement.query_map([now], |row| {
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    telegram_chat_id: row.get(1)?,
-                    prompt: row.get(2)?,
-                    run_at: row.get(3)?,
-                })
-            })?;
+            let rows = statement.query_map([now], scheduled_task_from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for task in &due {
@@ -538,14 +577,84 @@ impl Database {
         )?)
     }
 
-    /// Mark a claimed task's terminal outcome so it is never picked up again.
+    /// Resolve a claimed task's outcome. A one-shot task (`repeat_interval_seconds` is `NULL`)
+    /// simply gets `status`. A recurring task that ran successfully (`status == "completed"`) is
+    /// instead put back to `pending` with `run_at` advanced by its interval, so the scheduler picks
+    /// it up again next time rather than it ending here; a recurring task that *failed* still gets
+    /// marked `failed` like a one-shot would; a failing recurring reminder should surface the error
+    /// rather than silently keep retrying forever.
     pub fn complete_scheduled_task(&self, id: &str, status: &str) -> Result<()> {
+        if status == "completed" {
+            let recurrence: Option<(i64, i64)> = self
+                .connection
+                .query_row(
+                    "SELECT run_at, repeat_interval_seconds FROM scheduled_tasks WHERE id = ?1",
+                    [id],
+                    |row| {
+                        let interval: Option<i64> = row.get(1)?;
+                        Ok(interval.map(|interval| (row.get::<_, i64>(0).unwrap_or(0), interval)))
+                    },
+                )
+                .optional()?
+                .flatten();
+            if let Some((run_at, interval)) = recurrence {
+                self.connection.execute(
+                    "UPDATE scheduled_tasks SET status = 'pending', run_at = ?2 WHERE id = ?1",
+                    params![id, run_at + interval],
+                )?;
+                return Ok(());
+            }
+        }
         self.connection.execute(
             "UPDATE scheduled_tasks SET status = ?2 WHERE id = ?1",
             params![id, status],
         )?;
         Ok(())
     }
+
+    /// Whether `tool_name` was granted "always allow" for `chat_id` (see `always_allow_tool`).
+    pub fn is_tool_always_allowed(&self, chat_id: i64, tool_name: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM always_allowed_tools WHERE telegram_chat_id = ?1 AND tool_name = ?2",
+                params![chat_id, tool_name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(Into::into)
+    }
+
+    /// Grant "always allow" for `tool_name` in `chat_id`: every future call to that tool in this
+    /// chat skips the approval prompt until `clear_always_allowed` (Kumo calls this from `/new`).
+    pub fn always_allow_tool(&self, chat_id: i64, tool_name: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO always_allowed_tools (telegram_chat_id, tool_name)
+             VALUES (?1, ?2)",
+            params![chat_id, tool_name],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke every "always allow" grant for `chat_id` (called by `/new`, so a fresh conversation
+    /// starts with the normal per-call approval prompts again).
+    pub fn clear_always_allowed(&self, chat_id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM always_allowed_tools WHERE telegram_chat_id = ?1",
+            [chat_id],
+        )?;
+        Ok(())
+    }
+}
+
+fn scheduled_task_from_row(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask> {
+    Ok(ScheduledTask {
+        id: row.get(0)?,
+        telegram_chat_id: row.get(1)?,
+        prompt: row.get(2)?,
+        run_at: row.get(3)?,
+        repeat_interval_seconds: row.get(4)?,
+    })
 }
 
 fn migrate_to_v1(connection: &Connection) -> Result<()> {
@@ -662,6 +771,22 @@ fn migrate_to_v5(connection: &Connection) -> Result<()> {
              updated_at INTEGER NOT NULL DEFAULT (unixepoch())
          );
          PRAGMA user_version = 5;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Adds recurring-schedule support and per-chat "always allow" tool trust.
+fn migrate_to_v6(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         ALTER TABLE scheduled_tasks ADD COLUMN repeat_interval_seconds INTEGER;
+         CREATE TABLE always_allowed_tools (
+             telegram_chat_id INTEGER NOT NULL,
+             tool_name TEXT NOT NULL,
+             PRIMARY KEY (telegram_chat_id, tool_name)
+         );
+         PRAGMA user_version = 6;
          COMMIT;",
     )?;
     Ok(())
@@ -1105,10 +1230,10 @@ mod tests {
     fn claim_due_scheduled_tasks_returns_only_pending_tasks_at_or_before_now() {
         let mut database = database();
         let past = database
-            .create_scheduled_task(42, "check the weather", 100)
+            .create_scheduled_task(42, "check the weather", 100, None)
             .unwrap();
         let future = database
-            .create_scheduled_task(42, "check it later", 1_000_000)
+            .create_scheduled_task(42, "check it later", 1_000_000, None)
             .unwrap();
 
         let due = database.claim_due_scheduled_tasks(500).unwrap();
@@ -1122,7 +1247,9 @@ mod tests {
     #[test]
     fn claiming_a_task_prevents_it_being_claimed_again() {
         let mut database = database();
-        database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
 
         let first_claim = database.claim_due_scheduled_tasks(500).unwrap();
         let second_claim = database.claim_due_scheduled_tasks(500).unwrap();
@@ -1137,7 +1264,9 @@ mod tests {
     #[test]
     fn completed_tasks_are_not_returned_as_due_again() {
         let mut database = database();
-        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+        let id = database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
 
         database.complete_scheduled_task(&id, "completed").unwrap();
 
@@ -1148,9 +1277,11 @@ mod tests {
     fn expire_stale_scheduled_tasks_skips_tasks_past_the_grace_period() {
         let database = database();
         let stale = database
-            .create_scheduled_task(42, "long overdue", 100)
+            .create_scheduled_task(42, "long overdue", 100, None)
             .unwrap();
-        let fresh = database.create_scheduled_task(42, "just due", 950).unwrap();
+        let fresh = database
+            .create_scheduled_task(42, "just due", 950, None)
+            .unwrap();
 
         // now=1000, stale_after=100: "long overdue" (run_at=100) is 900s late, past the grace
         // period; "just due" (run_at=950) is only 50s late, still within it.
@@ -1165,7 +1296,7 @@ mod tests {
     fn an_expired_task_is_never_claimed() {
         let mut database = database();
         database
-            .create_scheduled_task(42, "long overdue", 100)
+            .create_scheduled_task(42, "long overdue", 100, None)
             .unwrap();
 
         database.expire_stale_scheduled_tasks(1000, 100).unwrap();
@@ -1176,7 +1307,9 @@ mod tests {
     #[test]
     fn reset_stuck_running_tasks_returns_running_tasks_to_pending() {
         let mut database = database();
-        database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
         database.claim_due_scheduled_tasks(500).unwrap();
 
         let reset_count = database.reset_stuck_running_tasks().unwrap();
@@ -1189,7 +1322,9 @@ mod tests {
     #[test]
     fn reset_stuck_running_tasks_leaves_completed_tasks_alone() {
         let mut database = database();
-        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+        let id = database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
         database.claim_due_scheduled_tasks(500).unwrap();
         database.complete_scheduled_task(&id, "completed").unwrap();
 
@@ -1205,7 +1340,7 @@ mod tests {
         migrate_to_v4(&connection).unwrap();
 
         let mut database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
-        let id = database.create_scheduled_task(1, "test", 0).unwrap();
+        let id = database.create_scheduled_task(1, "test", 0, None).unwrap();
 
         let claimed = database.claim_due_scheduled_tasks(0).unwrap();
         assert_eq!(claimed[0].id, id);
@@ -1248,7 +1383,9 @@ mod tests {
             )
             .unwrap();
         // An untouched session (no messages saved yet) must not be counted.
-        database.create_scheduled_task(42, "ping me", 100).unwrap();
+        database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
         database.remember("a fact").unwrap();
 
         let summary = database.storage_summary().unwrap();
@@ -1261,12 +1398,118 @@ mod tests {
     #[test]
     fn storage_summary_excludes_completed_scheduled_tasks() {
         let database = database();
-        let id = database.create_scheduled_task(42, "ping me", 100).unwrap();
+        let id = database
+            .create_scheduled_task(42, "ping me", 100, None)
+            .unwrap();
         database.complete_scheduled_task(&id, "completed").unwrap();
 
         assert_eq!(
             database.storage_summary().unwrap().pending_scheduled_tasks,
             0
         );
+    }
+
+    #[test]
+    fn completing_a_recurring_task_reschedules_it_instead_of_finishing_it() {
+        let database = database();
+        let id = database
+            .create_scheduled_task(42, "daily reminder", 1000, Some(86400))
+            .unwrap();
+
+        database.complete_scheduled_task(&id, "completed").unwrap();
+
+        let tasks = database.list_scheduled_tasks(42).unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a recurring task stays pending, not completed"
+        );
+        assert_eq!(tasks[0].run_at, 1000 + 86400);
+        assert_eq!(tasks[0].repeat_interval_seconds, Some(86400));
+    }
+
+    #[test]
+    fn a_recurring_task_that_fails_is_marked_failed_not_rescheduled() {
+        let database = database();
+        let id = database
+            .create_scheduled_task(42, "daily reminder", 1000, Some(86400))
+            .unwrap();
+
+        database.complete_scheduled_task(&id, "failed").unwrap();
+
+        assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_one_shot_task_that_completes_is_not_rescheduled() {
+        let database = database();
+        let id = database
+            .create_scheduled_task(42, "one-off", 1000, None)
+            .unwrap();
+
+        database.complete_scheduled_task(&id, "completed").unwrap();
+
+        assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_scheduled_tasks_is_scoped_to_chat_and_sorted_by_run_at() {
+        let database = database();
+        database
+            .create_scheduled_task(42, "later", 2000, None)
+            .unwrap();
+        database
+            .create_scheduled_task(42, "sooner", 1000, None)
+            .unwrap();
+        database
+            .create_scheduled_task(99, "other chat", 500, None)
+            .unwrap();
+
+        let tasks = database.list_scheduled_tasks(42).unwrap();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].prompt, "sooner");
+        assert_eq!(tasks[1].prompt, "later");
+    }
+
+    #[test]
+    fn cancel_scheduled_task_is_scoped_to_chat() {
+        let database = database();
+        let id = database
+            .create_scheduled_task(42, "ping me", 1000, None)
+            .unwrap();
+
+        // A different chat guessing the same ID prefix must not be able to cancel it.
+        assert!(!database.cancel_scheduled_task(99, &id[..8]).unwrap());
+        assert!(database.cancel_scheduled_task(42, &id[..8]).unwrap());
+        assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_scheduled_task_reports_no_match_for_an_unknown_prefix() {
+        let database = database();
+        assert!(!database.cancel_scheduled_task(42, "nonexistent").unwrap());
+    }
+
+    #[test]
+    fn always_allow_grants_and_clears_per_chat() {
+        let database = database();
+        assert!(!database.is_tool_always_allowed(42, "run_command").unwrap());
+
+        database.always_allow_tool(42, "run_command").unwrap();
+        assert!(database.is_tool_always_allowed(42, "run_command").unwrap());
+        // Scoped per chat: a different chat's grant is independent.
+        assert!(!database.is_tool_always_allowed(99, "run_command").unwrap());
+
+        database.clear_always_allowed(42).unwrap();
+        assert!(!database.is_tool_always_allowed(42, "run_command").unwrap());
+    }
+
+    #[test]
+    fn always_allow_tool_is_idempotent() {
+        let database = database();
+        database.always_allow_tool(42, "run_command").unwrap();
+        database.always_allow_tool(42, "run_command").unwrap();
+        assert!(database.is_tool_always_allowed(42, "run_command").unwrap());
     }
 }

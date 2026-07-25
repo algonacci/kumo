@@ -9,10 +9,11 @@ need, not by matching what a bigger gateway (OpenClaw, Hermes) happens to ship.
 Status: Kumo is a working single-user gateway. Onboarding pairs a Telegram bot to one owner without
 a manual ID lookup or a `.env` file, an agent loop answers messages with `read_file`, `list_directory`,
 approval-gated `run_command`, approval-gated `delegate_to_kamui` for file edits, and `schedule_task`
-for one-shot future prompts, MCP servers can contribute more tools over stdio, and long conversations
-compact into a rolling summary. Every turn is persisted to SQLite. What is missing relative to that
-description is deliberate: there is no way to browse or resume a past session, and no support for
-more than one Telegram user, more than one workspace, or more than one model provider connection.
+for one-shot or recurring future prompts (listed and cancelled with `/reminders`), MCP servers can
+contribute more tools over stdio, and long conversations compact into a rolling summary. A chat can
+tap "Always allow" on an approval prompt to skip further prompts for that tool until `/new`. Every
+turn is persisted to SQLite. What is missing relative to that description is deliberate: no support
+for more than one Telegram user, more than one workspace, or more than one model provider connection.
 
 ## Phase 1: Gateway Foundation
 
@@ -45,8 +46,8 @@ configured context window (or a 48 KiB default), without ever deleting the origi
 ## Phase 2: Coding Agent Parity
 
 - [x] Delegate file editing to Kamui (`delegate_to_kamui`, via `kamui -p <task> --auto-approve`)
-- [ ] Structured result rendering for a Kamui delegation (today it is raw stdout/stderr, like
-      `run_command`; a summary of files touched would read better in Telegram)
+- [x] Structured result rendering for a Kamui delegation (a short summary of tool calls/errors plus
+      Kamui's final answer, instead of raw stdout/stderr like `run_command`)
 - [ ] Tool-call round limit review (currently 8; a delegation itself uses one round from Kumo's
       point of view, so this matters less than it would have for an in-process editor)
 - [ ] Optional RTK execution backend for `run_command` output compression
@@ -73,6 +74,16 @@ RTK is optional and orthogonal to permission policy (see Kamui's RTK Decision fo
 it would compress `run_command` output before it reaches the model, nothing more. Skip it until
 `run_command` output volume is actually a problem in practice.
 
+A Kamui delegation's raw output was the exit code plus interleaved stdout/stderr — the same
+`format_command_output` shape `run_command` uses — which meant Telegram saw Kamui's own tool-trace
+lines (`  → read_file(...)`, `    ok (N chars)`) verbatim rather than a readable result.
+`summarize_kamui_output` (`src/tools.rs`) instead counts those trace lines (tool calls made, any
+`! error` lines among them) into a one-line header, then takes everything after the last trace line
+as Kamui's actual final answer (`kamui -p` prints nothing else to stdout after that point, by
+design, specifically so this split is reliable) and appends it below the header. A run with no
+answer at all (a crash, a signal) falls back to reporting stderr instead of showing an empty
+result.
+
 ## Phase 3: Scheduled Tasks
 
 - [x] `schedule_task` tool: one-shot future prompt, run through the same agent loop
@@ -84,8 +95,8 @@ it would compress `run_command` output before it reaches the model, nothing more
 - [x] Atomic claim (`pending` → `running`) so a crash mid-run cannot double-dispatch a task, plus
       startup recovery for any task a hard crash left stuck in `running`
 - [x] A failed task notifies the chat with the error, not just the terminal log
-- [ ] Recurring tasks (daily/weekly), not just one-shot
-- [ ] A way to list or cancel a pending scheduled task from Telegram
+- [x] Recurring tasks on a fixed interval, not just one-shot
+- [x] `/reminders` and `/reminders cancel <id>` to list or cancel a pending scheduled task
 
 This was previously listed under Not Planned, reasoning that "every turn is triggered by an inbound
 message" and a scheduler was a large, separate effort. In practice the scope was smaller than
@@ -130,17 +141,34 @@ that widened the `status` CHECK constraint to add `running` and `expired`:
   `reset_stuck_running_tasks` runs once at startup to put any such task back to `pending` rather than
   lose it permanently.
 
-What is intentionally out of scope for now: recurring schedules (a `repeat_interval` column would be
-the natural extension, but one-shot covers the common "remind me" case first) and any Telegram UI to
-inspect or cancel a pending task before it fires — today `/status` does not surface pending scheduled
-tasks at all. Both are reasonable follow-ups once one-shot scheduling sees real use.
+Recurring tasks and a Telegram UI to inspect/cancel a pending task landed together once one-shot
+scheduling saw real use. Recurrence deliberately stayed a fixed interval in seconds
+(`repeat_interval_seconds`, a nullable column added in `user_version = 6`) rather than a cron
+expression: the model already computes `run_at` itself from the user's timezone, and asking it to
+also produce a correct cron string is more failure surface for a feature whose only real cases are
+"daily," "weekly," "every N hours" — all trivially expressed as a second count. `schedule_task`
+rejects an interval under 60 seconds, both because the scheduler only polls every 30 seconds anyway
+and to stop the model from accidentally spamming the chat with a too-tight interval. A recurring
+task's own rescheduling is folded into `complete_scheduled_task`: on `"completed"` it looks up
+whether the task has a `repeat_interval_seconds` and, if so, advances `run_at` by that interval and
+resets status to `pending` instead of marking it done, so the scheduler's normal claim/complete path
+handles recurrence with no separate "is this recurring" branch anywhere else. A recurring task that
+*fails* is simply marked `failed` like any other — it is not retried or auto-rescheduled, on the
+reasoning that a repeated failure (a broken MCP server, a bad prompt) is more likely to need the
+owner's attention than a silent retry loop.
+
+`/reminders` lists a chat's own pending tasks (`list_scheduled_tasks`, scoped to `telegram_chat_id`
+and ordered by `run_at`) with each task's local run time and, for a recurring one, its interval.
+`/reminders cancel <id>` resolves an unambiguous ID prefix the same way `/resume`/`/delete` already
+do for sessions, but scoped to the requesting chat, so one chat can never see or cancel another's
+reminder even by guessing a matching prefix.
 
 ## Phase 4: Session and Approval Quality
 
 - [x] `/sessions` — list saved sessions for the current chat
 - [x] `/resume <id>` — switch the active session back to a past one
 - [x] `/delete <id>` — delete a saved session
-- [ ] Per-session "always allow this command" opt-in, distinct from per-server MCP trust
+- [x] Per-chat "Always allow" per tool, cleared on `/new`, distinct from per-server MCP trust
 - [ ] Typing/progress feedback during long tool rounds (Kumo sends one `ChatAction::Typing` and then
       goes silent until the final answer)
 
@@ -165,10 +193,20 @@ the `ON DELETE CASCADE` already in place on `messages`, `usage_records`, and `ac
 place since the schema's first migration) to clean up everything that referenced it, including
 clearing the chat's active-session pointer if the deleted session happened to be the active one.
 
-The approval flow is currently "allow once" for every single confirmable call, with no way to say
-"allow this exact command for the rest of the session" short of marking an entire MCP server
-`trusted` in `kumo.toml`. A scoped, session-lifetime allow (not persisted past `/new`) would cut
-repeated approval prompts for a chatty multi-step task without weakening the default posture.
+The approval flow used to be "allow once" for every single confirmable call, with no way to say
+"allow this for the rest of the session" short of marking an entire MCP server `trusted` in
+`kumo.toml`. The approval keyboard now offers a third button, **Always allow**, alongside Allow
+once and Deny; tapping it both dispatches the current call and records a standing grant
+(`always_allowed_tools`, a `(telegram_chat_id, tool_name)` table added in `user_version = 6`) so
+every later call to that *tool* — not that specific command, e.g. every future `run_command`
+regardless of what command string it runs — skips the approval prompt for the rest of the chat's
+active session. `/new` calls `clear_always_allowed` alongside its existing `clear_active_session`,
+so a grant never outlives the session it was made in; there is deliberately no way to grant it
+permanently, matching the same reasoning MCP's per-server `trusted` flag already uses (an explicit,
+bounded escape hatch from repeated prompts, not a way to disable confirmation altogether). This is
+tool-grained rather than command-grained by design — a scoped list of "these exact commands are
+pre-approved" would need its own matching and escaping logic for little real benefit, since a chat
+that trusts `run_command` at all in a session is very likely to trust it for the whole session.
 
 ## Phase 4b: Memory
 

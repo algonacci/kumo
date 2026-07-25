@@ -97,8 +97,13 @@ async fn run_due_tasks(
             Ok(()) => "completed",
             Err(error) => {
                 eprintln!("Scheduled task {} failed: {error:#}", &task.id[..8]);
+                let repeat_note = if task.repeat_interval_seconds.is_some() {
+                    " This recurring reminder will not be retried automatically; reschedule it if needed."
+                } else {
+                    ""
+                };
                 let notice = format!(
-                    "\u{26a0}\u{fe0f} A scheduled task failed to run: \"{}\"\nError: {error:#}",
+                    "\u{26a0}\u{fe0f} A scheduled task failed to run: \"{}\"\nError: {error:#}{repeat_note}",
                     task.prompt
                 );
                 if let Err(send_error) = bot.send_message(chat_id, notice).await {
@@ -110,6 +115,8 @@ async fn run_due_tasks(
                 "failed"
             }
         };
+        // For a successful, recurring task this reschedules it (run_at advanced by its interval)
+        // instead of actually marking it completed — see Database::complete_scheduled_task.
         database
             .lock()
             .await
@@ -134,6 +141,7 @@ async fn run_scheduled_task(
         state,
         approvals,
         questions,
+        database,
         history,
         ProviderMessage::user(prompt),
     )

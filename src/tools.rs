@@ -27,6 +27,10 @@ const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
 /// How far into the future a scheduled task may be set, as a sanity bound against the model
 /// misparsing a relative date (e.g. the wrong year).
 const MAX_SCHEDULE_HORIZON: chrono::Duration = chrono::Duration::days(366);
+/// Shortest allowed gap between runs of a recurring task, as a floor against the scheduler's
+/// 30-second poll interval and against the model setting an accidentally tiny interval that would
+/// spam the chat.
+const MIN_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping the
 /// system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
@@ -138,11 +142,15 @@ impl ToolRegistry {
         }
         definitions.push(ToolDefinition {
             name: "schedule_task".to_owned(),
-            description: "Schedule a one-shot message to yourself for a future time. At the \
-                          scheduled time, the given prompt is sent through your own agent loop \
-                          (with all the same tools) as if the user had just sent it, and the \
-                          result is delivered to the user in this chat. Use the user's configured \
-                          timezone (given in the system prompt) to compute run_at."
+            description: "Schedule a message to yourself for a future time, once or repeating. \
+                          At the scheduled time (and again after each repeat_interval_seconds, if \
+                          given), the given prompt is sent through your own agent loop (with all \
+                          the same tools) as if the user had just sent it, and the result is \
+                          delivered to the user in this chat. Use the user's configured timezone \
+                          (given in the system prompt) to compute run_at, which is always the \
+                          *first* time it should run — for a recurring task like \"every day at \
+                          9am\", set run_at to the next upcoming 9am, not today's if it has \
+                          already passed."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -153,7 +161,11 @@ impl ToolRegistry {
                     },
                     "run_at": {
                         "type": "string",
-                        "description": "When to run, as RFC 3339 with a UTC offset, e.g. \"2026-07-27T09:00:00+07:00\"."
+                        "description": "When to run it the first time, as RFC 3339 with a UTC offset, e.g. \"2026-07-27T09:00:00+07:00\"."
+                    },
+                    "repeat_interval_seconds": {
+                        "type": "integer",
+                        "description": "Omit for a one-shot task. For a recurring one, how many seconds between runs, e.g. 86400 for daily, 604800 for weekly."
                     }
                 },
                 "required": ["prompt", "run_at"]
@@ -407,7 +419,7 @@ impl ToolRegistry {
         match tokio::time::timeout(KAMUI_TIMEOUT, child.wait_with_output()).await {
             Ok(result) => {
                 let output = result.context("failed to run kamui")?;
-                Ok(format_command_output(&output))
+                Ok(summarize_kamui_output(&output))
             }
             Err(_) => Ok(format!(
                 "Error: kamui timed out after {} seconds and was terminated",
@@ -416,8 +428,9 @@ impl ToolRegistry {
         }
     }
 
-    /// Record a one-shot scheduled task. Actually running it later is the scheduler loop's job
-    /// (`src/scheduler.rs`); this only validates and persists the request.
+    /// Record a one-shot or recurring scheduled task. Actually running it (and, for a recurring
+    /// task, rescheduling it after each run) is the scheduler loop's job (`src/scheduler.rs`);
+    /// this only validates and persists the request.
     async fn schedule_task(&self, chat_id: i64, arguments: &str) -> Result<String> {
         let arguments: ScheduleArguments =
             serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
@@ -441,15 +454,28 @@ impl ToolRegistry {
                 MAX_SCHEDULE_HORIZON.num_days()
             );
         }
+        if let Some(interval) = arguments.repeat_interval_seconds
+            && interval < MIN_REPEAT_INTERVAL.as_secs() as i64
+        {
+            bail!(
+                "repeat_interval_seconds must be at least {} seconds",
+                MIN_REPEAT_INTERVAL.as_secs()
+            );
+        }
 
         let id = self.database.lock().await.create_scheduled_task(
             chat_id,
             prompt,
             run_at.timestamp(),
+            arguments.repeat_interval_seconds,
         )?;
         let local_time = run_at.with_timezone(&self.timezone);
+        let recurrence = match arguments.repeat_interval_seconds {
+            Some(interval) => format!(", repeating every {interval} seconds"),
+            None => String::new(),
+        };
         Ok(format!(
-            "scheduled ({}): will run at {} ({})",
+            "scheduled ({}): will run at {} ({}){recurrence}",
             &id[..8],
             local_time.format("%Y-%m-%d %H:%M %Z"),
             self.timezone
@@ -555,6 +581,8 @@ struct TaskArguments {
 struct ScheduleArguments {
     prompt: String,
     run_at: String,
+    #[serde(default)]
+    repeat_interval_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -591,6 +619,62 @@ fn parse_task(arguments: &str) -> Result<String> {
         bail!("delegate_to_kamui requires a non-empty 'task' argument");
     }
     Ok(task.to_owned())
+}
+
+/// Turn a `kamui -p` invocation's raw output into something readable in Telegram: a one-line
+/// summary of what happened (tool calls made, any errors) followed by Kamui's actual final
+/// answer, instead of the exit code plus the full interleaved stdout/stderr `format_command_output`
+/// would produce for a generic command. Kamui's own trace lines (`  → tool(...)`, `    ok (N
+/// chars)`, `    ! error`) are counted rather than shown verbatim; the final answer is taken as
+/// the text after the last such trace line, since `kamui -p` prints it as `\n{answer}` after the
+/// tool loop and nothing else goes to stdout after that (its "resume this session" hint goes to
+/// stderr, not stdout, specifically so this split works).
+fn summarize_kamui_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    let is_trace_line = |line: &str| {
+        line.starts_with("  \u{2192} ")
+            || line.starts_with("    ok (")
+            || line.starts_with("    ! ")
+    };
+    let last_trace = lines.iter().rposition(|line| is_trace_line(line));
+    let tool_calls = lines
+        .iter()
+        .filter(|line| line.starts_with("  \u{2192} "))
+        .count();
+    let errors = lines
+        .iter()
+        .filter(|line| line.trim_start().starts_with('!'))
+        .count();
+
+    let answer_start = last_trace.map_or(0, |index| index + 1);
+    let answer = lines[answer_start..]
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+
+    let mut summary = match output.status.code() {
+        Some(0) if tool_calls == 0 => String::new(),
+        Some(0) => format!("({tool_calls} tool call(s), {errors} error(s))\n"),
+        Some(code) => format!("(kamui exited with code {code}, {tool_calls} tool call(s))\n"),
+        None => "(kamui was terminated by a signal)\n".to_owned(),
+    };
+
+    if answer.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        summary.push_str("Error: kamui produced no answer.");
+        if !stderr.trim().is_empty() {
+            summary.push_str("\nstderr:\n");
+            summary.push_str(stderr.trim());
+        }
+    } else {
+        summary.push_str(&answer);
+    }
+    truncate_utf8(summary, MAX_COMMAND_OUTPUT)
 }
 
 fn format_command_output(output: &std::process::Output) -> String {
@@ -914,6 +998,58 @@ mod tests {
         assert_eq!(due[0].telegram_chat_id, 42);
     }
 
+    #[tokio::test]
+    async fn schedule_task_persists_a_repeat_interval() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        let next_year = chrono::Utc::now() + chrono::Duration::days(30);
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: serde_json::json!({
+                "prompt": "daily standup reminder",
+                "run_at": next_year.to_rfc3339(),
+                "repeat_interval_seconds": 86400,
+            })
+            .to_string(),
+        };
+
+        let output = tools.dispatch(42, &call).await;
+        assert!(output.contains("repeating every 86400 seconds"), "{output}");
+
+        let due = database
+            .lock()
+            .await
+            .claim_due_scheduled_tasks(next_year.timestamp() + 1)
+            .unwrap();
+        assert_eq!(due[0].repeat_interval_seconds, Some(86400));
+    }
+
+    #[tokio::test]
+    async fn schedule_task_rejects_a_repeat_interval_below_the_minimum() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        let next_year = chrono::Utc::now() + chrono::Duration::days(30);
+        let call = ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: serde_json::json!({
+                "prompt": "spam every second",
+                "run_at": next_year.to_rfc3339(),
+                "repeat_interval_seconds": 1,
+            })
+            .to_string(),
+        };
+
+        let output = tools.dispatch(42, &call).await;
+        assert!(output.starts_with("Error:"), "{output}");
+    }
+
     fn memory_call(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "1".into(),
@@ -1081,5 +1217,70 @@ mod tests {
             )
             .await;
         assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    /// Builds a real `std::process::Output` with the given exit code, stdout, and stderr, using a
+    /// throwaway shell invocation so the `ExitStatus` is constructed the same way the real
+    /// `delegate_to_kamui` code path receives one (no private-field access or unsafe needed).
+    fn fake_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .unwrap();
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn summarizes_a_clean_run_with_no_tool_calls_as_just_the_answer() {
+        let output = fake_output(0, "\nThe answer is 42.", "");
+        assert_eq!(summarize_kamui_output(&output), "The answer is 42.");
+    }
+
+    #[test]
+    fn summarizes_a_clean_run_with_tool_calls() {
+        let stdout =
+            "  \u{2192} read_file(src/main.rs)\n    ok (120 chars)\n\nDone reading the file.";
+        let output = fake_output(0, stdout, "");
+        let summary = summarize_kamui_output(&output);
+        assert!(
+            summary.starts_with("(1 tool call(s), 0 error(s))\n"),
+            "{summary}"
+        );
+        assert!(summary.ends_with("Done reading the file."), "{summary}");
+    }
+
+    #[test]
+    fn summarizes_a_run_with_a_tool_error() {
+        let stdout = "  \u{2192} run_command(false)\n    ! exit code 1\n\nThe command failed.";
+        let output = fake_output(0, stdout, "");
+        let summary = summarize_kamui_output(&output);
+        assert!(
+            summary.starts_with("(1 tool call(s), 1 error(s))\n"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn summarizes_a_nonzero_exit() {
+        let output = fake_output(1, "  \u{2192} run_command(false)\n    ! exit code 1", "");
+        let summary = summarize_kamui_output(&output);
+        assert!(
+            summary.starts_with("(kamui exited with code 1, 1 tool call(s))\n"),
+            "{summary}"
+        );
+        assert!(summary.contains("Error: kamui produced no answer."));
+    }
+
+    #[test]
+    fn falls_back_to_stderr_when_there_is_no_answer() {
+        let output = fake_output(1, "", "panicked at src/main.rs:1");
+        let summary = summarize_kamui_output(&output);
+        assert!(summary.contains("Error: kamui produced no answer."));
+        assert!(summary.contains("panicked at src/main.rs:1"));
     }
 }
