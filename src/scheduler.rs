@@ -8,7 +8,7 @@ use teloxide::prelude::*;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    AppState, PendingApprovals, PendingQuestions, prepare_history,
+    AppState, PendingApprovals, PendingQuestions, logging, prepare_history,
     provider::Message as ProviderMessage, run_agent, send_formatted, send_mcp_images,
     storage::Database,
 };
@@ -38,7 +38,7 @@ pub async fn run(
         if let Err(error) =
             run_due_tasks(&bot, &state, &approvals, &questions, &database, &turn_lock).await
         {
-            eprintln!("Scheduler error: {error:#}");
+            logging::error("scheduler", "poll failed", &error);
         }
     }
 }
@@ -67,9 +67,13 @@ async fn run_due_tasks(
             task.prompt
         );
         if let Err(error) = bot.send_message(chat_id, notice).await {
-            eprintln!(
-                "Could not notify chat {chat_id} about expired task {}: {error:#}",
-                &task.id[..8]
+            logging::warn(
+                "scheduler",
+                format!(
+                    "task={} chat_id={} notification=failed reason=expired error={error:#}",
+                    &task.id[..8],
+                    chat_id
+                ),
             );
         }
     }
@@ -78,10 +82,14 @@ async fn run_due_tasks(
     for task in due {
         let _turn_guard = turn_lock.lock().await;
         let chat_id = ChatId(task.telegram_chat_id);
-        println!(
-            "Running scheduled task {} for chat {chat_id} (was due at {})",
-            &task.id[..8],
-            task.run_at
+        logging::info(
+            "scheduler",
+            format!(
+                "task={} chat_id={} status=started due_at={}",
+                &task.id[..8],
+                chat_id,
+                task.run_at
+            ),
         );
 
         let outcome = run_scheduled_task(
@@ -97,7 +105,11 @@ async fn run_due_tasks(
         let status = match &outcome {
             Ok(()) => "completed",
             Err(error) => {
-                eprintln!("Scheduled task {} failed: {error:#}", &task.id[..8]);
+                logging::error(
+                    "scheduler",
+                    format!("task={} status=failed", &task.id[..8]),
+                    error,
+                );
                 let repeat_note = if task.repeat_interval_seconds.is_some() {
                     " This recurring reminder will not be retried automatically; reschedule it if needed."
                 } else {
@@ -108,9 +120,13 @@ async fn run_due_tasks(
                     task.prompt
                 );
                 if let Err(send_error) = bot.send_message(chat_id, notice).await {
-                    eprintln!(
-                        "Could not notify chat {chat_id} about failed task {}: {send_error:#}",
-                        &task.id[..8]
+                    logging::warn(
+                        "scheduler",
+                        format!(
+                            "task={} chat_id={} notification=failed error={send_error:#}",
+                            &task.id[..8],
+                            chat_id
+                        ),
                     );
                 }
                 "failed"

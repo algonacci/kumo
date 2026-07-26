@@ -1,7 +1,7 @@
 //! MCP stdio client. Configured servers are launched at startup and their advertised tools join
 //! Kumo's registry under qualified names so they use the same agent loop and Telegram approvals.
 
-use std::{process::Stdio, sync::Arc};
+use std::{process::Stdio, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use rmcp::{
 };
 use serde_json::Value;
 
-use crate::{config::McpServerConfig, provider::ToolDefinition, tools::ExternalTool};
+use crate::{config::McpServerConfig, logging, provider::ToolDefinition, tools::ExternalTool};
 
 const MEDIA_RESULT_PREFIX: &str = "__KUMO_MCP_MEDIA__";
 const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -55,8 +55,18 @@ pub async fn connect_all(
     let mut tools = Vec::new();
     let mut statuses = Vec::new();
     for (name, server) in servers {
+        let started = Instant::now();
+        logging::info("mcp", format!("server={name} status=connecting"));
         match connect(name, server).await {
             Ok(mut connected) => {
+                logging::info(
+                    "mcp",
+                    format!(
+                        "server={name} status=initialized tools={} duration_ms={}",
+                        connected.len(),
+                        started.elapsed().as_millis()
+                    ),
+                );
                 statuses.push(ConnectionStatus {
                     name: name.clone(),
                     tool_count: connected.len(),
@@ -68,12 +78,22 @@ pub async fn connect_all(
                 });
                 tools.append(&mut connected);
             }
-            Err(error) => statuses.push(ConnectionStatus {
-                name: name.clone(),
-                tool_count: 0,
-                trusted_count: 0,
-                error: Some(format!("{error:#}")),
-            }),
+            Err(error) => {
+                logging::error(
+                    "mcp",
+                    format!(
+                        "server={name} status=failed duration_ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                    &error,
+                );
+                statuses.push(ConnectionStatus {
+                    name: name.clone(),
+                    tool_count: 0,
+                    trusted_count: 0,
+                    error: Some(format!("{error:#}")),
+                });
+            }
         }
     }
     Connections { tools, statuses }

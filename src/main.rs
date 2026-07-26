@@ -1,6 +1,7 @@
 mod compaction;
 mod config;
 mod daemon;
+mod logging;
 mod markdown;
 mod mcp;
 mod onboarding;
@@ -10,7 +11,12 @@ mod service;
 mod storage;
 mod tools;
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use config::Config;
@@ -22,7 +28,8 @@ use teloxide::{
     payloads::SendMessageSetters,
     prelude::*,
     types::{
-        CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
+        CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+        MessageId, ParseMode,
     },
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
@@ -150,6 +157,10 @@ async fn main() -> Result<()> {
 }
 
 async fn run_gateway(config: Config) -> Result<()> {
+    logging::info(
+        "gateway",
+        format!("status=starting version={}", env!("CARGO_PKG_VERSION")),
+    );
     let bot = Bot::new(config.telegram.bot_token.clone());
     let allowed_user_id = config.telegram.owner_user_id;
     let provider = Provider::new(config.provider()?.clone());
@@ -175,19 +186,33 @@ async fn run_gateway(config: Config) -> Result<()> {
         .collect::<Vec<_>>();
     for status in &mcp.statuses {
         match &status.error {
-            Some(error) => println!("MCP {}: failed ({error})", status.name),
-            None => println!(
-                "MCP {}: {} tool(s){}",
-                status.name,
-                status.tool_count,
-                status.trust_label()
+            Some(error) => logging::warn(
+                "mcp",
+                format!("server={} status=failed error={error}", status.name),
             ),
+            None => {
+                let trust = match status.trusted_count {
+                    0 => "approval_required".to_owned(),
+                    count if count == status.tool_count => "trusted".to_owned(),
+                    count => format!("partial({count}/{})", status.tool_count),
+                };
+                logging::info(
+                    "mcp",
+                    format!(
+                        "server={} status=connected tools={} trust={}",
+                        status.name, status.tool_count, trust
+                    ),
+                )
+            }
         }
     }
     let database = Database::open()?;
     let reset_count = database.reset_stuck_running_tasks()?;
     if reset_count > 0 {
-        println!("Recovered {reset_count} scheduled task(s) interrupted by a previous shutdown.");
+        logging::warn(
+            "scheduler",
+            format!("recovered_tasks={reset_count} reason=previous_shutdown"),
+        );
     }
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     let database = Arc::new(Mutex::new(database));
@@ -210,23 +235,23 @@ async fn run_gateway(config: Config) -> Result<()> {
     }));
 
     let current = state.read().await;
-    println!(
-        "Kumo is listening as @{}.",
-        current.config.telegram.bot_username
-    );
-    println!("Model: {}", current.provider.active_model());
-    println!(
-        "Workspace: {}",
-        current
-            .config
-            .tools
-            .as_ref()
-            .expect("tools are configured before gateway startup")
-            .workspace
-            .display()
+    logging::info(
+        "gateway",
+        format!(
+            "status=listening bot=@{} model={} workspace={}",
+            current.config.telegram.bot_username,
+            current.provider.active_model(),
+            current
+                .config
+                .tools
+                .as_ref()
+                .expect("tools are configured before gateway startup")
+                .workspace
+                .display()
+        ),
     );
     drop(current);
-    println!("Press Ctrl+C to stop.");
+    logging::info("gateway", "press Ctrl+C to stop");
 
     let scheduler_task = tokio::spawn(scheduler::run(
         bot.clone(),
@@ -286,15 +311,14 @@ async fn run_gateway(config: Config) -> Result<()> {
         }
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to listen for Ctrl+C")?;
-            println!();
-            println!("Shutting down Kumo...");
+            logging::info("gateway", "shutdown requested by Ctrl+C");
             approvals.lock().await.clear();
             questions.lock().await.clear();
             if let Ok(shutdown) = shutdown_token.shutdown() {
                 shutdown.await;
             }
             dispatch_task.await.context("Telegram dispatcher task failed")?;
-            println!("Kumo stopped.");
+            logging::info("gateway", "status=stopped");
         }
     }
     scheduler_task.abort();
@@ -317,8 +341,29 @@ async fn handle_message(
         return Ok(());
     };
     if user.id.0 != allowed_user_id {
+        logging::warn(
+            "telegram",
+            format!("event=unauthorized_message user_id={}", user.id.0),
+        );
         return Ok(());
     }
+
+    let message_kind = if message.photo().is_some() {
+        "photo"
+    } else if message.document().is_some() {
+        "document"
+    } else if message.text().is_some() {
+        "text"
+    } else {
+        "unsupported"
+    };
+    logging::info(
+        "telegram",
+        format!(
+            "event=message_received type={} chat_id={} user_id={} message_id={}",
+            message_kind, message.chat.id, user.id.0, message.id
+        ),
+    );
 
     // If an ask_user question is waiting on this chat, any text the user sends next answers it
     // (a free-text reply instead of tapping one of the offered buttons) rather than starting a
@@ -357,7 +402,6 @@ async fn handle_message(
     };
     let _turn_guard = turn_lock.lock().await;
 
-    println!("Received a message from Telegram user {}", user.id.0);
     if text == "/new" {
         let database = database.lock().await;
         let cleared = database.clear_active_session(message.chat.id.0)?;
@@ -665,10 +709,17 @@ async fn deliver_agent_turn(
             )?;
         }
         Err(error) => {
-            eprintln!("Model request failed: {error:#}");
+            let reference = &Uuid::new_v4().to_string()[..8];
+            logging::error(
+                "agent",
+                format!("request_id={reference} status=failed"),
+                &error,
+            );
             bot.send_message(
                 chat_id,
-                "The model provider could not answer. Check the Kumo terminal for details.",
+                format!(
+                    "The model provider could not answer. Check the Kumo log for reference {reference}."
+                ),
             )
             .await?;
         }
@@ -734,8 +785,19 @@ pub(crate) async fn run_agent(
     let mut images = Vec::new();
 
     for _ in 0..MAX_TOOL_ROUNDS {
+        let model_started = Instant::now();
         let response =
             with_typing(bot, chat_id, provider.chat(&messages, &tool_definitions)).await?;
+        logging::info(
+            "model",
+            format!(
+                "status=completed model={} duration_ms={} tool_calls={} finish_reason={}",
+                model,
+                model_started.elapsed().as_millis(),
+                response.tool_calls.len(),
+                response.finish_reason
+            ),
+        );
         accumulate_usage(&mut usage, &response.usage);
         if response.tool_calls.is_empty() {
             if response.content.trim().is_empty() {
@@ -752,16 +814,18 @@ pub(crate) async fn run_agent(
             ));
         }
 
-        println!(
-            "Model requested {} tool call(s).",
-            response.tool_calls.len()
+        logging::info(
+            "agent",
+            format!("event=tool_round calls={}", response.tool_calls.len()),
         );
         let request_message =
             ProviderMessage::tool_request(response.content, response.tool_calls.clone());
         messages.push(request_message.clone());
         trail.push(request_message);
         for call in response.tool_calls {
-            println!("Tool: {}", call.name);
+            let tool_started = Instant::now();
+            logging::info("tool", format!("name={} status=started", call.name));
+            let progress = send_tool_progress(bot, chat_id, &call.name).await;
             let output = if call.name == "ask_user" {
                 ask_user(bot, chat_id, questions, &call.arguments).await?
             } else {
@@ -799,6 +863,26 @@ pub(crate) async fn run_agent(
                 }
             };
             let (output, mut tool_images) = mcp::extract_media(output);
+            let failed = output.starts_with("Error:");
+            logging::info(
+                "tool",
+                format!(
+                    "name={} status={} duration_ms={} images={}",
+                    call.name,
+                    if failed { "failed" } else { "completed" },
+                    tool_started.elapsed().as_millis(),
+                    tool_images.len()
+                ),
+            );
+            finish_tool_progress(
+                bot,
+                chat_id,
+                progress,
+                &call.name,
+                failed,
+                tool_started.elapsed(),
+            )
+            .await;
             images.append(&mut tool_images);
             let result_message = ProviderMessage::tool_result(call.id, output);
             messages.push(result_message.clone());
@@ -810,7 +894,10 @@ pub(crate) async fn run_agent(
     // entire turn away — including commands the owner already approved and the results they
     // produced — and report it as a provider failure, which it is not. Ask once more with no tools
     // offered instead, so the model has to answer from what it already gathered.
-    println!("Reached the {MAX_TOOL_ROUNDS}-round tool limit; asking for a final answer.");
+    logging::warn(
+        "agent",
+        format!("tool_round_limit={MAX_TOOL_ROUNDS} action=request_final_answer"),
+    );
     let response = with_typing(bot, chat_id, provider.chat(&messages, &[])).await?;
     accumulate_usage(&mut usage, &response.usage);
     if response.content.trim().is_empty() {
@@ -884,7 +971,7 @@ pub(crate) async fn prepare_history(
         return Ok(history);
     };
 
-    println!("Compacting {cutoff} older message(s)...");
+    logging::info("storage", format!("event=compaction messages={cutoff}"));
     let rendered = compaction::render(&history.messages[..cutoff]);
     let summary = provider
         .summarize(&compaction::summary_messages(
@@ -1392,7 +1479,10 @@ pub(crate) async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> R
     match sent {
         Ok(_) => Ok(()),
         Err(error) => {
-            eprintln!("Markdown formatting failed, sending plain text: {error:#}");
+            logging::warn(
+                "telegram",
+                format!("markdown_rejected=true fallback=plain_text error={error:#}"),
+            );
             bot.send_message(chat_id, chunk).await?;
             Ok(())
         }
@@ -1406,12 +1496,85 @@ pub(crate) async fn send_mcp_images(
 ) -> Result<()> {
     for image in images {
         if !image.mime_type.starts_with("image/") {
+            logging::warn(
+                "telegram",
+                format!("image_skipped=true mime_type={}", image.mime_type),
+            );
             continue;
         }
+        let started = Instant::now();
         bot.send_photo(chat_id, InputFile::memory(image.data.clone()))
             .await?;
+        logging::info(
+            "telegram",
+            format!(
+                "event=image_sent chat_id={} mime_type={} size_bytes={} duration_ms={}",
+                chat_id,
+                image.mime_type,
+                image.data.len(),
+                started.elapsed().as_millis()
+            ),
+        );
     }
     Ok(())
+}
+
+fn user_facing_tool_name(name: &str) -> String {
+    name.rsplit("__").next().unwrap_or(name).replace('_', " ")
+}
+
+fn should_show_tool_progress(name: &str) -> bool {
+    name.contains("__") || matches!(name, "delegate_to_kamui" | "run_command")
+}
+
+async fn send_tool_progress(bot: &Bot, chat_id: ChatId, name: &str) -> Option<MessageId> {
+    if !should_show_tool_progress(name) {
+        return None;
+    }
+    let label = user_facing_tool_name(name);
+    match bot
+        .send_message(chat_id, format!("🛠️ Sedang menjalankan {label}..."))
+        .await
+    {
+        Ok(message) => Some(message.id),
+        Err(error) => {
+            logging::warn(
+                "telegram",
+                format!("tool_progress=send_failed tool={name} error={error:#}"),
+            );
+            None
+        }
+    }
+}
+
+async fn finish_tool_progress(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: Option<MessageId>,
+    name: &str,
+    failed: bool,
+    elapsed: Duration,
+) {
+    let Some(message_id) = message_id else {
+        return;
+    };
+    let label = user_facing_tool_name(name);
+    let icon = if failed { "❌" } else { "✅" };
+    let status = if failed { "gagal" } else { "selesai" };
+    let seconds = elapsed.as_secs_f64();
+    if let Err(error) = bot
+        .edit_message_text(
+            chat_id,
+            message_id,
+            format!("{icon} {label} {status} dalam {seconds:.1} detik."),
+        )
+        .await
+    {
+        logging::warn(
+            "telegram",
+            format!("tool_progress=edit_failed tool={name} error={error:#}"),
+        );
+    }
 }
 
 pub(crate) fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
@@ -1493,7 +1656,7 @@ async fn switch_provider(state: &RwLock<AppState>, name: &str) -> String {
     match state.config.save() {
         Ok(_) => format!("Switched to {name} ({model})."),
         Err(error) => {
-            eprintln!("Could not save the provider selection: {error:#}");
+            logging::error("config", "could not save provider selection", &error);
             format!("Switched to {name} for this run, but Kumo could not save the selection.")
         }
     }
@@ -1556,7 +1719,7 @@ async fn set_context_window(state: &RwLock<AppState>, tokens: &str) -> String {
     match state.config.save() {
         Ok(_) => format!("Context window set to {window} tokens."),
         Err(error) => {
-            eprintln!("Could not save the context window: {error:#}");
+            logging::error("config", "could not save context window", &error);
             "Context window changed for this run, but Kumo could not save it.".to_owned()
         }
     }
@@ -1606,7 +1769,7 @@ async fn refresh_models(state: &RwLock<AppState>) -> String {
         ),
     }
     if let Err(error) = state.config.save() {
-        eprintln!("Could not save the refreshed model list: {error:#}");
+        logging::error("config", "could not save refreshed model list", &error);
         message.push_str("\n\nThe list is updated for this run, but Kumo could not save it.");
     }
     message
@@ -1633,7 +1796,7 @@ async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
     match state.config.save() {
         Ok(_) => format!("Switched to {model}."),
         Err(error) => {
-            eprintln!("Could not save model selection: {error:#}");
+            logging::error("config", "could not save model selection", &error);
             "Model changed for this run, but Kumo could not save the selection.".to_owned()
         }
     }
@@ -1922,6 +2085,19 @@ mod tests {
         assert_eq!(turn.answer, "There are 42 errors.");
         // A turn cut short by the round cap stays distinguishable once stored.
         assert_eq!(turn.finish_reason, "tool_round_limit");
+    }
+
+    #[test]
+    fn progress_is_shown_only_for_visible_external_work() {
+        assert!(should_show_tool_progress("mcptools__render_plantuml"));
+        assert!(should_show_tool_progress("delegate_to_kamui"));
+        assert!(should_show_tool_progress("run_command"));
+        assert!(!should_show_tool_progress("read_file"));
+        assert!(!should_show_tool_progress("remember"));
+        assert_eq!(
+            user_facing_tool_name("mcptools__render_plantuml"),
+            "render plantuml"
+        );
     }
 
     #[test]

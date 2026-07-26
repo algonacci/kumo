@@ -379,6 +379,12 @@ conversation history, so base64 image data does not consume the model context.
 The agent is instructed to prefer specialized MCP capabilities over Kamui, shell commands, or ad hoc
 scripts; Kamui remains reserved for actual codebase changes.
 
+Foreground runtime logs use a consistent `[timestamp] [LEVEL] [component] message` format. MCP
+startup, Telegram updates, model/tool duration, generated image delivery, scheduler activity, and
+full error chains are logged without including message text, tool arguments, tokens, or secrets.
+For visible user progress, meaningful MCP, Kamui, and shell operations post a Telegram status such
+as `🛠️ Sedang menjalankan ...`, then edit it to `✅ selesai` or `❌ gagal` with elapsed time.
+
 ## Development
 
 Requires a current stable Rust toolchain.
