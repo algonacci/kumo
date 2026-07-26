@@ -14,7 +14,23 @@ use chrono_tz::TZ_VARIANTS;
 
 const BOTFATHER_URL: &str = "https://t.me/BotFather";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long each `getUpdates` call waits for Telegram to hand us an update.
+const PAIRING_POLL_TIMEOUT: Duration = Duration::from_secs(20);
+/// The HTTP client has to outlive the long poll it carries, otherwise reqwest
+/// aborts the request before Telegram ever answers. Teloxide's default is 17s,
+/// which is shorter than `PAIRING_POLL_TIMEOUT`.
+const TELEGRAM_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pause before retrying after a failed poll, so a flaky link does not spin.
+const PAIRING_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+fn telegram_bot(token: String) -> Result<Bot> {
+    let client = teloxide::net::default_reqwest_settings()
+        .timeout(TELEGRAM_HTTP_TIMEOUT)
+        .build()
+        .context("could not build the Telegram HTTP client")?;
+    Ok(Bot::with_client(token, client))
+}
 
 pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result<Config> {
     println!("Kumo onboarding");
@@ -123,7 +139,7 @@ async fn setup_telegram() -> Result<TelegramConfig> {
         let token = Password::with_theme(&theme)
             .with_prompt("Create the bot, then paste its token here")
             .interact()?;
-        let bot = Bot::new(token.trim().to_owned());
+        let bot = telegram_bot(token.trim().to_owned())?;
 
         match bot.get_me().await {
             Ok(me) => break (bot, me.username().to_owned(), token.trim().to_owned()),
@@ -216,15 +232,22 @@ async fn setup_provider() -> Result<ProviderConfig> {
 async fn wait_for_owner(bot: &Bot, payload: &str) -> Result<UserId> {
     let expected = format!("/start {payload}");
     let deadline = Instant::now() + PAIRING_TIMEOUT;
+    let poll_timeout = PAIRING_POLL_TIMEOUT.as_secs() as u32;
     let mut offset = 0;
+    let mut last_error = None;
 
     while Instant::now() < deadline {
-        let updates = bot
-            .get_updates()
-            .offset(offset)
-            .timeout(20)
-            .await
-            .context("failed while waiting for Telegram pairing")?;
+        let updates = match bot.get_updates().offset(offset).timeout(poll_timeout).await {
+            Ok(updates) => updates,
+            // A slow or flaky connection should not end onboarding: keep polling
+            // until the deadline, and only report the error if we never pair.
+            Err(error) => {
+                eprintln!("Still waiting for Telegram ({error}). Retrying...");
+                last_error = Some(error);
+                tokio::time::sleep(PAIRING_RETRY_DELAY).await;
+                continue;
+            }
+        };
 
         for update in updates {
             offset = update.id.0.saturating_add(1) as i32;
@@ -242,5 +265,11 @@ async fn wait_for_owner(bot: &Bot, payload: &str) -> Result<UserId> {
         }
     }
 
-    bail!("pairing timed out; run `kumo onboard` to try again")
+    match last_error {
+        Some(error) => {
+            Err(anyhow::Error::new(error)
+                .context("pairing timed out; run `kumo onboard` to try again"))
+        }
+        None => bail!("pairing timed out; run `kumo onboard` to try again"),
+    }
 }
