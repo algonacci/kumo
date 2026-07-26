@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
 use rmcp::{
-    model::CallToolRequestParam,
+    model::CallToolRequestParams,
     service::{RoleClient, RunningService, ServiceExt},
     transport::TokioChildProcess,
 };
@@ -162,12 +162,13 @@ impl ExternalTool for McpTool {
     async fn run(&self, arguments: &str) -> Result<String> {
         let value: Value =
             serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let mut request = CallToolRequestParams::new(self.remote_name.clone());
+        if let Some(arguments) = value.as_object().cloned() {
+            request = request.with_arguments(arguments);
+        }
         let result = self
             .service
-            .call_tool(CallToolRequestParam {
-                name: self.remote_name.clone().into(),
-                arguments: value.as_object().cloned(),
-            })
+            .call_tool(request)
             .await
             .with_context(|| format!("MCP tool '{}' failed", self.qualified_name))?;
         Ok(render_result(&result))

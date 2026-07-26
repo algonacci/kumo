@@ -11,9 +11,12 @@
 //! Neither is worth the added complexity without a concrete need, so `enable`/`disable` on Windows
 //! just explain that and point at `kumo start` instead.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::{Context, bail};
 
 /// The `PATH` a service-managed Kumo should run with, captured from the shell running `kumo
 /// enable`. Neither systemd nor launchd inherits a login shell's environment, so their default
