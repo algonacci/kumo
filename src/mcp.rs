@@ -5,6 +5,7 @@ use std::{process::Stdio, sync::Arc};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine;
 use rmcp::{
     model::CallToolRequestParam,
     service::{RoleClient, RunningService, ServiceExt},
@@ -13,6 +14,14 @@ use rmcp::{
 use serde_json::Value;
 
 use crate::{config::McpServerConfig, provider::ToolDefinition, tools::ExternalTool};
+
+const MEDIA_RESULT_PREFIX: &str = "__KUMO_MCP_MEDIA__";
+const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+pub(crate) struct McpImage {
+    pub(crate) mime_type: String,
+    pub(crate) data: Vec<u8>,
+}
 
 pub struct ConnectionStatus {
     pub name: String,
@@ -161,16 +170,64 @@ fn render_result<T: serde::Serialize>(result: &T) -> String {
                 .collect()
         })
         .unwrap_or_default();
+    let images: Vec<Value> = value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let body = if texts.is_empty() {
         value.to_string()
     } else {
         texts.join("\n")
     };
-    if is_error {
+    let body = if is_error {
         format!("Error: {body}")
     } else {
         body
+    };
+    if images.is_empty() {
+        body
+    } else {
+        format!(
+            "{MEDIA_RESULT_PREFIX}{}",
+            serde_json::json!({"text": body, "images": images})
+        )
     }
+}
+
+pub(crate) fn extract_media(output: String) -> (String, Vec<McpImage>) {
+    let Some(payload) = output.strip_prefix(MEDIA_RESULT_PREFIX) else {
+        return (output, Vec::new());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return (output, Vec::new());
+    };
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let images = value
+        .get("images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|image| {
+            let mime_type = image.get("mimeType")?.as_str()?.to_owned();
+            let encoded = image.get("data")?.as_str()?;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            (data.len() <= MAX_MCP_IMAGE_BYTES).then_some(McpImage { mime_type, data })
+        })
+        .collect();
+    (text, images)
 }
 
 #[cfg(test)]
@@ -193,5 +250,20 @@ mod tests {
             "isError": true
         });
         assert_eq!(render_result(&result), "Error: failed");
+    }
+
+    #[test]
+    fn extracts_image_content_without_leaking_base64_into_text() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "chart metadata"},
+                {"type": "image", "mimeType": "image/png", "data": "iVBORw=="}
+            ]
+        });
+        let (text, images) = extract_media(render_result(&result));
+        assert_eq!(text, "chart metadata");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, b"\x89PNG");
     }
 }

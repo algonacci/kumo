@@ -185,6 +185,10 @@ image is sent either way, and an unsupported model's rejection surfaces as a nor
 Photos are capped at 5 MiB and, like a text message, are not part of any stored conversation history
 beyond the turn they were sent in.
 
+CSV, XLSX, and XLSM documents are saved under `uploads` in the configured workspace. Their local
+path and caption are passed to the model, allowing MCP data tools to read the file and return a
+generated chart as a Telegram photo. Documents are capped at 20 MiB.
+
 The model's answer is rendered with Telegram's MarkdownV2 formatting: `**bold**`, `_italic_`,
 `` `inline code` ``, fenced code blocks, and `[links](url)` all render as Telegram entities instead
 of raw punctuation. If Telegram rejects the formatted message (for example, an entity split across a
@@ -336,6 +340,8 @@ and skipped.
 Servers are launched as child processes of Kumo, so they inherit its `PATH`. `kumo enable` records
 the `PATH` of the shell that ran it into the systemd unit or launchd agent for that reason — without
 it, a service-managed Kumo would fail to find `uv`, `npx`, or `node` in `~/.local/bin`.
+MCP image content is delivered to the Telegram chat as a photo; only accompanying text is stored in
+conversation history, so base64 image data does not consume the model context.
 
 ## Development
 

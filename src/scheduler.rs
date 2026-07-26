@@ -9,7 +9,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     AppState, PendingApprovals, PendingQuestions, prepare_history,
-    provider::Message as ProviderMessage, run_agent, send_formatted, storage::Database,
+    provider::Message as ProviderMessage, run_agent, send_formatted, send_mcp_images,
+    storage::Database,
 };
 
 /// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
@@ -152,6 +153,7 @@ async fn run_scheduled_task(
     for chunk in crate::message_chunks(&turn.answer, 4000) {
         send_formatted(bot, chat_id, &chunk).await?;
     }
+    send_mcp_images(bot, chat_id, &turn.images).await?;
     database.lock().await.save_turn(
         chat_id.0,
         &turn.model,

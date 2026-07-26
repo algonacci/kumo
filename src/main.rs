@@ -21,7 +21,9 @@ use teloxide::{
     net::Download,
     payloads::SendMessageSetters,
     prelude::*,
-    types::{CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{
+        CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode,
+    },
 };
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tools::ToolRegistry;
@@ -45,6 +47,7 @@ pub(crate) struct AgentTurn {
     pub(crate) usage: Usage,
     pub(crate) finish_reason: String,
     pub(crate) model: String,
+    pub(crate) images: Vec<mcp::McpImage>,
 }
 
 const MAX_TOOL_ROUNDS: usize = 8;
@@ -332,6 +335,10 @@ async fn handle_message(
         let _turn_guard = turn_lock.lock().await;
         return handle_photo_message(bot, message, state, approvals, questions, database).await;
     }
+    if message.document().is_some() {
+        let _turn_guard = turn_lock.lock().await;
+        return handle_document_message(bot, message, state, approvals, questions, database).await;
+    }
 
     let Some(text) = message.text() else {
         return Ok(());
@@ -450,6 +457,7 @@ async fn handle_message(
 /// Maximum size of a downloaded Telegram photo, matching Kamui's `@file` image cap: generous
 /// enough for a phone photo, small enough to keep one request's payload reasonable.
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Handle a message containing a photo: download the highest-resolution size Telegram sent,
 /// attach it to a user message (with the caption as text, if any), and run it through the same
@@ -507,6 +515,95 @@ async fn handle_photo_message(
     .await
 }
 
+async fn handle_document_message(
+    bot: Bot,
+    message: Message,
+    state: Arc<RwLock<AppState>>,
+    approvals: PendingApprovals,
+    questions: PendingQuestions,
+    database: Arc<Mutex<Database>>,
+) -> Result<()> {
+    let document = message
+        .document()
+        .context("document message unexpectedly had no document")?;
+    if document.file.size > 0 && u64::from(document.file.size) > MAX_DOCUMENT_BYTES {
+        bot.send_message(
+            message.chat.id,
+            format!(
+                "That document is too large ({} bytes); the limit is {MAX_DOCUMENT_BYTES} bytes.",
+                document.file.size
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let original_name = document.file_name.as_deref().unwrap_or("upload.bin");
+    let filename = std::path::Path::new(original_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload.bin");
+    let extension = std::path::Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "csv" | "xlsx" | "xlsm") {
+        bot.send_message(
+            message.chat.id,
+            "Only CSV, XLSX, and XLSM documents are currently supported.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let workspace = state
+        .read()
+        .await
+        .config
+        .tools
+        .as_ref()
+        .context("tools workspace is not configured")?
+        .workspace
+        .clone();
+    let upload_dir = workspace.join("uploads");
+    std::fs::create_dir_all(&upload_dir)?;
+    let path = upload_dir.join(format!("{}-{filename}", Uuid::new_v4()));
+
+    let file = bot.get_file(document.file.id.clone()).await?;
+    let mut bytes = Vec::new();
+    bot.download_file(&file.path, &mut bytes).await?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        bail!("downloaded document exceeds the {MAX_DOCUMENT_BYTES}-byte limit");
+    }
+    std::fs::write(&path, bytes)?;
+
+    let caption = message.caption().unwrap_or_default();
+    let instruction = if caption.is_empty() {
+        "Inspect its columns and ask what analysis or chart they want if the request is unclear."
+    } else {
+        caption
+    };
+    let prompt = format!(
+        "The user uploaded a data file at `{}`. {instruction}",
+        path.display()
+    );
+    bot.send_chat_action(message.chat.id, ChatAction::Typing)
+        .await?;
+    let history = prepare_history(&state, &database, message.chat.id.0).await?;
+    deliver_agent_turn(
+        &bot,
+        message.chat.id,
+        &state,
+        &approvals,
+        &questions,
+        &database,
+        history,
+        ProviderMessage::user(prompt),
+    )
+    .await
+}
+
 /// Shared tail of both the text and photo message paths: run the agent loop, deliver the answer
 /// (or a generic failure notice) to the chat, and persist a successful turn.
 #[allow(clippy::too_many_arguments)]
@@ -536,6 +633,7 @@ async fn deliver_agent_turn(
             for chunk in message_chunks(&turn.answer, 4000) {
                 send_formatted(bot, chat_id, &chunk).await?;
             }
+            send_mcp_images(bot, chat_id, &turn.images).await?;
             database.lock().await.save_turn(
                 chat_id.0,
                 &turn.model,
@@ -611,6 +709,7 @@ pub(crate) async fn run_agent(
     messages.push(user_message.clone());
     let mut trail = Vec::new();
     let mut usage = Usage::default();
+    let mut images = Vec::new();
 
     for _ in 0..MAX_TOOL_ROUNDS {
         let response =
@@ -627,6 +726,7 @@ pub(crate) async fn run_agent(
                 usage,
                 response.finish_reason,
                 model,
+                images,
             ));
         }
 
@@ -676,6 +776,8 @@ pub(crate) async fn run_agent(
                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call)).await
                 }
             };
+            let (output, mut tool_images) = mcp::extract_media(output);
+            images.append(&mut tool_images);
             let result_message = ProviderMessage::tool_result(call.id, output);
             messages.push(result_message.clone());
             trail.push(result_message);
@@ -702,6 +804,7 @@ pub(crate) async fn run_agent(
         // distinguishable in storage from one the model chose to end.
         TOOL_ROUND_LIMIT_FINISH_REASON.to_owned(),
         model,
+        images,
     ))
 }
 
@@ -714,6 +817,7 @@ fn finish_turn(
     usage: Usage,
     finish_reason: String,
     model: String,
+    images: Vec<mcp::McpImage>,
 ) -> AgentTurn {
     let mut record = Vec::with_capacity(trail.len() + 2);
     record.push(user_message);
@@ -725,6 +829,7 @@ fn finish_turn(
         usage,
         finish_reason,
         model,
+        images,
     }
 }
 
@@ -1260,6 +1365,21 @@ pub(crate) async fn send_formatted(bot: &Bot, chat_id: ChatId, chunk: &str) -> R
     }
 }
 
+pub(crate) async fn send_mcp_images(
+    bot: &Bot,
+    chat_id: ChatId,
+    images: &[mcp::McpImage],
+) -> Result<()> {
+    for image in images {
+        if !image.mime_type.starts_with("image/") {
+            continue;
+        }
+        bot.send_photo(chat_id, InputFile::memory(image.data.clone()))
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
     if message.is_empty() {
         return Vec::new();
@@ -1701,6 +1821,7 @@ mod tests {
             Usage::default(),
             TOOL_ROUND_LIMIT_FINISH_REASON.to_owned(),
             "model-a".to_owned(),
+            Vec::new(),
         );
 
         assert_eq!(turn.record.len(), 3);
