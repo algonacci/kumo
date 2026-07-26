@@ -10,7 +10,7 @@ mod service;
 mod storage;
 mod tools;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use config::Config;
@@ -49,6 +49,9 @@ pub(crate) struct AgentTurn {
 
 const MAX_TOOL_ROUNDS: usize = 8;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Telegram clears a typing indicator on its own after roughly five seconds, so anything longer
+/// has to keep saying so.
+const TYPING_REFRESH: Duration = Duration::from_secs(4);
 const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
 const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. If delegate_to_kamui is available and the task involves editing files or a multi-step coding change, prefer it over run_command: it runs a dedicated coding agent with a proper diff-reviewed file editor, rather than an ad hoc shell command.";
 /// A user's answer to an approval prompt. `AlwaysAllow` is distinct from `AllowOnce`: it also
@@ -154,7 +157,7 @@ async fn run_gateway(config: Config) -> Result<()> {
                 "{}: {} tool(s){}",
                 status.name,
                 status.tool_count,
-                if status.trusted { " [trusted]" } else { "" }
+                status.trust_label()
             ),
         })
         .collect::<Vec<_>>();
@@ -165,7 +168,7 @@ async fn run_gateway(config: Config) -> Result<()> {
                 "MCP {}: {} tool(s){}",
                 status.name,
                 status.tool_count,
-                if status.trusted { " [trusted]" } else { "" }
+                status.trust_label()
             ),
         }
     }
@@ -534,6 +537,21 @@ async fn deliver_agent_turn(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs `work` while holding Telegram's typing indicator up, so a turn that spends a minute in a
+/// provider call or a shell command does not look like it stalled. Deliberately wrapped around
+/// work only: an approval prompt or an `ask_user` question is Kumo waiting on the owner, and
+/// showing "typing" while the owner is the one being waited on would be a lie.
+async fn with_typing<T>(bot: &Bot, chat_id: ChatId, work: impl Future<Output = T>) -> T {
+    tokio::pin!(work);
+    loop {
+        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+        tokio::select! {
+            output = &mut work => return output,
+            _ = tokio::time::sleep(TYPING_REFRESH) => {}
+        }
+    }
+}
+
 pub(crate) async fn run_agent(
     bot: &Bot,
     chat_id: ChatId,
@@ -575,7 +593,8 @@ pub(crate) async fn run_agent(
     let mut usage = Usage::default();
 
     for _ in 0..MAX_TOOL_ROUNDS {
-        let response = provider.chat(&messages, &tool_definitions).await?;
+        let response =
+            with_typing(bot, chat_id, provider.chat(&messages, &tool_definitions)).await?;
         accumulate_usage(&mut usage, &response.usage);
         if response.tool_calls.is_empty() {
             if response.content.trim().is_empty() {
@@ -619,14 +638,16 @@ pub(crate) async fn run_agent(
                         Some(preview) => {
                             match request_approval(bot, chat_id, approvals, &preview).await? {
                                 ApprovalOutcome::AllowOnce => {
-                                    tools.dispatch(chat_id.0, &call).await
+                                    with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
+                                        .await
                                 }
                                 ApprovalOutcome::AlwaysAllow => {
                                     database
                                         .lock()
                                         .await
                                         .always_allow_tool(chat_id.0, &call.name)?;
-                                    tools.dispatch(chat_id.0, &call).await
+                                    with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
+                                        .await
                                 }
                                 ApprovalOutcome::Deny => {
                                     "User denied this command. Do not run it.".to_owned()
@@ -636,7 +657,7 @@ pub(crate) async fn run_agent(
                         None => "Error: invalid command arguments".to_owned(),
                     }
                 } else {
-                    tools.dispatch(chat_id.0, &call).await
+                    with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call)).await
                 }
             };
             let result_message = ProviderMessage::tool_result(call.id, output);
@@ -1410,8 +1431,10 @@ async fn run_doctor() -> Result<()> {
                         failures += 1;
                     }
                     None => check_ok(&format!(
-                        "MCP server '{}' connected ({} tool(s))",
-                        status.name, status.tool_count
+                        "MCP server '{}' connected ({} tool(s){})",
+                        status.name,
+                        status.tool_count,
+                        status.trust_label()
                     )),
                 }
             }

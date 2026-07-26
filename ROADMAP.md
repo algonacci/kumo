@@ -169,8 +169,7 @@ reminder even by guessing a matching prefix.
 - [x] `/resume <id>` — switch the active session back to a past one
 - [x] `/delete <id>` — delete a saved session
 - [x] Per-chat "Always allow" per tool, cleared on `/new`, distinct from per-server MCP trust
-- [ ] Typing/progress feedback during long tool rounds (Kumo sends one `ChatAction::Typing` and then
-      goes silent until the final answer)
+- [x] Typing/progress feedback during long tool rounds
 
 Kumo already stored every session in SQLite and multiplexed one *active* session per Telegram chat,
 but there was no user-facing way to see or return to a session that `/new` had retired — the rows sat
@@ -207,6 +206,16 @@ bounded escape hatch from repeated prompts, not a way to disable confirmation al
 tool-grained rather than command-grained by design — a scoped list of "these exact commands are
 pre-approved" would need its own matching and escaping logic for little real benefit, since a chat
 that trusts `run_command` at all in a session is very likely to trust it for the whole session.
+
+Telegram clears a typing indicator about five seconds after it arrives, and `handle_message` sent
+exactly one before starting the turn — so every turn that took longer than that (a provider call on
+a slow model, a `run_command`, any Kamui delegation) looked from the chat's side like Kumo had
+simply stopped responding. `with_typing` (`src/main.rs`) wraps a future and re-sends
+`ChatAction::Typing` every four seconds until that future resolves, without a spawned task or a
+`Drop` guard: it just `select!`s the work against a sleep in a loop. It is applied to the provider
+call and to each `tools.dispatch`, and deliberately *not* around `request_approval` or `ask_user` —
+in those Kumo is waiting on the owner, and showing "typing" while the owner is the one being waited
+on would misrepresent who is holding up the turn.
 
 ## Phase 4b: Memory
 
@@ -393,6 +402,17 @@ different process model `kumo run` was never written to implement — the Servic
 start/stop protocol) or a Task Scheduler XML task, and neither was worth the complexity without a
 concrete need; `kumo start` still works fine there, just without the "restarts on boot" part.
 
+Neither generated unit inherits a login shell's environment, which is fine for Kumo itself (an
+absolute `ExecStart` path) but not for the MCP servers it spawns: `uv`, `npx`, and `node` usually
+live in `~/.local/bin` or a version manager's directory, none of which are on the bare `PATH`
+systemd and launchd default to. That produced a failure mode with no obvious cause — an MCP server
+that works under `kumo run` fails with "No such file or directory" under `kumo enable`, and only
+there. Both `enable` paths now capture the `PATH` of the shell that ran `kumo enable` into the unit
+(`Environment=PATH=` for systemd, `EnvironmentVariables` for launchd), which is the same thing the
+user would get by hand and needs no configuration of its own. Generating the unit text is split out
+of `enable` into `systemd_unit`/`launchd_plist` so it can be tested without actually installing a
+service.
+
 Making `kumo status` find a service-managed instance took an extra step: `kumo enable`'s unit
 files launch `kumo run` directly, so no PID file exists the way `kumo start` writes one. The fix is
 `daemon::running_pid()` falling back to scanning every running process for one whose executable
@@ -409,12 +429,22 @@ the long-running gateway.
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
 - [ ] Per-chat workspace selection (today one `workspace: PathBuf` serves the whole process)
-- [ ] Per-tool MCP trust (today trust is all-or-nothing per server)
+- [x] Per-tool MCP trust (`trusted_tools`, alongside the existing all-or-nothing `trusted`)
 - [ ] Structured audit log independent of Telegram message history
 
 Each of these is a real seam already visible in the code (`owner_user_id: u64` is a scalar;
-`ToolsConfig.workspace` is a single path; `McpServerConfig.trusted` gates every tool a server
-advertises) but none of them should be built ahead of an actual need. Kumo is explicitly a *personal*
+`ToolsConfig.workspace` is a single path) but none of them should be built ahead of an actual need.
+
+Per-tool trust is the one that stopped being speculative: a single MCP server can advertise both
+`get_price` and `send_email`, and one `trusted` flag forces a choice between confirming harmless
+reads and skipping confirmation for irreversible sends. `McpServerConfig::trusts` now answers
+per tool — `trusted` still means the whole server, `trusted_tools` names individual tools as the
+server itself advertises them (no server prefix, since that prefix is Kumo's own namespacing).
+Nothing else changed shape: `McpTool.trusted` was already per-tool state, it was just always being
+handed the server-wide flag. `ConnectionStatus` reports the split (`[trusted]` when nothing needs
+approval, `[n trusted]` when only some of it does) so `kumo doctor` can confirm a `trusted_tools`
+list actually matched the names the server advertises — a typo there fails silently otherwise,
+by simply never matching. Kumo is explicitly a *personal*
 gateway — multi-user support only matters if you actually want a second person to reach it, and
 per-chat workspaces only matter once a single Telegram account is used for more than one project.
 Don't build these speculatively; this phase exists so the seams are named, not so they get filled on

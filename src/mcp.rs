@@ -17,8 +17,22 @@ use crate::{config::McpServerConfig, provider::ToolDefinition, tools::ExternalTo
 pub struct ConnectionStatus {
     pub name: String,
     pub tool_count: usize,
-    pub trusted: bool,
+    /// How many of this server's tools skip the approval prompt — all of them when the server
+    /// itself is `trusted`, otherwise however many `trusted_tools` named.
+    pub trusted_count: usize,
     pub error: Option<String>,
+}
+
+impl ConnectionStatus {
+    /// " [trusted]" when nothing this server offers needs approval, " [n trusted]" when only some
+    /// of it does, and nothing at all when every call is gated.
+    pub fn trust_label(&self) -> String {
+        match self.trusted_count {
+            0 => String::new(),
+            count if count == self.tool_count => " [trusted]".to_owned(),
+            count => format!(" [{count} trusted]"),
+        }
+    }
 }
 
 pub struct Connections {
@@ -37,7 +51,10 @@ pub async fn connect_all(
                 statuses.push(ConnectionStatus {
                     name: name.clone(),
                     tool_count: connected.len(),
-                    trusted: server.trusted,
+                    trusted_count: connected
+                        .iter()
+                        .filter(|tool| !tool.requires_confirmation())
+                        .count(),
                     error: None,
                 });
                 tools.append(&mut connected);
@@ -45,7 +62,7 @@ pub async fn connect_all(
             Err(error) => statuses.push(ConnectionStatus {
                 name: name.clone(),
                 tool_count: 0,
-                trusted: server.trusted,
+                trusted_count: 0,
                 error: Some(format!("{error:#}")),
             }),
         }
@@ -75,7 +92,7 @@ async fn connect(name: &str, server: &McpServerConfig) -> Result<Vec<Arc<dyn Ext
                 remote_name: tool.name.to_string(),
                 description: tool.description.as_deref().unwrap_or_default().to_string(),
                 schema: Value::Object(tool.input_schema.as_ref().clone()),
-                trusted: server.trusted,
+                trusted: server.trusts(&tool.name),
                 service: service.clone(),
             }) as Arc<dyn ExternalTool>
         })

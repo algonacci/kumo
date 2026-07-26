@@ -306,12 +306,26 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "C:\\path\\to\\files"]
 command = "uvx"
 args = ["mcp-excel"]
 trusted = true
+
+[mcp.research]
+command = "uv"
+args = ["--directory", "/path/to/server", "run", "python", "server.py"]
+trusted_tools = ["search", "read_pdf"]
 ```
 
 Advertised tools are exposed to the model as `<server>__<tool>`, preventing collisions with built-in
 tools and other servers. MCP servers can execute arbitrary code or external actions, so each call
 requires the same one-time Telegram approval by default. Set `trusted = true` only for a server whose
-tools may run unattended. A server that fails to start is reported in the terminal and skipped.
+tools may run unattended, or list individual tools in `trusted_tools` when only part of a server is
+safe to run unattended — a server offering both `search` and `send_email` shouldn't have to trust
+both to stop confirming the first. Name those tools exactly as the server advertises them, without
+the `<server>__` prefix; `kumo doctor` reports how many matched, so a typo shows up as a lower count
+rather than silently leaving a tool gated. A server that fails to start is reported in the terminal
+and skipped.
+
+Servers are launched as child processes of Kumo, so they inherit its `PATH`. `kumo enable` records
+the `PATH` of the shell that ran it into the systemd unit or launchd agent for that reason — without
+it, a service-managed Kumo would fail to find `uv`, `npx`, or `node` in `~/.local/bin`.
 
 ## Development
 

@@ -15,6 +15,49 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
+/// The `PATH` a service-managed Kumo should run with, captured from the shell running `kumo
+/// enable`. Neither systemd nor launchd inherits a login shell's environment, so their default
+/// `PATH` is a bare `/usr/bin:/bin`-style list — which is enough for Kumo itself but not for the
+/// MCP servers it spawns, since `uv`, `npx`, and `node` typically live in `~/.local/bin` or a
+/// version manager's directory. Without this an MCP server that works under `kumo run` fails with
+/// "No such file or directory" under `kumo enable`, and only in that one case.
+#[cfg(unix)]
+fn service_path() -> Option<String> {
+    std::env::var("PATH").ok().filter(|path| !path.is_empty())
+}
+
+/// A plist is XML, and both a `PATH` entry and a home directory can legally contain `&` or `<`.
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit(exe: &str, path: Option<&str>) -> String {
+    let environment = match path {
+        Some(path) => format!("Environment=PATH={path}\n"),
+        None => String::new(),
+    };
+    format!(
+        "[Unit]\n\
+         Description=Kumo personal agent gateway\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         ExecStart={exe} run\n\
+         {environment}\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
 #[cfg(target_os = "linux")]
 pub fn enable() -> Result<()> {
     let exe = std::env::current_exe().context("could not determine the kumo executable path")?;
@@ -25,21 +68,7 @@ pub fn enable() -> Result<()> {
     std::fs::create_dir_all(unit_dir)
         .with_context(|| format!("failed to create {}", unit_dir.display()))?;
 
-    let unit = format!(
-        "[Unit]\n\
-         Description=Kumo personal agent gateway\n\
-         After=network-online.target\n\
-         Wants=network-online.target\n\
-         \n\
-         [Service]\n\
-         ExecStart={} run\n\
-         Restart=on-failure\n\
-         RestartSec=5\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        exe.display()
-    );
+    let unit = systemd_unit(&exe.to_string_lossy(), service_path().as_deref());
     std::fs::write(&unit_path, unit)
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
 
@@ -108,7 +137,36 @@ pub fn enable() -> Result<()> {
         .with_context(|| format!("failed to create {}", plist_dir.display()))?;
 
     let log_path = crate::storage::data_dir()?.join("kumo.log");
-    let plist = format!(
+    let plist = launchd_plist(
+        &exe.to_string_lossy(),
+        &log_path.to_string_lossy(),
+        service_path().as_deref(),
+    );
+    std::fs::write(&plist_path, plist)
+        .with_context(|| format!("failed to write {}", plist_path.display()))?;
+
+    run_launchctl(&["load", "-w", &plist_path.to_string_lossy()])?;
+
+    println!("Kumo installed as a launchd agent and started.");
+    println!("Plist: {}", plist_path.display());
+    println!("Logs: {}", log_path.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist(exe: &str, log: &str, path: Option<&str>) -> String {
+    let environment = match path {
+        Some(path) => format!(
+            "    <key>EnvironmentVariables</key>\n    \
+             <dict>\n        \
+             <key>PATH</key>\n        \
+             <string>{}</string>\n    \
+             </dict>\n",
+            xml_escape(path)
+        ),
+        None => String::new(),
+    };
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -120,7 +178,7 @@ pub fn enable() -> Result<()> {
         <string>{exe}</string>
         <string>run</string>
     </array>
-    <key>RunAtLoad</key>
+{environment}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <dict>
@@ -134,18 +192,9 @@ pub fn enable() -> Result<()> {
 </dict>
 </plist>
 "#,
-        exe = exe.display(),
-        log = log_path.display(),
-    );
-    std::fs::write(&plist_path, plist)
-        .with_context(|| format!("failed to write {}", plist_path.display()))?;
-
-    run_launchctl(&["load", "-w", &plist_path.to_string_lossy()])?;
-
-    println!("Kumo installed as a launchd agent and started.");
-    println!("Plist: {}", plist_path.display());
-    println!("Logs: {}", log_path.display());
-    Ok(())
+        exe = xml_escape(exe),
+        log = xml_escape(log),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -203,4 +252,62 @@ pub fn enable() -> Result<()> {
 pub fn disable() -> Result<()> {
     println!("Kumo has no Windows auto-start service to disable (see `kumo enable`).");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    use super::launchd_plist;
+    #[cfg(target_os = "linux")]
+    use super::systemd_unit;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plist_carries_the_captured_path() {
+        let plist = launchd_plist(
+            "/usr/local/bin/kumo",
+            "/tmp/kumo.log",
+            Some("/a/bin:/b/bin"),
+        );
+
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("<string>/a/bin:/b/bin</string>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plist_without_a_path_omits_the_environment_block() {
+        let plist = launchd_plist("/usr/local/bin/kumo", "/tmp/kumo.log", None);
+
+        assert!(!plist.contains("EnvironmentVariables"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plist_escapes_xml_in_every_interpolated_path() {
+        let plist = launchd_plist("/opt/a&b/kumo", "/tmp/<log>", Some("/x&y/bin"));
+
+        assert!(plist.contains("<string>/opt/a&amp;b/kumo</string>"));
+        assert!(plist.contains("<string>/tmp/&lt;log&gt;</string>"));
+        assert!(plist.contains("<string>/x&amp;y/bin</string>"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unit_carries_the_captured_path() {
+        let unit = systemd_unit("/usr/local/bin/kumo", Some("/a/bin:/b/bin"));
+
+        assert!(unit.contains("Environment=PATH=/a/bin:/b/bin\n"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/kumo run\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_unit_without_a_path_omits_the_environment_line() {
+        let unit = systemd_unit("/usr/local/bin/kumo", None);
+
+        assert!(!unit.contains("Environment="));
+        assert!(unit.contains("Restart=on-failure\n"));
+    }
 }

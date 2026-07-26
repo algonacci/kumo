@@ -48,8 +48,20 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Skip the Telegram approval prompt for every tool this server advertises.
     #[serde(default)]
     pub trusted: bool,
+    /// Skip the approval prompt for these tools only, named as the server advertises them (no
+    /// server prefix). Lets a server mix read-only tools with tools that send mail or drop rows
+    /// without having to trust all of them at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_tools: Vec<String>,
+}
+
+impl McpServerConfig {
+    pub fn trusts(&self, tool: &str) -> bool {
+        self.trusted || self.trusted_tools.iter().any(|name| name == tool)
+    }
 }
 
 impl Config {
@@ -143,6 +155,7 @@ mod tests {
                     command: "server".into(),
                     args: vec!["--stdio".into()],
                     trusted: true,
+                    trusted_tools: Vec::new(),
                 },
             )]),
         };
@@ -160,6 +173,32 @@ mod tests {
         );
         assert!(decoded.mcp["files"].trusted);
         assert_eq!(decoded.timezone.as_deref(), Some("Asia/Jakarta"));
+    }
+
+    #[test]
+    fn trusts_named_tools_without_trusting_the_whole_server() {
+        let decoded: Config = toml::from_str(
+            "[telegram]\nbot_token = \"123:secret\"\nbot_username = \"bot\"\nowner_user_id = 42\n\
+             \n[mcp.tools]\ncommand = \"server\"\ntrusted_tools = [\"get_price\"]",
+        )
+        .unwrap();
+
+        let server = &decoded.mcp["tools"];
+        assert!(!server.trusted);
+        assert!(server.trusts("get_price"));
+        assert!(!server.trusts("send_email"));
+    }
+
+    #[test]
+    fn a_trusted_server_trusts_every_tool() {
+        let server = McpServerConfig {
+            command: "server".into(),
+            args: Vec::new(),
+            trusted: true,
+            trusted_tools: Vec::new(),
+        };
+
+        assert!(server.trusts("send_email"));
     }
 
     #[test]
