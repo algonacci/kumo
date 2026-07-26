@@ -376,6 +376,8 @@ the `PATH` of the shell that ran it into the systemd unit or launchd agent for t
 it, a service-managed Kumo would fail to find `uv`, `npx`, or `node` in `~/.local/bin`.
 MCP image content is delivered to the Telegram chat as a photo; only accompanying text is stored in
 conversation history, so base64 image data does not consume the model context.
+The agent is instructed to prefer specialized MCP capabilities over Kamui, shell commands, or ad hoc
+scripts; Kamui remains reserved for actual codebase changes.
 
 ## Development
 
