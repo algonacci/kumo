@@ -425,6 +425,38 @@ regardless — every other `kumo` subcommand finishes in well under a second, so
 `kumo`-executable process still alive at the moment of the scan is, for all practical purposes,
 the long-running gateway.
 
+## Phase 4g: Model Listing and Context Budget
+
+- [x] `/models refresh` — re-read the provider's model listing at runtime, not only at onboarding
+- [x] Context windows recorded per model from the provider's listing, so `/model` switches the
+      compaction budget along with the model
+- [x] `/context` / `/context <tokens>` for providers whose listing reports no window
+
+`provider::list_models` existed but was only ever called from onboarding, so the model list Kumo
+knew was frozen at whatever the provider offered on setup day. That is not a cosmetic staleness:
+`switch_model` validates `/model <id>` against that cached list, so a model added afterwards is
+unreachable, and a list that has drifted far enough can reject the model the gateway is currently
+running on. `/models refresh` re-reads the listing and saves it; the active selection is
+deliberately left alone when the provider no longer offers it (reported instead of silently
+swapped) because choosing a replacement is the owner's decision, not a fallback Kumo should make
+mid-conversation.
+
+The listing turned out to carry something Kumo was otherwise guessing at. `ProviderConfig
+.context_window` — the number compaction budgets against — was written as `None` by onboarding and
+never set by anything else, so every install compacted at the conservative 48 KiB default no matter
+how large the model's window actually was, quietly summarizing away history a 128k-token model
+could still have held. Groq reports a window as `context_window`, OpenRouter as `context_length`,
+and the OpenAI API itself reports neither, so `ModelInfo.context_window` reads both spellings and
+stays `Option`. Windows are stored per model id (`context_windows`) rather than as one number,
+because the alternative is a `/model` switch silently keeping the previous model's budget; the
+original scalar is kept as the fallback for any model the provider says nothing about, which also
+means a hand-written `context_window` in an existing `kumo.toml` keeps working unchanged.
+
+Auto-detection only helps where the provider actually reports the field, and plenty do not — so
+`/context <tokens>` sets the number directly, clearing any provider-reported window for the active
+model so the typed value is the one that wins. It refuses anything under 4000 tokens, which would
+leave no room for a conversation after the system prompt and tool schemas.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)

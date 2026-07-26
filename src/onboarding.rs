@@ -199,21 +199,33 @@ async fn setup_provider() -> Result<ProviderConfig> {
 
         println!("Checking available models...");
         match provider::list_models(&base_url, &api_key).await {
-            Ok(models) => {
+            Ok(listing) => {
+                let names: Vec<&str> = listing.iter().map(|model| model.id.as_str()).collect();
                 let selected = FuzzySelect::with_theme(&theme)
                     .with_prompt("Choose the default model (type to search)")
-                    .items(&models)
+                    .items(&names)
                     .default(0)
                     .interact()?;
-                let active_model = models[selected].clone();
-                println!("Connected. Found {} models.", models.len());
-                return Ok(ProviderConfig {
+                let active_model = listing[selected].id.clone();
+                println!("Connected. Found {} models.", listing.len());
+
+                let mut provider = ProviderConfig {
                     base_url,
                     api_key,
                     active_model,
-                    models,
+                    models: Vec::new(),
                     context_window: None,
-                });
+                    context_windows: Default::default(),
+                };
+                provider.apply_model_listing(listing);
+                match provider.active_context_window() {
+                    Some(window) => println!("Context window: {window} tokens."),
+                    None => println!(
+                        "This provider does not report a context window; Kumo will use its \
+                         conservative default until one is set in kumo.toml."
+                    ),
+                }
+                return Ok(provider);
             }
             Err(error) => {
                 eprintln!("Could not load models: {error:#}");

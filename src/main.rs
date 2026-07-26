@@ -395,6 +395,13 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if text == "/models refresh" {
+        bot.send_chat_action(message.chat.id, ChatAction::Typing)
+            .await?;
+        let response = refresh_models(&state).await;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if text == "/model" {
         let active_model = state.read().await.provider.active_model().to_owned();
         bot.send_message(
@@ -406,6 +413,16 @@ async fn handle_message(
     }
     if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
         let response = switch_model(&state, model).await;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/context" {
+        let response = context_window_message(&state.read().await.config);
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(tokens) = text.strip_prefix("/context ").map(str::trim) {
+        let response = set_context_window(&state, tokens).await;
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
@@ -679,7 +696,7 @@ pub(crate) async fn prepare_history(
         let state = state.read().await;
         (
             state.provider.clone(),
-            state.config.provider()?.context_window,
+            state.config.provider()?.active_context_window(),
         )
     };
     if compaction::total_bytes(&history.messages) <= compaction::threshold(context_window) {
@@ -729,7 +746,7 @@ async fn status_message(
         .display()
         .to_string();
     let model = state.provider.active_model().to_owned();
-    let context_window = state.config.provider()?.context_window;
+    let context_window = state.config.provider()?.active_context_window();
     let mcp = if state.mcp_statuses.is_empty() {
         "none".to_owned()
     } else {
@@ -1218,14 +1235,130 @@ fn models_message(config: &Config) -> String {
         .expect("provider is configured before gateway startup");
     let mut message = format!("Available models (current: {}):\n", provider.active_model);
     for model in &provider.models {
-        let line = format!("\n{model}");
+        let line = match provider.context_windows.get(model) {
+            Some(window) => format!("\n{model} ({window} tokens)"),
+            None => format!("\n{model}"),
+        };
         if message.len() + line.len() > 3800 {
             message.push_str("\n\nList truncated.");
             break;
         }
         message.push_str(&line);
     }
-    message.push_str("\n\nSwitch with /model <id>.");
+    message.push_str("\n\nSwitch with /model <id>, or re-read the list with /models refresh.");
+    message
+}
+
+/// Not every OpenAI-compatible provider reports a context window in its model listing, and Kumo's
+/// fallback (48 KiB of history) is deliberately conservative — small enough to be safe against an
+/// unknown model, small enough to compact away history a large model could still hold. `/context`
+/// is the way to tell Kumo the real number when the provider will not.
+fn context_window_message(config: &Config) -> String {
+    let provider = config
+        .provider
+        .as_ref()
+        .expect("provider is configured before gateway startup");
+    match provider.active_context_window() {
+        Some(window) => {
+            let source = if provider
+                .context_windows
+                .contains_key(&provider.active_model)
+            {
+                "reported by the provider"
+            } else {
+                "set with /context"
+            };
+            format!(
+                "Context window for {}: {window} tokens ({source}).\n\nHistory is compacted once \
+                 it passes about half of that. Change it with /context <tokens>.",
+                provider.active_model
+            )
+        }
+        None => format!(
+            "This provider reports no context window for {}, so Kumo compacts history using its \
+             conservative default.\n\nSet the real one with /context <tokens>.",
+            provider.active_model
+        ),
+    }
+}
+
+async fn set_context_window(state: &RwLock<AppState>, tokens: &str) -> String {
+    let Ok(window) = tokens.replace([',', '_'], "").parse::<u64>() else {
+        return format!(
+            "Not a number of tokens: {tokens}\n\nUse /context <tokens>, e.g. /context 128000."
+        );
+    };
+    if window < 4_000 {
+        return "A context window under 4000 tokens would leave no room for a conversation."
+            .to_owned();
+    }
+
+    let mut state = state.write().await;
+    let Some(provider_config) = state.config.provider.as_mut() else {
+        return "Model provider is not configured.".to_owned();
+    };
+    provider_config.context_window = Some(window);
+    // A provider-reported window for this model would otherwise keep winning over the number the
+    // owner just typed.
+    let model = provider_config.active_model.clone();
+    provider_config.context_windows.remove(&model);
+
+    match state.config.save() {
+        Ok(_) => format!("Context window set to {window} tokens."),
+        Err(error) => {
+            eprintln!("Could not save the context window: {error:#}");
+            "Context window changed for this run, but Kumo could not save it.".to_owned()
+        }
+    }
+}
+
+/// Re-reads the provider's model listing into the config. Kumo otherwise caches whatever
+/// onboarding saw, so a model added or withdrawn since then is invisible to `/models` and rejected
+/// by `/model <id>` — including, if the listing has drifted, the model currently in use.
+async fn refresh_models(state: &RwLock<AppState>) -> String {
+    let (base_url, api_key) = {
+        let state = state.read().await;
+        let Some(provider) = state.config.provider.as_ref() else {
+            return "Model provider is not configured.".to_owned();
+        };
+        (provider.base_url.clone(), provider.api_key.clone())
+    };
+
+    // Deliberately outside the lock: this is a network round trip, and holding the write lock
+    // across it would stall every message and scheduled task until the provider answers.
+    let listing = match provider::list_models(&base_url, &api_key).await {
+        Ok(listing) => listing,
+        Err(error) => return format!("Could not reach the provider: {error:#}"),
+    };
+    let count = listing.len();
+
+    let mut state = state.write().await;
+    let Some(provider_config) = state.config.provider.as_mut() else {
+        return "Model provider is not configured.".to_owned();
+    };
+    let active_available = provider_config.apply_model_listing(listing);
+    let active_model = provider_config.active_model.clone();
+    let context_window = provider_config.active_context_window();
+
+    let mut message = format!("Refreshed: {count} model(s) available.");
+    if !active_available {
+        message.push_str(&format!(
+            "\n\nThe active model ({active_model}) is no longer offered by this provider. \
+             Switch with /model <id>."
+        ));
+    }
+    match context_window {
+        Some(window) => {
+            message.push_str(&format!("\n\nContext window: {window} tokens ({active_model})."))
+        }
+        None => message.push_str(
+            "\n\nThis provider reports no context window, so compaction keeps using Kumo's default.",
+        ),
+    }
+    if let Err(error) = state.config.save() {
+        eprintln!("Could not save the refreshed model list: {error:#}");
+        message.push_str("\n\nThe list is updated for this run, but Kumo could not save it.");
+    }
     message
 }
 
@@ -1239,7 +1372,10 @@ async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
         .iter()
         .any(|available| available == model)
     {
-        return format!("Unknown model: {model}\n\nUse /models to see available models.");
+        return format!(
+            "Unknown model: {model}\n\nUse /models to see available models, or /models refresh \
+             if the list is out of date."
+        );
     }
 
     provider_config.active_model = model.to_owned();

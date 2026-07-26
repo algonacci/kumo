@@ -228,7 +228,15 @@ impl Provider {
     }
 }
 
-pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+/// One entry of a provider's model listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// The model's context window in tokens, when the provider reports one.
+    pub context_window: Option<u64>,
+}
+
+pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>> {
     let response = authorized(Client::new().get(endpoint(base_url, "models")), api_key)
         .send()
         .await
@@ -244,18 +252,26 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
         .json()
         .await
         .context("provider returned an invalid models response")?;
-    let mut models = response
-        .data
-        .into_iter()
-        .map(|model| model.id)
-        .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
+    let models = model_listing(response);
 
     if models.is_empty() {
         bail!("provider returned no models");
     }
     Ok(models)
+}
+
+fn model_listing(response: ModelsResponse) -> Vec<ModelInfo> {
+    let mut models = response
+        .data
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.id,
+            context_window: model.context_window.or(model.context_length),
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    models
 }
 
 fn endpoint(base_url: &str, path: &str) -> String {
@@ -447,6 +463,13 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct Model {
     id: String,
+    /// Groq reports a model's window under this name, OpenRouter under `context_length`, and the
+    /// OpenAI API itself reports neither — so both are optional and a provider that names it
+    /// something else simply leaves Kumo on its conservative default.
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    context_length: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -462,6 +485,38 @@ struct ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_context_window_under_either_provider_spelling() {
+        let response: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "groq-style", "context_window": 131072},
+                {"id": "openrouter-style", "context_length": 200000},
+                {"id": "openai-style"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let listing = model_listing(response);
+
+        assert_eq!(
+            listing,
+            vec![
+                ModelInfo {
+                    id: "groq-style".into(),
+                    context_window: Some(131_072)
+                },
+                ModelInfo {
+                    id: "openai-style".into(),
+                    context_window: None
+                },
+                ModelInfo {
+                    id: "openrouter-style".into(),
+                    context_window: Some(200_000)
+                },
+            ]
+        );
+    }
 
     #[test]
     fn joins_provider_endpoints() {

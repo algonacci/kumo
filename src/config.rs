@@ -34,8 +34,37 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub active_model: String,
     pub models: Vec<String>,
+    /// A hand-set window, and the fallback for any model the provider does not report one for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Context windows as the provider reported them, keyed by model id. Kept per model rather
+    /// than as one number so switching models with `/model` does not silently keep the previous
+    /// model's compaction budget.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_windows: BTreeMap<String, u64>,
+}
+
+impl ProviderConfig {
+    /// The window compaction should budget against: what the provider reported for the model in
+    /// use, or the hand-set `context_window` when it reported nothing.
+    pub fn active_context_window(&self) -> Option<u64> {
+        self.context_windows
+            .get(&self.active_model)
+            .copied()
+            .or(self.context_window)
+    }
+
+    /// Replaces the cached listing with what the provider currently advertises. The active model
+    /// is left selected either way — a model that has disappeared upstream is reported rather than
+    /// silently swapped, since picking a replacement is the owner's call.
+    pub fn apply_model_listing(&mut self, listing: Vec<crate::provider::ModelInfo>) -> bool {
+        self.context_windows = listing
+            .iter()
+            .filter_map(|model| Some((model.id.clone(), model.context_window?)))
+            .collect();
+        self.models = listing.into_iter().map(|model| model.id).collect();
+        self.models.contains(&self.active_model)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -144,6 +173,7 @@ mod tests {
                 active_model: "model-a".into(),
                 models: vec!["model-a".into(), "model-b".into()],
                 context_window: Some(128_000),
+                context_windows: BTreeMap::from([("model-a".into(), 200_000)]),
             }),
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
@@ -173,6 +203,79 @@ mod tests {
         );
         assert!(decoded.mcp["files"].trusted);
         assert_eq!(decoded.timezone.as_deref(), Some("Asia/Jakarta"));
+    }
+
+    fn provider(active: &str, windows: BTreeMap<String, u64>) -> ProviderConfig {
+        ProviderConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: "secret".into(),
+            active_model: active.into(),
+            models: windows.keys().cloned().collect(),
+            context_window: None,
+            context_windows: windows,
+        }
+    }
+
+    #[test]
+    fn the_active_window_follows_the_active_model() {
+        let config = provider(
+            "small",
+            BTreeMap::from([("small".into(), 8_000), ("large".into(), 200_000)]),
+        );
+
+        assert_eq!(config.active_context_window(), Some(8_000));
+
+        let switched = provider(
+            "large",
+            BTreeMap::from([("small".into(), 8_000), ("large".into(), 200_000)]),
+        );
+
+        assert_eq!(switched.active_context_window(), Some(200_000));
+    }
+
+    #[test]
+    fn a_hand_set_window_covers_a_model_the_provider_says_nothing_about() {
+        let mut config = provider("unreported", BTreeMap::new());
+        config.context_window = Some(32_000);
+
+        assert_eq!(config.active_context_window(), Some(32_000));
+    }
+
+    #[test]
+    fn a_refreshed_listing_replaces_the_cached_models_and_windows() {
+        let mut config = provider("model-a", BTreeMap::from([("model-a".into(), 8_000)]));
+
+        let still_available = config.apply_model_listing(vec![
+            crate::provider::ModelInfo {
+                id: "model-a".into(),
+                context_window: Some(128_000),
+            },
+            crate::provider::ModelInfo {
+                id: "model-c".into(),
+                context_window: None,
+            },
+        ]);
+
+        assert!(still_available);
+        assert_eq!(config.models, vec!["model-a", "model-c"]);
+        assert_eq!(config.active_context_window(), Some(128_000));
+        // A model the provider reports no window for must not inherit a stale one.
+        assert!(!config.context_windows.contains_key("model-c"));
+    }
+
+    #[test]
+    fn a_refresh_reports_an_active_model_the_provider_dropped() {
+        let mut config = provider("retired", BTreeMap::from([("retired".into(), 8_000)]));
+
+        let still_available = config.apply_model_listing(vec![crate::provider::ModelInfo {
+            id: "model-a".into(),
+            context_window: Some(128_000),
+        }]);
+
+        assert!(!still_available);
+        // The selection is left alone: replacing it is the owner's call, not a silent swap.
+        assert_eq!(config.active_model, "retired");
+        assert_eq!(config.active_context_window(), None);
     }
 
     #[test]

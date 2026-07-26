@@ -163,8 +163,12 @@ status if anything failed, so it's usable as a pre-flight check in a script.
 - `/memory` lists every fact Kumo currently remembers about you (see Memory below).
 - `/forget <text>` or `/forget all` removes one or all remembered facts.
 - `/model` shows the active model.
-- `/models` lists models discovered during onboarding.
+- `/models` lists the cached model list, with each model's context window where the provider
+  reports one.
+- `/models refresh` re-reads the list from the provider and saves it.
 - `/model <id>` switches the active model and saves the choice.
+- `/context` shows the context window Kumo budgets history against; `/context <tokens>` sets it for
+  providers that do not report one.
 
 Session IDs are scoped to the Telegram chat they belong to, so `/resume` and `/delete` can only act
 on a session that chat itself created — a prefix that happens to match another chat's session ID
@@ -193,8 +197,13 @@ migrations; Kumo refuses to open databases created by a newer unsupported versio
 
 Long sessions are compacted automatically. Kumo folds older messages into a persisted rolling
 summary while keeping the six most recent messages verbatim; full history remains in SQLite. The
-default compaction threshold is 48 KiB of recent message content. Set the provider's context window
-to compact at roughly half of its capacity:
+default compaction threshold is 48 KiB of recent message content, used when no context window is
+known; otherwise Kumo compacts at roughly half the window's capacity.
+
+Onboarding and `/models refresh` record whatever windows the provider reports in its model listing
+(Groq names the field `context_window`, OpenRouter `context_length`), per model, so switching models
+switches the budget with it. A provider that reports neither leaves Kumo on its default until you
+set the number yourself with `/context <tokens>` or by hand:
 
 ```toml
 [provider]
