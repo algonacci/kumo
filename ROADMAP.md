@@ -7,13 +7,20 @@ auditable core over feature breadth — every capability should earn its place b
 need, not by matching what a bigger gateway (OpenClaw, Hermes) happens to ship.
 
 Status: Kumo is a working single-user gateway. Onboarding pairs a Telegram bot to one owner without
-a manual ID lookup or a `.env` file, an agent loop answers messages with `read_file`, `list_directory`,
-approval-gated `run_command`, approval-gated `delegate_to_kamui` for file edits, and `schedule_task`
-for one-shot or recurring future prompts (listed and cancelled with `/reminders`), MCP servers can
-contribute more tools over stdio, and long conversations compact into a rolling summary. A chat can
-tap "Always allow" on an approval prompt to skip further prompts for that tool until `/new`. Every
-turn is persisted to SQLite. What is missing relative to that description is deliberate: no support
-for more than one Telegram user, more than one workspace, or more than one model provider connection.
+a manual ID lookup or a `.env` file, an agent loop answers messages with `read_file`,
+`list_directory`, approval-gated `run_command`, approval-gated `delegate_to_kamui` for file edits,
+`ask_user` for mid-turn clarification, `remember`/`update_memory`/`forget` for facts that outlive a
+session, and `schedule_task` for one-shot or recurring future prompts (listed and cancelled with
+`/reminders`). Photos are attached to the request as images. MCP servers contribute more tools over
+stdio, trusted per server or per tool. Several providers can be configured and switched between at
+runtime, each with its own model list and context budget. Long conversations compact into a rolling
+summary, budgeted against the whole request rather than message text alone. A chat can tap "Always
+allow" on an approval prompt to skip further prompts for that tool until `/new`. Every turn is
+persisted to SQLite, and `kumo start`/`enable` run it in the background or as a user service.
+
+What is missing relative to that description is deliberate: one Telegram owner, one workspace, no
+streaming, and no code editing of its own. What is missing *by omission* rather than by choice is
+tracked in Phase 6 — chiefly that nothing in the agent loop can be tested without a live provider.
 
 ## Phase 1: Gateway Foundation
 
@@ -482,15 +489,51 @@ Auto-detection only helps where the provider actually reports the field, and ple
 model so the typed value is the one that wins. It refuses anything under 4000 tokens, which would
 leave no room for a conversation after the system prompt and tool schemas.
 
+## Phase 4h: Compaction Accounting
+
+- [x] Count the whole request — tool schemas, system prompt, memory, summary, images — not
+      just message text
+
+Compaction compared *message* bytes against a budget derived from the context window, but a
+request is not only its messages. The system prompt, the memory snapshot, the rolling summary, and
+every tool schema ride along on every turn, and none of them were counted; neither were images,
+which live in a separate field from message content, so a 5 MiB photo counted as zero. With a few
+MCP servers connected the uncounted part can exceed the counted one — a single server here
+advertises 61 tools, about 31 KB of schema per request — so the number being compared to the
+threshold was not the size of anything real.
+
+`message_budget(context_window, overhead)` now subtracts that overhead first, and `total_bytes`
+counts image payloads. The overhead is measured once at startup (`AppState.tool_schema_bytes`),
+since MCP servers connect once and the memory snapshot is already frozen for the life of the
+process; only the summary length varies per turn. This makes compaction fire *earlier* than before
+on a tool-heavy install, which is the correct direction — it was previously overrunning its budget
+by whatever the schemas cost — but it also makes an unset context window more expensive than it
+used to be, which is what `/context` is for. A floor of 8 KiB keeps history from being squeezed to
+nothing by overhead alone, since summarizing messages cannot shrink a tool schema and a request
+that is over budget because of its tools will stay over budget however much history is folded away.
+
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
 - [ ] Per-chat workspace selection (today one `workspace: PathBuf` serves the whole process)
 - [x] Per-tool MCP trust (`trusted_tools`, alongside the existing all-or-nothing `trusted`)
-- [ ] Structured audit log independent of Telegram message history
+- [ ] A tool record that outlives the session it belongs to (narrowed from "structured audit log")
 
 Each of these is a real seam already visible in the code (`owner_user_id: u64` is a scalar;
 `ToolsConfig.workspace` is a single path) but none of them should be built ahead of an actual need.
+Kumo is explicitly a *personal* gateway — multi-user support only matters if you actually want a
+second person to reach it, and per-chat workspaces only matter once a single Telegram account is
+used for more than one project. Don't build these speculatively; this phase exists so the seams are
+named, not so they get filled on a schedule.
+
+The audit log item was narrowed after looking at how Kamui answers the same question: it lists
+"tool audit trail" as *done*, satisfied entirely by persisting each tool request and result as part
+of the turn. Kumo's `save_turn` already does exactly that, so most of what a separate audit
+subsystem would record is recorded. The one thing that is genuinely missing is durability against
+the user's own commands: `/delete` drops a session and, by `ON DELETE CASCADE`, every tool call it
+contained. So the open item is not "build an audit log" but "keep the tool record when the
+conversation it belonged to is deleted" — a much smaller question, and one worth answering only if
+losing that history ever actually matters.
 
 Per-tool trust is the one that stopped being speculative: a single MCP server can advertise both
 `get_price` and `send_email`, and one `trusted` flag forces a choice between confirming harmless
@@ -500,12 +543,66 @@ server itself advertises them (no server prefix, since that prefix is Kumo's own
 Nothing else changed shape: `McpTool.trusted` was already per-tool state, it was just always being
 handed the server-wide flag. `ConnectionStatus` reports the split (`[trusted]` when nothing needs
 approval, `[n trusted]` when only some of it does) so `kumo doctor` can confirm a `trusted_tools`
-list actually matched the names the server advertises — a typo there fails silently otherwise,
-by simply never matching. Kumo is explicitly a *personal*
-gateway — multi-user support only matters if you actually want a second person to reach it, and
-per-chat workspaces only matter once a single Telegram account is used for more than one project.
-Don't build these speculatively; this phase exists so the seams are named, not so they get filled on
-a schedule.
+list actually matched the names the server advertises — a typo there fails silently otherwise, by
+simply never matching.
+
+## Phase 6: Borrowed from Kamui
+
+- [ ] `Provider` trait, splitting the OpenAI wire mapping from the agent loop
+- [ ] User-defined commands: markdown prompt templates invoked as `/<name>` from Telegram
+- [ ] A read-only sub-agent that absorbs a multi-step task and returns only its answer
+- [ ] Background commands: start now, report later, instead of one 30-second window
+
+These come from reading Kamui's source directly rather than from a feature list. Kamui is the
+larger project (roughly 20k lines to Kumo's 8k) and solves several problems Kumo has since grown
+into; what follows is what survived asking "does this fit a Telegram gateway, or only a terminal?"
+Ideas that did not survive are recorded at the end, so they do not get re-proposed.
+
+**`Provider` trait** (`src/provider/mod.rs` in Kamui). Kamui defines `trait Provider: Send + Sync`
+with the OpenAI adapter behind it in `provider/openai.rs`; Kumo's `Provider` is a concrete struct
+that reaches for reqwest directly. This is not an abstraction for its own sake — it has already
+cost Kumo twice. The round-limit degradation in Phase 2 could only be tested at the seam
+(`finish_turn`), not through `run_agent`, because nothing in the agent loop can run without a live
+provider; and this same missing seam is the reason a native Anthropic or Gemini backend was filed
+as impractical. Both message types are already identical across the two projects (`Message`,
+`ToolCall`, `ImageAttachment` were copied from Kamui when image input landed), so the shape is
+known to fit.
+
+**User-defined commands** (`src/commands.rs` in Kamui, ~330 lines with tests). Markdown files with
+optional frontmatter, loaded from a global and a project directory, invoked as `/<name>` and
+expanded into a full prompt. This fits Kumo *better* than it fits Kamui, for a reason specific to
+the interface: typing a long, carefully worded prompt is unpleasant on a phone keyboard, which is
+exactly where Kumo is used. `/standup` expanding into a paragraph of instructions is a bigger win
+in Telegram than at a terminal where the prompt can be pasted or edited in place. The loader itself
+is self-contained; what changes is only where the invocation comes from.
+
+**A read-only sub-agent** (`spawn_agent` in Kamui). Kamui hands a self-contained task to a
+sub-agent with a fresh system prompt and no shared history, and returns only its final answer, so
+the sub-agent's own tool calls never enter the parent's context. Its tools are restricted to the
+read-only set specifically so that no approval flow has to be reproduced inside it. Kumo has a
+sharper reason to want this than Kamui does: after Phase 4h, tool schemas and history compete for
+one budget, and a single MCP server here contributes 61 tools. A research task that burns six
+rounds of tool calls currently spends all of that in the conversation Kumo is trying to keep small;
+routed through a sub-agent it costs one paragraph. The restriction to read-only tools carries over
+unchanged — Kumo's approval prompts are per chat, and a sub-agent that could trigger them would
+raise exactly the interleaving question Kamui deferred.
+
+**Background commands** (`run_command(background: true)`, `command_status`, `stop_command`,
+`/jobs` in Kamui). Kumo's `run_command` is bounded by a 30-second timeout, so a build or a test
+suite is simply not runnable. In a terminal, a background job is a convenience — the user is
+sitting there and could watch it. Through Telegram it is closer to a requirement: the user is by
+definition not at the machine, and "start it, tell me when it is done" is the natural shape. Kumo
+also already has the delivery half built, since the scheduler can send a chat a message on its own
+without an inbound prompt.
+
+Not taken: **Kamui Dispatch**, a planned relay backend plus phone app so a phone can trigger Kamui
+on a host machine. Kamui's own roadmap describes it as three pieces of software that are
+deliberately not part of the Kamui binary — a phone client, a relay, and a host-side agent that
+invokes `kamui -p`. That is a description of what Kumo already is. Also not taken: RTK (already
+filed in Phase 2 on its own merits), semantic code search and `@file`/`@diff` context (Kamui is
+repository-aware by design; Kumo inspects one workspace read-only and delegates code work), and
+Kamui's `patch_file` (Phase 2 settled that editing belongs to Kamui, not to a second implementation
+inside Kumo).
 
 ## Later: Providers and Platforms
 
@@ -513,9 +610,9 @@ a schedule.
 - [ ] Streaming responses (Kumo buffers the full completion before replying; Telegram message
       editing would be required to show partial output, and polling-based Telegram bots gain less
       from this than a terminal does)
-- [ ] Native Anthropic / Gemini provider (not planned — no trait boundary exists for a second
-      backend today, and OpenAI-compatible base URLs already cover OpenRouter, Ollama, LM Studio,
-      Groq, DeepSeek, LiteLLM)
+- [ ] Native Anthropic / Gemini provider (still not planned — OpenAI-compatible base URLs already
+      cover OpenRouter, Ollama, LM Studio, Groq, DeepSeek, LiteLLM; the `Provider` trait in Phase 6
+      would remove the structural objection, but not the "no concrete need" one)
 
 This stopped being speculative the moment a provider was actually swapped: `kumo onboard`
 overwrote the single `[provider]` block, so trying a second provider cost the first one entirely —
@@ -535,26 +632,6 @@ merged, the same precedence Kamui gives its profiles. `Config::provider`/`provid
 whichever entry is active, so `/model`, `/models refresh`, and `/context` write to the right one
 without knowing profiles exist at all; `active_provider` naming something that no longer exists
 falls back to the first entry instead of leaving the gateway with no provider.
-
-## Compaction accounting
-
-Compaction compared *message* bytes against a budget derived from the context window, but a
-request is not only its messages. The system prompt, the memory snapshot, the rolling summary, and
-every tool schema ride along on every turn, and none of them were counted; neither were images,
-which live in a separate field from message content, so a 5 MiB photo counted as zero. With a few
-MCP servers connected the uncounted part can exceed the counted one — a single server here
-advertises 61 tools, about 31 KB of schema per request — so the number being compared to the
-threshold was not the size of anything real.
-
-`message_budget(context_window, overhead)` now subtracts that overhead first, and `total_bytes`
-counts image payloads. The overhead is measured once at startup (`AppState.tool_schema_bytes`),
-since MCP servers connect once and the memory snapshot is already frozen for the life of the
-process; only the summary length varies per turn. This makes compaction fire *earlier* than before
-on a tool-heavy install, which is the correct direction — it was previously overrunning its budget
-by whatever the schemas cost — but it also makes an unset context window more expensive than it
-used to be, which is what `/context` is for. A floor of 8 KiB keeps history from being squeezed to
-nothing by overhead alone, since summarizing messages cannot shrink a tool schema and a request
-that is over budget because of its tools will stay over budget however much history is folded away.
 
 ## Not Planned
 
