@@ -48,6 +48,9 @@ pub(crate) struct AgentTurn {
 }
 
 const MAX_TOOL_ROUNDS: usize = 8;
+/// Stored in place of the provider's own finish reason when Kumo's round cap, not the model, ended
+/// the turn.
+const TOOL_ROUND_LIMIT_FINISH_REASON: &str = "tool_round_limit";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Telegram clears a typing indicator on its own after roughly five seconds, so anything longer
 /// has to keep saying so.
@@ -617,18 +620,14 @@ pub(crate) async fn run_agent(
             if response.content.trim().is_empty() {
                 bail!("provider returned an empty response");
             }
-            let assistant = ProviderMessage::assistant(response.content.clone());
-            let mut record = Vec::with_capacity(trail.len() + 2);
-            record.push(user_message);
-            record.append(&mut trail);
-            record.push(assistant);
-            return Ok(AgentTurn {
-                answer: response.content,
-                record,
+            return Ok(finish_turn(
+                user_message,
+                trail,
+                response.content,
                 usage,
-                finish_reason: response.finish_reason,
+                response.finish_reason,
                 model,
-            });
+            ));
         }
 
         println!(
@@ -683,7 +682,50 @@ pub(crate) async fn run_agent(
         }
     }
 
-    bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit")
+    // The round cap is spent and the model is still asking for tools. Failing here would throw the
+    // entire turn away — including commands the owner already approved and the results they
+    // produced — and report it as a provider failure, which it is not. Ask once more with no tools
+    // offered instead, so the model has to answer from what it already gathered.
+    println!("Reached the {MAX_TOOL_ROUNDS}-round tool limit; asking for a final answer.");
+    let response = with_typing(bot, chat_id, provider.chat(&messages, &[])).await?;
+    accumulate_usage(&mut usage, &response.usage);
+    if response.content.trim().is_empty() {
+        bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit without answering");
+    }
+
+    Ok(finish_turn(
+        user_message,
+        trail,
+        response.content,
+        usage,
+        // Recorded rather than the provider's own reason, so a turn cut short by Kumo's cap is
+        // distinguishable in storage from one the model chose to end.
+        TOOL_ROUND_LIMIT_FINISH_REASON.to_owned(),
+        model,
+    ))
+}
+
+/// Assembles the turn as it will be persisted: the user's message, everything the tool rounds
+/// produced, then the answer.
+fn finish_turn(
+    user_message: ProviderMessage,
+    mut trail: Vec<ProviderMessage>,
+    answer: String,
+    usage: Usage,
+    finish_reason: String,
+    model: String,
+) -> AgentTurn {
+    let mut record = Vec::with_capacity(trail.len() + 2);
+    record.push(user_message);
+    record.append(&mut trail);
+    record.push(ProviderMessage::assistant(answer.clone()));
+    AgentTurn {
+        answer,
+        record,
+        usage,
+        finish_reason,
+        model,
+    }
 }
 
 pub(crate) async fn prepare_history(
@@ -886,12 +928,21 @@ async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<St
         let count = database.clear_memory()?;
         return Ok(format!("Forgot all {count} remembered fact(s)."));
     }
-    if database.forget(argument)? {
-        Ok(format!("Forgot the fact matching \"{argument}\"."))
-    } else {
-        Ok(format!(
-            "No remembered fact matches \"{argument}\", or the text matches more than one. Use /memory to see exact wording."
-        ))
+    match database.forget(argument)? {
+        storage::MemoryMatch::One(_) => Ok(format!("Forgot the fact matching \"{argument}\".")),
+        storage::MemoryMatch::None => Ok(format!(
+            "No remembered fact contains \"{argument}\". Use /memory to see exact wording."
+        )),
+        storage::MemoryMatch::Ambiguous(entries) => {
+            let mut message = format!(
+                "\"{argument}\" matches {} remembered facts. Use text unique to one of them:",
+                entries.len()
+            );
+            for entry in &entries {
+                message.push_str(&format!("\n- {entry}"));
+            }
+            Ok(message)
+        }
     }
 }
 
@@ -1639,6 +1690,29 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_turn_records_the_prompt_then_the_tool_trail_then_the_answer() {
+        let turn = finish_turn(
+            ProviderMessage::user("what is in the log?".to_owned()),
+            vec![ProviderMessage::tool_result(
+                "call-1".to_owned(),
+                "42 errors".to_owned(),
+            )],
+            "There are 42 errors.".to_owned(),
+            Usage::default(),
+            TOOL_ROUND_LIMIT_FINISH_REASON.to_owned(),
+            "model-a".to_owned(),
+        );
+
+        assert_eq!(turn.record.len(), 3);
+        assert_eq!(turn.record[0].content, "what is in the log?");
+        assert_eq!(turn.record[1].content, "42 errors");
+        assert_eq!(turn.record[2].content, "There are 42 errors.");
+        assert_eq!(turn.answer, "There are 42 errors.");
+        // A turn cut short by the round cap stays distinguishable once stored.
+        assert_eq!(turn.finish_reason, "tool_round_limit");
+    }
+
+    #[test]
     fn truncate_appends_ellipsis_only_when_needed() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 5), "hello\u{2026}");
@@ -1851,7 +1925,29 @@ mod tests {
     async fn forget_command_reports_no_match_without_erroring() {
         let database = Mutex::new(Database::open_in_memory_for_tests());
         let response = forget_command(&database, "nonexistent").await.unwrap();
-        assert!(response.contains("No remembered fact matches"));
+        assert!(
+            response.contains("No remembered fact contains"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_command_names_the_facts_an_ambiguous_text_matched() {
+        let db = Database::open_in_memory_for_tests();
+        db.remember("The user likes tea.").unwrap();
+        db.remember("The user likes coffee.").unwrap();
+        let database = Mutex::new(db);
+
+        let response = forget_command(&database, "The user likes").await.unwrap();
+
+        assert!(
+            response.contains("matches 2 remembered facts"),
+            "{response}"
+        );
+        assert!(response.contains("The user likes tea."), "{response}");
+        assert!(response.contains("The user likes coffee."), "{response}");
+        // Nothing is removed while the text is ambiguous.
+        assert_eq!(database.lock().await.list_memory().unwrap().len(), 2);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     provider::{ToolCall, ToolDefinition},
-    storage::Database,
+    storage::{Database, MemoryMatch},
 };
 
 const MAX_FILE_SIZE: u64 = 64 * 1024;
@@ -34,6 +34,10 @@ const MIN_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping the
 /// system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
+/// Bounds on how much of an ambiguous match is echoed back: enough for the model to tell the
+/// candidates apart, not so much that a wide substring returns most of memory as a tool result.
+const MAX_AMBIGUOUS_MEMORY_ENTRIES: usize = 5;
+const MAX_AMBIGUOUS_FACT_CHARS: usize = 120;
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -195,8 +199,8 @@ impl ToolRegistry {
             name: "update_memory".to_owned(),
             description: "Replace a previously remembered fact that is now outdated or wrong. \
                           Find it by an unambiguous substring of its exact wording; if more than \
-                          one remembered fact matches, this fails and you should use a longer, \
-                          more specific substring."
+                          one remembered fact matches, this fails and lists the facts it matched, \
+                          so retry with a substring that appears in only one of them."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -514,14 +518,10 @@ impl ToolRegistry {
             bail!("update_memory requires non-empty 'matching' and 'fact' arguments");
         }
 
-        let updated = self.database.lock().await.update_memory(matching, fact)?;
-        if updated {
-            Ok(format!("updated memory matching \"{matching}\" to: {fact}"))
-        } else {
-            bail!(
-                "no single remembered fact matches \"{matching}\"; it may not exist, or the \
-                 substring matches more than one entry"
-            )
+        match self.database.lock().await.update_memory(matching, fact)? {
+            MemoryMatch::One(_) => Ok(format!("updated memory matching \"{matching}\" to: {fact}")),
+            MemoryMatch::None => bail!("no remembered fact contains \"{matching}\""),
+            MemoryMatch::Ambiguous(entries) => bail!(ambiguous_memory_error(matching, &entries)),
         }
     }
 
@@ -534,16 +534,39 @@ impl ToolRegistry {
             bail!("forget requires a non-empty 'matching' argument");
         }
 
-        let forgotten = self.database.lock().await.forget(matching)?;
-        if forgotten {
-            Ok(format!("forgot the fact matching \"{matching}\""))
-        } else {
-            bail!(
-                "no single remembered fact matches \"{matching}\"; it may not exist, or the \
-                 substring matches more than one entry"
-            )
+        match self.database.lock().await.forget(matching)? {
+            MemoryMatch::One(_) => Ok(format!("forgot the fact matching \"{matching}\"")),
+            MemoryMatch::None => bail!("no remembered fact contains \"{matching}\""),
+            MemoryMatch::Ambiguous(entries) => bail!(ambiguous_memory_error(matching, &entries)),
         }
     }
+}
+
+/// Names the entries a substring collided with. Listing them is the whole point: a caller told only
+/// that its substring was ambiguous has to guess a better one, while a caller shown the competing
+/// facts can pick wording that appears in exactly one of them.
+fn ambiguous_memory_error(matching: &str, entries: &[String]) -> String {
+    let mut message = format!(
+        "\"{matching}\" matches {} remembered facts; use a substring unique to one of them:",
+        entries.len()
+    );
+    for entry in entries.iter().take(MAX_AMBIGUOUS_MEMORY_ENTRIES) {
+        message.push_str(&format!("\n- {}", truncate_fact(entry)));
+    }
+    if let Some(rest) = entries.len().checked_sub(MAX_AMBIGUOUS_MEMORY_ENTRIES)
+        && rest > 0
+    {
+        message.push_str(&format!("\n- ...and {rest} more"));
+    }
+    message
+}
+
+fn truncate_fact(fact: &str) -> String {
+    if fact.chars().count() <= MAX_AMBIGUOUS_FACT_CHARS {
+        return fact.to_owned();
+    }
+    let head: String = fact.chars().take(MAX_AMBIGUOUS_FACT_CHARS).collect();
+    format!("{head}...")
 }
 
 /// Whether the `kamui` binary is reachable on `PATH`. Detected once per process; delegation is an
@@ -1178,6 +1201,61 @@ mod tests {
             )
             .await;
         assert!(output.starts_with("Error:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn update_memory_names_the_facts_an_ambiguous_substring_matched() {
+        let database = test_database();
+        let tools = ToolRegistry::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            database.clone(),
+            chrono_tz::UTC,
+        )
+        .unwrap();
+        {
+            let database = database.lock().await;
+            database.remember("The user likes tea.").unwrap();
+            database.remember("The user likes coffee.").unwrap();
+        }
+
+        let output = tools
+            .dispatch(
+                42,
+                &memory_call(
+                    "update_memory",
+                    serde_json::json!({ "matching": "The user likes", "fact": "x" }),
+                ),
+            )
+            .await;
+
+        assert!(output.starts_with("Error:"), "{output}");
+        assert!(output.contains("The user likes tea."), "{output}");
+        assert!(output.contains("The user likes coffee."), "{output}");
+        // The model needs enough to retry, and neither entry may be modified meanwhile.
+        assert_eq!(database.lock().await.list_memory().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_ambiguous_match_lists_a_bounded_number_of_facts() {
+        let entries: Vec<String> = (0..9).map(|index| format!("fact number {index}")).collect();
+
+        let message = ambiguous_memory_error("fact", &entries);
+
+        assert!(message.contains("matches 9 remembered facts"), "{message}");
+        assert!(message.contains("fact number 4"), "{message}");
+        assert!(!message.contains("fact number 5"), "{message}");
+        assert!(message.contains("...and 4 more"), "{message}");
+    }
+
+    #[test]
+    fn a_long_fact_is_truncated_in_an_ambiguous_match() {
+        let long = "x".repeat(MAX_AMBIGUOUS_FACT_CHARS + 50);
+
+        let message = ambiguous_memory_error("x", &[long, "short".to_owned()]);
+
+        assert!(message.contains(&format!("{}...", "x".repeat(MAX_AMBIGUOUS_FACT_CHARS))));
+        assert!(!message.contains(&"x".repeat(MAX_AMBIGUOUS_FACT_CHARS + 1)));
     }
 
     #[tokio::test]

@@ -297,8 +297,9 @@ turn.
 
 The model can also correct or remove a fact itself — `update_memory` replaces an existing entry
 matched the same way `/forget` does, so a stated preference or fact can be corrected in place
-instead of contradicting an older one; `forget` removes one. Both fail with a clear error if the
-text matches more than one stored fact, asking for something more specific rather than guessing.
+instead of contradicting an older one; `forget` removes one. Both refuse to act when the text
+matches more than one stored fact, and list the facts it matched so the next attempt can use
+wording unique to one of them rather than guessing.
 Total stored memory is capped at 4 KiB, since every byte of it is sent with every request; once
 full, `remember` refuses new facts until something is consolidated or removed.
 

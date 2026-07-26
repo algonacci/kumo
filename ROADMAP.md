@@ -48,8 +48,7 @@ configured context window (or a 48 KiB default), without ever deleting the origi
 - [x] Delegate file editing to Kamui (`delegate_to_kamui`, via `kamui -p <task> --auto-approve`)
 - [x] Structured result rendering for a Kamui delegation (a short summary of tool calls/errors plus
       Kamui's final answer, instead of raw stdout/stderr like `run_command`)
-- [ ] Tool-call round limit review (currently 8; a delegation itself uses one round from Kumo's
-      point of view, so this matters less than it would have for an in-process editor)
+- [x] Tool-call round limit review (still 8, but reaching it no longer discards the turn)
 - [ ] Optional RTK execution backend for `run_command` output compression
 
 This was the most visible gap relative to Kamui: the README used to say plainly "Kumo cannot edit
@@ -69,6 +68,22 @@ only the final combined output, not each of Kamui's own tool calls), and no way 
 individual file edit inside a delegated task — the approval is "let Kamui attempt this task" as a
 whole. If that granularity turns out to matter in practice, an in-process editor (this phase's
 original plan) remains an option, at the cost of the duplication described above.
+
+The round limit turned out to be the wrong thing to review. The number (8) was never the problem;
+what the cap *did* on being reached was. `run_agent` ended the turn with an error, which meant the
+whole turn was discarded before `save_turn` — every tool result in it, including commands the owner
+had explicitly approved and waited for — and the chat was told "the model provider could not
+answer," blaming the provider for a limit that is Kumo's own. Raising the number would only have
+made that outcome rarer, not less destructive, and lowering the odds mattered less than it used to:
+a Kumo with several MCP servers connected can advertise dozens of tools, so a long chain of calls
+is ordinary rather than pathological.
+
+The cap now degrades instead of failing. On the last round Kumo makes one more request with no
+tools offered at all, so the model has to answer from what it already gathered, and that answer is
+saved as a normal turn. Only a model that returns nothing even then is an error. The turn is
+recorded with a `tool_round_limit` finish reason rather than the provider's own, so a turn cut short
+by the cap stays distinguishable in storage from one the model chose to end — the signal worth
+keeping if the number ever does need revisiting.
 
 RTK is optional and orthogonal to permission policy (see Kamui's RTK Decision for the same framing):
 it would compress `run_command` output before it reaches the model, nothing more. Skip it until
@@ -222,8 +237,7 @@ on would misrepresent who is holding up the turn.
 - [x] `remember`/`update_memory`/`forget` tools: global facts, not scoped to any session or chat
 - [x] `/memory` and `/forget <text>`/`/forget all` Telegram commands
 - [x] 4 KiB cap on total stored memory, enforced by `remember`
-- [ ] A way to correct an ambiguous match without knowing the exact stored wording (today
-      `update_memory`/`forget` require a substring unique enough to resolve to one entry)
+- [x] A way to correct an ambiguous match without knowing the exact stored wording
 
 This was directly inspired by Hermes Agent's memory feature, but deliberately built as a much
 smaller slice of it. Hermes runs a background LLM review after every turn to auto-extract lessons
@@ -257,6 +271,17 @@ for no real benefit, since a personal fact changing moment-to-moment is not a re
 tradeoff is explicit in `/memory`'s own output and in this project's user, who confirmed restarting
 after a memory change is an acceptable cost for a personal single-user gateway — that would be a
 much harder tradeoff to accept for a multi-user product.
+
+Strict substring matching had one flaw that was not about strictness at all: `update_memory` and
+`forget` collapsed "no entry matched" and "several entries matched" into the same `Ok(false)`, and
+the resulting error said it might be either. A caller that cannot tell those apart has nothing to
+act on — the model could only guess another substring, blind to what it was choosing between, which
+is exactly the failure this line of the roadmap described. The two now return a `MemoryMatch`
+carrying the competing entries, and the error lists them (up to five, each truncated to 120
+characters, so a deliberately wide substring cannot return most of memory as a tool result). The
+matching rule itself is unchanged: still a case-insensitive substring that must resolve to exactly
+one entry. What changed is that failing to resolve now tells you what you collided with. `/forget`
+lists them for the owner the same way.
 
 What is intentionally out of scope: nothing resembling Hermes's provider ecosystem, background
 review, or write-approval queue. If memory usage in practice reveals a real need for one of those

@@ -50,6 +50,17 @@ pub struct MemoryEntry {
     pub content: String,
 }
 
+/// The outcome of resolving a memory substring. `update_memory` and `forget` act only on `One`;
+/// the other two variants say precisely why nothing happened, which "it did not work" alone never
+/// did — a caller that cannot tell "no such fact" from "several such facts" can only guess again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryMatch {
+    One(i64),
+    None,
+    /// Every entry the substring matched, in insertion order.
+    Ambiguous(Vec<String>),
+}
+
 pub struct StorageSummary {
     pub session_count: i64,
     pub pending_scheduled_tasks: i64,
@@ -353,42 +364,54 @@ impl Database {
         Ok(self.connection.last_insert_rowid())
     }
 
+    /// What a substring resolved to. `Ambiguous` carries the competing entries rather than just
+    /// their count: the caller (usually the model) cannot pick a more specific substring without
+    /// seeing what it is choosing between.
+    fn match_memory(&self, substring: &str) -> Result<MemoryMatch> {
+        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
+        let matches: Vec<(i64, String)> = self
+            .connection
+            .prepare(
+                "SELECT id, content FROM memory WHERE content LIKE ?1 ESCAPE '\\' ORDER BY id",
+            )?
+            .query_map([&pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(match matches.len() {
+            0 => MemoryMatch::None,
+            1 => MemoryMatch::One(matches[0].0),
+            _ => MemoryMatch::Ambiguous(
+                matches
+                    .into_iter()
+                    .map(|(_, content)| content)
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    }
+
     /// Replace the content of an unambiguous entry matched by a case-insensitive substring, so a
     /// superseded fact (e.g. an old job title) can be corrected in place instead of left to
-    /// contradict a newer one. Returns `Ok(false)` for no match or an ambiguous (multi-match)
-    /// substring, so the caller can ask for something more specific rather than guess.
-    pub fn update_memory(&self, substring: &str, new_content: &str) -> Result<bool> {
-        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
-        let matches: Vec<i64> = self
-            .connection
-            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
-            .query_map([&pattern], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if matches.len() != 1 {
-            return Ok(false);
+    /// contradict a newer one.
+    pub fn update_memory(&self, substring: &str, new_content: &str) -> Result<MemoryMatch> {
+        let matched = self.match_memory(substring)?;
+        if let MemoryMatch::One(id) = &matched {
+            self.connection.execute(
+                "UPDATE memory SET content = ?2, updated_at = unixepoch() WHERE id = ?1",
+                params![id, new_content],
+            )?;
         }
-        self.connection.execute(
-            "UPDATE memory SET content = ?2, updated_at = unixepoch() WHERE id = ?1",
-            params![matches[0], new_content],
-        )?;
-        Ok(true)
+        Ok(matched)
     }
 
     /// Delete an unambiguous entry matched by a case-insensitive substring. Same ambiguity
     /// handling as `update_memory`.
-    pub fn forget(&self, substring: &str) -> Result<bool> {
-        let pattern = format!("%{}%", substring.replace('%', "\\%").replace('_', "\\_"));
-        let matches: Vec<i64> = self
-            .connection
-            .prepare("SELECT id FROM memory WHERE content LIKE ?1 ESCAPE '\\'")?
-            .query_map([&pattern], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if matches.len() != 1 {
-            return Ok(false);
+    pub fn forget(&self, substring: &str) -> Result<MemoryMatch> {
+        let matched = self.match_memory(substring)?;
+        if let MemoryMatch::One(id) = &matched {
+            self.connection
+                .execute("DELETE FROM memory WHERE id = ?1", [id])?;
         }
-        self.connection
-            .execute("DELETE FROM memory WHERE id = ?1", [matches[0]])?;
-        Ok(true)
+        Ok(matched)
     }
 
     /// Delete every memory entry (used by the `/forget all` Telegram command).
@@ -1081,21 +1104,31 @@ mod tests {
             .update_memory("is a researcher", "is a software engineer.")
             .unwrap();
 
-        assert!(updated);
+        assert!(matches!(updated, MemoryMatch::One(_)));
         let entries = database.list_memory().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "is a software engineer.");
     }
 
     #[test]
-    fn update_memory_fails_on_no_match_or_ambiguous_match() {
+    fn update_memory_distinguishes_no_match_from_an_ambiguous_one() {
         let database = database();
         database.remember("The user likes tea.").unwrap();
         database.remember("The user likes coffee.").unwrap();
 
-        assert!(!database.update_memory("nonexistent", "x").unwrap());
-        // Both entries contain "The user likes", so this is ambiguous.
-        assert!(!database.update_memory("The user likes", "x").unwrap());
+        assert_eq!(
+            database.update_memory("nonexistent", "x").unwrap(),
+            MemoryMatch::None
+        );
+        // Both entries contain "The user likes", so this is ambiguous — and the caller is told
+        // which entries it collided with, not merely that it failed.
+        assert_eq!(
+            database.update_memory("The user likes", "x").unwrap(),
+            MemoryMatch::Ambiguous(vec![
+                "The user likes tea.".to_owned(),
+                "The user likes coffee.".to_owned(),
+            ])
+        );
         // Neither original entry should have been touched.
         let entries = database.list_memory().unwrap();
         assert_eq!(entries.len(), 2);
@@ -1107,7 +1140,10 @@ mod tests {
         database.remember("The user is a researcher.").unwrap();
         database.remember("The user likes tea.").unwrap();
 
-        assert!(database.forget("researcher").unwrap());
+        assert!(matches!(
+            database.forget("researcher").unwrap(),
+            MemoryMatch::One(_)
+        ));
 
         let entries = database.list_memory().unwrap();
         assert_eq!(entries.len(), 1);
@@ -1115,13 +1151,19 @@ mod tests {
     }
 
     #[test]
-    fn forget_fails_on_no_match_or_ambiguous_match() {
+    fn forget_distinguishes_no_match_from_an_ambiguous_one() {
         let database = database();
         database.remember("The user likes tea.").unwrap();
         database.remember("The user likes coffee.").unwrap();
 
-        assert!(!database.forget("nonexistent").unwrap());
-        assert!(!database.forget("The user likes").unwrap());
+        assert_eq!(database.forget("nonexistent").unwrap(), MemoryMatch::None);
+        assert_eq!(
+            database.forget("The user likes").unwrap(),
+            MemoryMatch::Ambiguous(vec![
+                "The user likes tea.".to_owned(),
+                "The user likes coffee.".to_owned(),
+            ])
+        );
         assert_eq!(database.list_memory().unwrap().len(), 2);
     }
 
@@ -1141,8 +1183,11 @@ mod tests {
         database.remember("100% sure about this_thing").unwrap();
 
         // '%' and '_' are SQL LIKE wildcards; a literal search for them must not match everything.
-        assert!(!database.forget("50%").unwrap());
-        assert!(database.forget("100% SURE").unwrap());
+        assert_eq!(database.forget("50%").unwrap(), MemoryMatch::None);
+        assert!(matches!(
+            database.forget("100% SURE").unwrap(),
+            MemoryMatch::One(_)
+        ));
     }
 
     #[test]
