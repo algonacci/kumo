@@ -509,14 +509,52 @@ a schedule.
 
 ## Later: Providers and Platforms
 
-- [ ] Named provider profiles, switchable at runtime (Kumo has one `base_url`/`api_key`/`models` list
-      today; Kamui's `[profiles.*]` pattern is the reference if this becomes worth doing)
+- [x] Named providers, switchable at runtime (`[providers.*]`, `/providers`, `/provider <name>`)
 - [ ] Streaming responses (Kumo buffers the full completion before replying; Telegram message
       editing would be required to show partial output, and polling-based Telegram bots gain less
       from this than a terminal does)
 - [ ] Native Anthropic / Gemini provider (not planned — no trait boundary exists for a second
       backend today, and OpenAI-compatible base URLs already cover OpenRouter, Ollama, LM Studio,
       Groq, DeepSeek, LiteLLM)
+
+This stopped being speculative the moment a provider was actually swapped: `kumo onboard`
+overwrote the single `[provider]` block, so trying a second provider cost the first one entirely —
+base URL, key, model list, and the context windows the listing had recorded. Kamui solves the same
+problem with `[profiles.*]` plus shared `[providers.*]` credential blocks, chosen by
+`default_profile`. Kumo takes the simpler half of that: one `[providers.<name>]` block per
+provider, each a complete `[provider]` of its own, selected by `active_provider`. Kamui's split
+between a profile and the credentials it references exists because Kamui expects several *models*
+on one provider; Kumo already tracks a model list per provider, so the second layer would buy
+nothing here.
+
+Two rules keep it from complicating the simple case. A first provider stays in the flat
+`[provider]` form and never needs a name — only setting up a second one migrates the config into
+named entries, and onboarding suggests a name derived from the host (`api.groq.com` → `groq`)
+rather than demanding one. And when named entries exist, the flat block is ignored rather than
+merged, the same precedence Kamui gives its profiles. `Config::provider`/`provider_mut` resolve
+whichever entry is active, so `/model`, `/models refresh`, and `/context` write to the right one
+without knowing profiles exist at all; `active_provider` naming something that no longer exists
+falls back to the first entry instead of leaving the gateway with no provider.
+
+## Compaction accounting
+
+Compaction compared *message* bytes against a budget derived from the context window, but a
+request is not only its messages. The system prompt, the memory snapshot, the rolling summary, and
+every tool schema ride along on every turn, and none of them were counted; neither were images,
+which live in a separate field from message content, so a 5 MiB photo counted as zero. With a few
+MCP servers connected the uncounted part can exceed the counted one — a single server here
+advertises 61 tools, about 31 KB of schema per request — so the number being compared to the
+threshold was not the size of anything real.
+
+`message_budget(context_window, overhead)` now subtracts that overhead first, and `total_bytes`
+counts image payloads. The overhead is measured once at startup (`AppState.tool_schema_bytes`),
+since MCP servers connect once and the memory snapshot is already frozen for the life of the
+process; only the summary length varies per turn. This makes compaction fire *earlier* than before
+on a tool-heavy install, which is the correct direction — it was previously overrunning its budget
+by whatever the schemas cost — but it also makes an unset context window more expensive than it
+used to be, which is what `/context` is for. A floor of 8 KiB keeps history from being squeezed to
+nothing by overhead alone, since summarizing messages cannot shrink a tool schema and a request
+that is over budget because of its tools will stay over budget however much history is folded away.
 
 ## Not Planned
 

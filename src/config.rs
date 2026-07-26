@@ -9,8 +9,19 @@ const CONFIG_FILE: &str = "kumo.toml";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     pub telegram: TelegramConfig,
+    /// The single-provider form, kept for installs that never defined a named one. When
+    /// `providers` is non-empty this is ignored, the same way Kamui's `[profiles.*]` win over its
+    /// flat provider settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
+    /// Named provider configurations, each a complete `[provider]` block of its own, so a second
+    /// provider can be set up without discarding the first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    /// Which entry of `providers` is in use. Only meaningful when more than one exists — a single
+    /// named provider is selected by being the only one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
     /// IANA timezone name (e.g. "Asia/Jakarta"), used to interpret relative times in scheduled
@@ -120,10 +131,39 @@ impl Config {
         Ok(path)
     }
 
+    /// The name of the provider in use, when there are named ones to choose between.
+    pub fn active_provider_name(&self) -> Option<String> {
+        if self.providers.is_empty() {
+            return None;
+        }
+        match &self.active_provider {
+            Some(name) if self.providers.contains_key(name) => Some(name.clone()),
+            // A config with exactly one named provider does not need to say which is active, and a
+            // stale `active_provider` (renamed or removed by hand) resolves the same way rather
+            // than leaving the gateway with no provider at all.
+            _ => self.providers.keys().next().cloned(),
+        }
+    }
+
     pub fn provider(&self) -> Result<&ProviderConfig> {
+        if let Some(name) = self.active_provider_name() {
+            return self
+                .providers
+                .get(&name)
+                .context("the active provider disappeared from the configuration");
+        }
         self.provider
             .as_ref()
             .context("model provider is not configured; run `kumo onboard`")
+    }
+
+    /// The same resolution as `provider`, for the commands that edit it (`/model`, `/context`,
+    /// `/models refresh`) — they must write to whichever entry is actually in use.
+    pub fn provider_mut(&mut self) -> Option<&mut ProviderConfig> {
+        match self.active_provider_name() {
+            Some(name) => self.providers.get_mut(&name),
+            None => self.provider.as_mut(),
+        }
     }
 
     /// The configured IANA timezone, or UTC on installs from before scheduling existed. The
@@ -175,6 +215,8 @@ mod tests {
                 context_window: Some(128_000),
                 context_windows: BTreeMap::from([("model-a".into(), 200_000)]),
             }),
+            providers: Default::default(),
+            active_provider: None,
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
             }),
@@ -276,6 +318,63 @@ mod tests {
         // The selection is left alone: replacing it is the owner's call, not a silent swap.
         assert_eq!(config.active_model, "retired");
         assert_eq!(config.active_context_window(), None);
+    }
+
+    /// Top-level keys have to precede the first table header, or TOML reads them as belonging to
+    /// that table instead.
+    fn config_with_providers(toml: &str) -> Config {
+        toml::from_str(&format!(
+            "{toml}\n[telegram]\nbot_token = \"123:secret\"\nbot_username = \"bot\"\n\
+             owner_user_id = 42\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_named_provider_wins_over_the_flat_one() {
+        let config = config_with_providers(
+            "\n[provider]\nbase_url = \"https://old.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"old\"\nmodels = [\"old\"]\n\
+             \n[providers.new]\nbase_url = \"https://new.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"new\"\nmodels = [\"new\"]",
+        );
+
+        assert_eq!(config.provider().unwrap().active_model, "new");
+        assert_eq!(config.active_provider_name().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn active_provider_selects_between_named_ones() {
+        let config = config_with_providers(
+            "active_provider = \"b\"\n\
+             \n[providers.a]\nbase_url = \"https://a.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"model-a\"\nmodels = [\"model-a\"]\n\
+             \n[providers.b]\nbase_url = \"https://b.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"model-b\"\nmodels = [\"model-b\"]",
+        );
+
+        assert_eq!(config.provider().unwrap().active_model, "model-b");
+    }
+
+    #[test]
+    fn a_stale_active_provider_still_resolves_to_something() {
+        let mut config = config_with_providers(
+            "active_provider = \"renamed-away\"\n\
+             \n[providers.a]\nbase_url = \"https://a.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"model-a\"\nmodels = [\"model-a\"]",
+        );
+
+        // A hand-edited name that no longer exists must not leave the gateway provider-less.
+        assert_eq!(config.provider().unwrap().active_model, "model-a");
+        assert!(config.provider_mut().is_some());
+    }
+
+    #[test]
+    fn a_config_with_no_providers_at_all_reports_it() {
+        let config = config_with_providers("");
+
+        assert!(config.provider().is_err());
+        assert!(config.active_provider_name().is_none());
     }
 
     #[test]

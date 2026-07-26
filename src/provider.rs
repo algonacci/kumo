@@ -133,6 +133,15 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+impl ToolDefinition {
+    /// What this definition costs in a request, for compaction's accounting. The JSON scaffolding
+    /// the wire layer wraps it in is a few dozen fixed bytes per tool, small enough against a
+    /// schema to leave out of the estimate.
+    pub fn payload_bytes(&self) -> usize {
+        self.name.len() + self.description.len() + self.parameters.to_string().len()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCall {
     pub id: String,

@@ -37,54 +37,109 @@ pub async fn run(existing: Option<Config>, reconfigure_provider: bool) -> Result
     println!("===============");
     println!();
 
-    let (telegram, existing_provider, existing_timezone, mcp) = match existing {
+    let mut config = match existing {
         Some(config) => {
             println!(
                 "Telegram is already connected as @{}.",
                 config.telegram.bot_username
             );
-            (
-                config.telegram,
-                config.provider,
-                config.timezone,
-                config.mcp,
-            )
+            config
         }
         None => {
             let telegram = setup_telegram().await?;
-            Config {
-                telegram: telegram.clone(),
+            let config = Config {
+                telegram,
                 provider: None,
+                providers: Default::default(),
+                active_provider: None,
                 tools: None,
                 timezone: None,
                 mcp: Default::default(),
-            }
-            .save()?;
-            (telegram, None, None, Default::default())
+            };
+            config.save()?;
+            config
         }
     };
-    let provider = match existing_provider {
-        Some(provider) if !reconfigure_provider => provider,
-        _ => setup_provider().await?,
-    };
-    let tools = setup_tools()?;
-    let timezone = match existing_timezone {
-        Some(timezone) => timezone,
-        None => setup_timezone()?,
-    };
-    let config = Config {
-        telegram,
-        provider: Some(provider),
-        tools: Some(tools),
-        timezone: Some(timezone),
-        mcp,
-    };
+
+    if config.provider().is_err() || reconfigure_provider {
+        let provider = setup_provider().await?;
+        install_provider(&mut config, provider)?;
+    }
+    config.tools = Some(setup_tools()?);
+    if config.timezone.is_none() {
+        config.timezone = Some(setup_timezone()?);
+    }
     let path = config.save()?;
 
     println!();
     println!("Setup complete.");
     println!("Configuration saved to {}", path.display());
     Ok(config)
+}
+
+/// Files a freshly configured provider, keeping any provider already set up instead of replacing
+/// it. Re-running `kumo onboard` used to cost you the previous provider entirely — base URL, key,
+/// and model list — which is a lot to lose just to try a second one.
+///
+/// A first provider stays in the simple `[provider]` form. Only a second one migrates the config
+/// to named `[providers.*]` entries, so an install that never wants two never has to think about
+/// names at all.
+fn install_provider(config: &mut Config, provider: ProviderConfig) -> Result<()> {
+    if config.provider.is_none() && config.providers.is_empty() {
+        config.provider = Some(provider);
+        return Ok(());
+    }
+
+    if let Some(previous) = config.provider.take() {
+        let name = unique_provider_name(&suggest_provider_name(&previous.base_url), config);
+        println!("Keeping the provider you had as \"{name}\".");
+        config.providers.insert(name, previous);
+    }
+
+    let suggested = unique_provider_name(&suggest_provider_name(&provider.base_url), config);
+    let name = Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Name for this provider (switch with /provider in Telegram)")
+        .default(suggested)
+        .interact_text()?
+        .trim()
+        .to_owned();
+    config.providers.insert(name.clone(), provider);
+    config.active_provider = Some(name);
+    Ok(())
+}
+
+/// A short name derived from the provider's host: `https://api.groq.com/openai/v1` becomes
+/// `groq`. Only a starting point — onboarding offers it as an editable default.
+fn suggest_provider_name(base_url: &str) -> String {
+    let host = base_url
+        .rsplit("//")
+        .next()
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let label = host
+        .split('.')
+        .find(|label| !label.is_empty() && *label != "api" && *label != "www")
+        .unwrap_or_default();
+    if label.is_empty() {
+        "provider".to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+fn unique_provider_name(preferred: &str, config: &Config) -> String {
+    if !config.providers.contains_key(preferred) {
+        return preferred.to_owned();
+    }
+    (2..)
+        .map(|suffix| format!("{preferred}-{suffix}"))
+        .find(|name| !config.providers.contains_key(name))
+        .expect("an unused suffix always exists")
 }
 
 fn setup_timezone() -> Result<String> {

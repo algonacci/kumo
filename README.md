@@ -169,6 +169,8 @@ status if anything failed, so it's usable as a pre-flight check in a script.
 - `/model <id>` switches the active model and saves the choice.
 - `/context` shows the context window Kumo budgets history against; `/context <tokens>` sets it for
   providers that do not report one.
+- `/providers` lists configured providers; `/provider <name>` switches to one, swapping its
+  credentials, model, and context budget together.
 
 Session IDs are scoped to the Telegram chat they belong to, so `/resume` and `/delete` can only act
 on a session that chat itself created — a prefix that happens to match another chat's session ID
@@ -213,6 +215,38 @@ set the number yourself with `/context <tokens>` or by hand:
 [provider]
 context_window = 128000
 ```
+
+The threshold covers the whole request, not just the conversation: the system prompt, remembered
+facts, the rolling summary, and every tool schema are subtracted from it before history gets what
+is left. Connecting an MCP server with dozens of tools therefore leaves less room for history, which
+is the accurate accounting — set a real context window (or `/context`) rather than relying on the
+conservative default when many tools are connected. History is never squeezed below 8 KiB no matter
+how large the overhead grows, since summarizing cannot shrink a tool schema.
+
+## Multiple providers
+
+One provider needs no name and lives in `[provider]`. Running `kumo onboard` again to set up a
+second one keeps the first: Kumo moves both into named entries and asks what to call the new one.
+
+```toml
+active_provider = "groq"
+
+[providers.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key = "gsk_..."
+active_model = "openai/gpt-oss-120b"
+models = ["openai/gpt-oss-120b"]
+
+[providers.local]
+base_url = "http://localhost:11434/v1"
+api_key = ""
+active_model = "qwen2.5-coder"
+models = ["qwen2.5-coder"]
+```
+
+`/providers` lists them and `/provider <name>` switches, which swaps the base URL, key, model list,
+and context budget together. `/model`, `/models refresh`, and `/context` always act on whichever
+provider is active. When named providers exist, a leftover `[provider]` block is ignored.
 
 ## Host tools
 

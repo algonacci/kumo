@@ -39,6 +39,10 @@ pub(crate) struct AppState {
     /// and does not defeat provider-side prompt caching; a `remember`/`update_memory`/`forget`
     /// call updates storage immediately but only appears in the prompt after Kumo restarts.
     memory_snapshot: String,
+    /// Serialized size of every tool definition offered to the model. Fixed for the life of the
+    /// process (MCP servers are connected once, at startup), so it is measured once here rather
+    /// than re-serialized per turn, and counted as request overhead by compaction.
+    tool_schema_bytes: usize,
 }
 
 pub(crate) struct AgentTurn {
@@ -125,7 +129,9 @@ async fn main() -> Result<()> {
     let existing = Config::exists()?.then(Config::load).transpose()?;
     let needs_onboarding = matches!(command, Command::Onboard)
         || existing.as_ref().is_none_or(|config| {
-            config.provider.is_none() || config.tools.is_none() || config.timezone.is_none()
+            // `provider()` rather than the `provider` field: a config that keeps its providers as
+            // named entries leaves that field empty and is still fully configured.
+            config.provider().is_err() || config.tools.is_none() || config.timezone.is_none()
         });
     let config = if needs_onboarding {
         let reconfigure_provider = matches!(command, Command::Onboard);
@@ -189,12 +195,18 @@ async fn run_gateway(config: Config) -> Result<()> {
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let questions: PendingQuestions = Arc::new(Mutex::new(HashMap::new()));
+    let tool_schema_bytes = tools
+        .definitions()
+        .iter()
+        .map(provider::ToolDefinition::payload_bytes)
+        .sum();
     let state = Arc::new(RwLock::new(AppState {
         config,
         provider,
         tools,
         mcp_statuses,
         memory_snapshot,
+        tool_schema_bytes,
     }));
 
     let current = state.read().await;
@@ -423,6 +435,16 @@ async fn handle_message(
     }
     if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
         let response = switch_model(&state, model).await;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/providers" || text == "/provider" {
+        let response = providers_message(&state.read().await.config);
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(name) = text.strip_prefix("/provider ").map(str::trim) {
+        let response = switch_provider(&state, name).await;
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
@@ -839,14 +861,23 @@ pub(crate) async fn prepare_history(
     chat_id: i64,
 ) -> Result<storage::History> {
     let mut history = database.lock().await.load_active_history(chat_id)?;
-    let (provider, context_window) = {
+    let (provider, context_window, overhead) = {
         let state = state.read().await;
+        // Everything a request carries besides the history itself. The system prompt, the memory
+        // snapshot and the tool schemas are constant per process; the summary is not.
+        let overhead = SYSTEM_PROMPT.len()
+            + state.memory_snapshot.len()
+            + state.tool_schema_bytes
+            + history.summary.as_deref().map_or(0, str::len);
         (
             state.provider.clone(),
             state.config.provider()?.active_context_window(),
+            overhead,
         )
     };
-    if compaction::total_bytes(&history.messages) <= compaction::threshold(context_window) {
+    if compaction::total_bytes(&history.messages)
+        <= compaction::message_budget(context_window, overhead)
+    {
         return Ok(history);
     }
     let Some(cutoff) = compaction::cutoff(&history.messages) else {
@@ -892,7 +923,10 @@ async fn status_message(
         .workspace
         .display()
         .to_string();
-    let model = state.provider.active_model().to_owned();
+    let model = match state.config.active_provider_name() {
+        Some(name) => format!("{} ({name})", state.provider.active_model()),
+        None => state.provider.active_model().to_owned(),
+    };
     let context_window = state.config.provider()?.active_context_window();
     let mcp = if state.mcp_statuses.is_empty() {
         "none".to_owned()
@@ -1420,6 +1454,51 @@ fn models_message(config: &Config) -> String {
     message
 }
 
+fn providers_message(config: &Config) -> String {
+    if config.providers.is_empty() {
+        return "One provider is configured, without a name.\n\nRun `kumo onboard` on the host to \
+                add a second one: Kumo keeps this one under a name of its own, and /provider \
+                switches between them from here."
+            .to_owned();
+    }
+
+    let active = config.active_provider_name();
+    let mut message = "Configured providers:\n".to_owned();
+    for (name, provider) in &config.providers {
+        let marker = if Some(name) == active.as_ref() {
+            " (active)"
+        } else {
+            ""
+        };
+        message.push_str(&format!("\n{name}{marker} — {}", provider.active_model));
+    }
+    message.push_str("\n\nSwitch with /provider <name>.");
+    message
+}
+
+/// Switching provider swaps the model, the credentials, and the context budget together, so the
+/// live `Provider` is rebuilt from whichever entry is now active.
+async fn switch_provider(state: &RwLock<AppState>, name: &str) -> String {
+    let mut state = state.write().await;
+    if state.config.providers.is_empty() {
+        return "Only one provider is configured, so there is nothing to switch to.".to_owned();
+    }
+    let Some(provider_config) = state.config.providers.get(name).cloned() else {
+        return format!("Unknown provider: {name}\n\nUse /providers to see the configured ones.");
+    };
+
+    state.config.active_provider = Some(name.to_owned());
+    state.provider = Provider::new(provider_config.clone());
+    let model = provider_config.active_model;
+    match state.config.save() {
+        Ok(_) => format!("Switched to {name} ({model})."),
+        Err(error) => {
+            eprintln!("Could not save the provider selection: {error:#}");
+            format!("Switched to {name} for this run, but Kumo could not save the selection.")
+        }
+    }
+}
+
 /// Not every OpenAI-compatible provider reports a context window in its model listing, and Kumo's
 /// fallback (48 KiB of history) is deliberately conservative — small enough to be safe against an
 /// unknown model, small enough to compact away history a large model could still hold. `/context`
@@ -1465,7 +1544,7 @@ async fn set_context_window(state: &RwLock<AppState>, tokens: &str) -> String {
     }
 
     let mut state = state.write().await;
-    let Some(provider_config) = state.config.provider.as_mut() else {
+    let Some(provider_config) = state.config.provider_mut() else {
         return "Model provider is not configured.".to_owned();
     };
     provider_config.context_window = Some(window);
@@ -1504,7 +1583,7 @@ async fn refresh_models(state: &RwLock<AppState>) -> String {
     let count = listing.len();
 
     let mut state = state.write().await;
-    let Some(provider_config) = state.config.provider.as_mut() else {
+    let Some(provider_config) = state.config.provider_mut() else {
         return "Model provider is not configured.".to_owned();
     };
     let active_available = provider_config.apply_model_listing(listing);
@@ -1535,7 +1614,7 @@ async fn refresh_models(state: &RwLock<AppState>) -> String {
 
 async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
     let mut state = state.write().await;
-    let Some(provider_config) = state.config.provider.as_mut() else {
+    let Some(provider_config) = state.config.provider_mut() else {
         return "Model provider is not configured.".to_owned();
     };
     if !provider_config
@@ -1621,12 +1700,24 @@ async fn print_status() -> Result<()> {
             println!("Config:    {}", path.display());
             let config = Config::load()?;
             println!("Telegram:  connected as @{}", config.telegram.bot_username);
-            match &config.provider {
-                Some(provider) => println!(
-                    "Provider:  {} ({})",
-                    provider.active_model, provider.base_url
-                ),
-                None => println!("Provider:  not configured (run `kumo onboard`)"),
+            match config.provider() {
+                Ok(provider) => {
+                    let name = config
+                        .active_provider_name()
+                        .map(|name| format!("{name}: "))
+                        .unwrap_or_default();
+                    println!(
+                        "Provider:  {name}{} ({})",
+                        provider.active_model, provider.base_url
+                    );
+                    if config.providers.len() > 1 {
+                        println!(
+                            "           {} configured, switch with /provider",
+                            config.providers.len()
+                        );
+                    }
+                }
+                Err(_) => println!("Provider:  not configured (run `kumo onboard`)"),
             }
             match &config.tools {
                 Some(tools) => println!("Workspace: {}", tools.workspace.display()),
