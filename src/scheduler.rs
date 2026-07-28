@@ -100,6 +100,7 @@ async fn run_due_tasks(
             questions,
             database,
             &task.prompt,
+            recurrence_note(&task),
         )
         .await;
         let status = match &outcome {
@@ -142,6 +143,25 @@ async fn run_due_tasks(
     Ok(())
 }
 
+/// The line appended to a recurring reminder telling the reader how to stop it. A reminder that
+/// turns out to be unwanted is discovered *by being delivered*, so the way out belongs in the
+/// message doing the interrupting — not in a command the reader has to already know about. One-shot
+/// tasks get nothing: there is nothing to stop.
+fn recurrence_note(task: &crate::storage::ScheduledTask) -> Option<String> {
+    let interval = task.repeat_interval_seconds?;
+    let every = match interval {
+        seconds if seconds % 86_400 == 0 => format!("{} day(s)", seconds / 86_400),
+        seconds if seconds % 3_600 == 0 => format!("{} hour(s)", seconds / 3_600),
+        seconds if seconds % 60 == 0 => format!("{} minute(s)", seconds / 60),
+        seconds => format!("{seconds} second(s)"),
+    };
+    Some(format!(
+        "Repeats every {every}. To stop it, send: /reminders cancel {}",
+        &task.id[..8]
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_task(
     bot: &Bot,
     chat_id: ChatId,
@@ -150,6 +170,7 @@ async fn run_scheduled_task(
     questions: &PendingQuestions,
     database: &Arc<Mutex<Database>>,
     prompt: &str,
+    recurrence_note: Option<String>,
 ) -> Result<()> {
     let history = prepare_history(state, database, chat_id.0).await?;
     let turn = run_agent(
@@ -170,6 +191,9 @@ async fn run_scheduled_task(
         send_formatted(bot, chat_id, &chunk).await?;
     }
     send_mcp_images(bot, chat_id, &turn.images).await?;
+    if let Some(note) = recurrence_note {
+        bot.send_message(chat_id, note).await?;
+    }
     database.lock().await.save_turn(
         chat_id.0,
         &turn.model,
@@ -178,4 +202,45 @@ async fn run_scheduled_task(
         &turn.finish_reason,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::ScheduledTask;
+
+    fn task(repeat_interval_seconds: Option<i64>) -> ScheduledTask {
+        ScheduledTask {
+            id: "8be7f7aa-1111-2222-3333-444444444444".to_owned(),
+            telegram_chat_id: 42,
+            prompt: "ping".to_owned(),
+            run_at: 0,
+            repeat_interval_seconds,
+        }
+    }
+
+    #[test]
+    fn a_one_shot_reminder_carries_no_note() {
+        assert!(recurrence_note(&task(None)).is_none());
+    }
+
+    #[test]
+    fn a_recurring_reminder_says_how_to_stop_itself() {
+        let note = recurrence_note(&task(Some(86_400))).unwrap();
+
+        assert!(note.contains("Repeats every 1 day(s)"), "{note}");
+        // The id has to be the short form /reminders cancel accepts.
+        assert!(note.contains("/reminders cancel 8be7f7aa"), "{note}");
+    }
+
+    #[test]
+    fn an_interval_is_described_in_its_largest_whole_unit() {
+        let hourly = recurrence_note(&task(Some(3_600))).unwrap();
+        let minutes = recurrence_note(&task(Some(300))).unwrap();
+        let odd = recurrence_note(&task(Some(90))).unwrap();
+
+        assert!(hourly.contains("1 hour(s)"), "{hourly}");
+        assert!(minutes.contains("5 minute(s)"), "{minutes}");
+        assert!(odd.contains("90 second(s)"), "{odd}");
+    }
 }

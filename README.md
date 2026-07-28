@@ -267,7 +267,10 @@ The model may call these tools while answering:
   timezone, either once or repeating on a fixed interval (`repeat_interval_seconds`, minimum 300
   seconds). At each scheduled time, Kumo runs the prompt through the same agent loop as a normal
   message — with all the same tools, subject to the same approvals — and delivers the result to the
-  chat that scheduled it, prefixed with "⏰ Scheduled task:". A recurring task reschedules itself
+  chat that scheduled it, prefixed with "⏰ Scheduled task:". A recurring delivery is followed by a
+  line stating its interval and the exact `/reminders cancel <id>` that stops it, so an unwanted
+  reminder can always be stopped from the message doing the interrupting. A recurring task
+  reschedules itself
   (`run_at` advanced by the interval) on success; if it fails, it is marked failed and not retried
   automatically. Does not require approval to schedule; approval still applies to whatever tools the
   task itself calls when it runs. A chat may hold at most 20 pending tasks.

@@ -188,6 +188,12 @@ itself a fresh agent turn, because the task kept firing. The second gap made the
 `MIN_REPEAT_INTERVAL` was 60 seconds, which is not a floor against anything a model would
 plausibly choose — "every minute" is a phrase, and the scheduler will honour it forever.
 
+There was a third gap, and it is the one that mattered most for someone who is not the author: an
+unwanted recurring reminder is discovered *by being delivered*, and the reader had no way out that
+did not require already knowing `/reminders`. Every recurring delivery now ends with its interval
+and the exact cancel command for that task, so the escape hatch travels with the thing doing the
+interrupting. One-shot deliveries get nothing appended, since there is nothing to stop.
+
 `list_scheduled_tasks` and `cancel_scheduled_task` close the first gap; both are scoped to the
 asking chat, like the `/reminders` commands they mirror. The floor moves to 300 seconds, still far
 below any real reminder ("hourly", "daily") but no longer a plausible accident. And because a
