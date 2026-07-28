@@ -27,10 +27,16 @@ const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
 /// How far into the future a scheduled task may be set, as a sanity bound against the model
 /// misparsing a relative date (e.g. the wrong year).
 const MAX_SCHEDULE_HORIZON: chrono::Duration = chrono::Duration::days(366);
-/// Shortest allowed gap between runs of a recurring task, as a floor against the scheduler's
-/// 30-second poll interval and against the model setting an accidentally tiny interval that would
-/// spam the chat.
-const MIN_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
+/// Shortest allowed gap between runs of a recurring task. This was 60 seconds, which turned out to
+/// be no protection at all: a model that reads "every minute" literally produces a task that
+/// delivers a message every single minute, forever, and every one of those runs costs a full agent
+/// turn. Five minutes is still far shorter than any real reminder ("hourly", "daily") and no longer
+/// reads as a plausible interval to reach for by accident.
+const MIN_REPEAT_INTERVAL: Duration = Duration::from_secs(300);
+/// How many pending tasks one chat may hold. A scheduled run goes through the same agent loop as a
+/// live message, so a task can schedule further tasks — without a ceiling, one confused turn can
+/// leave a chat with an ever-growing pile of them.
+const MAX_PENDING_TASKS: usize = 20;
 /// Total bytes of stored memory content allowed before `remember` refuses to add more, keeping the
 /// system prompt (which carries every entry on every request) from growing unbounded.
 const MAX_MEMORY_BYTES: i64 = 4 * 1024;
@@ -169,10 +175,37 @@ impl ToolRegistry {
                     },
                     "repeat_interval_seconds": {
                         "type": "integer",
-                        "description": "Omit for a one-shot task. For a recurring one, how many seconds between runs, e.g. 86400 for daily, 604800 for weekly."
+                        "description": "Omit for a one-shot task — most reminders are one-shot. Only set this when the user asks for something genuinely repeating, e.g. 86400 for daily, 604800 for weekly. Every run delivers a message to the chat, so short intervals read as spam."
                     }
                 },
                 "required": ["prompt", "run_at"]
+            }),
+        });
+        definitions.push(ToolDefinition {
+            name: "list_scheduled_tasks".to_owned(),
+            description: "List this chat's pending scheduled tasks, each with the id needed to \
+                          cancel it. Call this before answering any question about what is \
+                          scheduled, and before cancelling anything."
+                .to_owned(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
+        definitions.push(ToolDefinition {
+            name: "cancel_scheduled_task".to_owned(),
+            description: "Cancel a pending scheduled task by its id, as shown by \
+                          list_scheduled_tasks. Use this whenever the user asks to stop, remove, \
+                          or turn off a reminder — including \"stop reminding me\" and \"don't \
+                          repeat that\". Saying you have stopped a reminder without calling this \
+                          changes nothing, and it will keep firing."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The task id from list_scheduled_tasks; a unique prefix is enough."
+                    }
+                },
+                "required": ["id"]
             }),
         });
         definitions.push(ToolDefinition {
@@ -302,6 +335,8 @@ impl ToolRegistry {
             "run_command" => self.run_command(&call.arguments).await,
             "delegate_to_kamui" => self.delegate_to_kamui(&call.arguments).await,
             "schedule_task" => self.schedule_task(chat_id, &call.arguments).await,
+            "list_scheduled_tasks" => self.list_scheduled_tasks(chat_id).await,
+            "cancel_scheduled_task" => self.cancel_scheduled_task(chat_id, &call.arguments).await,
             "remember" => self.remember(&call.arguments).await,
             "update_memory" => self.update_memory(&call.arguments).await,
             "forget" => self.forget(&call.arguments).await,
@@ -467,12 +502,22 @@ impl ToolRegistry {
             );
         }
 
-        let id = self.database.lock().await.create_scheduled_task(
+        let database = self.database.lock().await;
+        let pending = database.list_scheduled_tasks(chat_id)?.len();
+        if pending >= MAX_PENDING_TASKS {
+            bail!(
+                "this chat already has {pending} pending scheduled tasks, which is the limit; \
+                 cancel some with cancel_scheduled_task before adding another"
+            );
+        }
+        let id = database.create_scheduled_task(
             chat_id,
             prompt,
             run_at.timestamp(),
             arguments.repeat_interval_seconds,
         )?;
+        drop(database);
+
         let local_time = run_at.with_timezone(&self.timezone);
         let recurrence = match arguments.repeat_interval_seconds {
             Some(interval) => format!(", repeating every {interval} seconds"),
@@ -484,6 +529,63 @@ impl ToolRegistry {
             local_time.format("%Y-%m-%d %H:%M %Z"),
             self.timezone
         ))
+    }
+
+    /// The pending tasks for this chat, with the ids `cancel_scheduled_task` accepts. Without this
+    /// the model could create reminders but never see or stop them, so "stop reminding me" could
+    /// only ever be answered with an apology.
+    async fn list_scheduled_tasks(&self, chat_id: i64) -> Result<String> {
+        let tasks = self.database.lock().await.list_scheduled_tasks(chat_id)?;
+        if tasks.is_empty() {
+            return Ok("no pending scheduled tasks".to_owned());
+        }
+
+        let lines: Vec<String> = tasks
+            .iter()
+            .map(|task| {
+                let when = DateTime::from_timestamp(task.run_at, 0)
+                    .map(|value| {
+                        value
+                            .with_timezone(&self.timezone)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "unknown time".to_owned());
+                let recurrence = match task.repeat_interval_seconds {
+                    Some(interval) => format!(", repeats every {interval}s"),
+                    None => String::new(),
+                };
+                format!(
+                    "{}: \"{}\" at {when}{recurrence}",
+                    &task.id[..8],
+                    task.prompt
+                )
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    async fn cancel_scheduled_task(&self, chat_id: i64, arguments: &str) -> Result<String> {
+        let arguments: CancelTaskArguments =
+            serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+        let id = arguments.id.trim();
+        if id.is_empty() {
+            bail!("cancel_scheduled_task requires a non-empty 'id' argument");
+        }
+
+        if self
+            .database
+            .lock()
+            .await
+            .cancel_scheduled_task(chat_id, id)?
+        {
+            Ok(format!("cancelled scheduled task {id}"))
+        } else {
+            bail!(
+                "no pending scheduled task in this chat matches \"{id}\"; call \
+                 list_scheduled_tasks for the current ids"
+            )
+        }
     }
 
     /// Append a new global memory entry, capped so the system prompt (which carries every stored
@@ -598,6 +700,11 @@ struct CommandArguments {
 #[derive(Deserialize)]
 struct TaskArguments {
     task: String,
+}
+
+#[derive(Deserialize)]
+struct CancelTaskArguments {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -948,6 +1055,118 @@ mod tests {
     fn schedule_task_never_requires_confirmation() {
         let tools = registry(std::env::temp_dir(), Vec::new());
         assert!(!tools.requires_confirmation("schedule_task"));
+    }
+
+    fn schedule_call(prompt: &str, run_at: &str, repeat: Option<i64>) -> ToolCall {
+        let mut arguments = serde_json::json!({ "prompt": prompt, "run_at": run_at });
+        if let Some(repeat) = repeat {
+            arguments["repeat_interval_seconds"] = repeat.into();
+        }
+        ToolCall {
+            id: "1".into(),
+            name: "schedule_task".into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn soon() -> String {
+        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+    }
+
+    #[tokio::test]
+    async fn a_reminder_can_be_listed_and_cancelled_by_the_model() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        tools
+            .dispatch(42, &schedule_call("ping", &soon(), Some(3600)))
+            .await;
+
+        let listed = tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "list_scheduled_tasks".into(),
+                    arguments: "{}".into(),
+                },
+            )
+            .await;
+        assert!(listed.contains("ping"), "{listed}");
+        assert!(listed.contains("repeats every 3600s"), "{listed}");
+
+        let id = listed.split(':').next().unwrap().to_owned();
+        let cancelled = tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "cancel_scheduled_task".into(),
+                    arguments: serde_json::json!({ "id": id }).to_string(),
+                },
+            )
+            .await;
+        assert!(cancelled.starts_with("cancelled"), "{cancelled}");
+
+        let after = tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "list_scheduled_tasks".into(),
+                    arguments: "{}".into(),
+                },
+            )
+            .await;
+        assert_eq!(after, "no pending scheduled tasks");
+    }
+
+    #[tokio::test]
+    async fn cancelling_is_scoped_to_the_asking_chat() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        tools
+            .dispatch(42, &schedule_call("mine", &soon(), None))
+            .await;
+
+        // Another chat must not see it, nor be able to cancel it by guessing a prefix.
+        let listed = tools
+            .dispatch(
+                99,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "list_scheduled_tasks".into(),
+                    arguments: "{}".into(),
+                },
+            )
+            .await;
+        assert_eq!(listed, "no pending scheduled tasks");
+    }
+
+    #[tokio::test]
+    async fn a_per_minute_repeat_is_refused() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+
+        let output = tools
+            .dispatch(42, &schedule_call("spam", &soon(), Some(60)))
+            .await;
+
+        assert!(output.starts_with("Error:"), "{output}");
+        assert!(output.contains("at least 300 seconds"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_chat_cannot_pile_up_unbounded_pending_tasks() {
+        let tools = registry(std::env::temp_dir(), Vec::new());
+        for _ in 0..MAX_PENDING_TASKS {
+            let output = tools
+                .dispatch(42, &schedule_call("ping", &soon(), None))
+                .await;
+            assert!(output.starts_with("scheduled"), "{output}");
+        }
+
+        let output = tools
+            .dispatch(42, &schedule_call("one too many", &soon(), None))
+            .await;
+        assert!(output.starts_with("Error:"), "{output}");
+        assert!(output.contains("cancel_scheduled_task"), "{output}");
     }
 
     #[tokio::test]

@@ -264,14 +264,17 @@ The model may call these tools while answering:
   how many tools Kamui called and any errors, followed by its final answer — instead of the raw
   interleaved stdout of the underlying process.
 - `schedule_task` schedules a prompt for a future time, computed from the user's configured
-  timezone, either once or repeating on a fixed interval (`repeat_interval_seconds`, minimum 60
+  timezone, either once or repeating on a fixed interval (`repeat_interval_seconds`, minimum 300
   seconds). At each scheduled time, Kumo runs the prompt through the same agent loop as a normal
   message — with all the same tools, subject to the same approvals — and delivers the result to the
   chat that scheduled it, prefixed with "⏰ Scheduled task:". A recurring task reschedules itself
   (`run_at` advanced by the interval) on success; if it fails, it is marked failed and not retried
   automatically. Does not require approval to schedule; approval still applies to whatever tools the
-  task itself calls when it runs. Use `/reminders` to list pending tasks for the chat and
-  `/reminders cancel <id>` to cancel one by its (possibly abbreviated) ID.
+  task itself calls when it runs. A chat may hold at most 20 pending tasks.
+- `list_scheduled_tasks` and `cancel_scheduled_task` let the model see and stop what it scheduled,
+  so "stop reminding me" is something it can actually carry out rather than only acknowledge. Both
+  are scoped to the asking chat. `/reminders` and `/reminders cancel <id>` do the same from your
+  side.
 - `remember`, `update_memory`, and `forget` manage permanent, global memory (see Memory below). None
   require approval — they only store or remove text.
 - `ask_user` pauses the turn to ask a clarifying question, with up to 4 suggested answers shown as

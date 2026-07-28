@@ -119,6 +119,7 @@ result.
 - [x] A failed task notifies the chat with the error, not just the terminal log
 - [x] Recurring tasks on a fixed interval, not just one-shot
 - [x] `/reminders` and `/reminders cancel <id>` to list or cancel a pending scheduled task
+- [x] `list_scheduled_tasks`/`cancel_scheduled_task` tools, so the model can stop what it started
 
 This was previously listed under Not Planned, reasoning that "every turn is triggered by an inbound
 message" and a scheduler was a large, separate effort. In practice the scope was smaller than
@@ -178,6 +179,22 @@ handles recurrence with no separate "is this recurring" branch anywhere else. A 
 *fails* is simply marked `failed` like any other — it is not retried or auto-rescheduled, on the
 reasoning that a repeated failure (a broken MCP server, a bad prompt) is more likely to need the
 owner's attention than a silent retry loop.
+
+Recurrence shipped with two gaps that only showed up once it met a real conversation. The model
+could create a recurring task but had no tool to list or cancel one — `/reminders cancel` was a
+human-only command — so when the owner said "stop reminding me", the model answered "I've stopped
+it" and nothing changed. It repeated that answer once a minute for forty minutes, each denial
+itself a fresh agent turn, because the task kept firing. The second gap made the first one worse:
+`MIN_REPEAT_INTERVAL` was 60 seconds, which is not a floor against anything a model would
+plausibly choose — "every minute" is a phrase, and the scheduler will honour it forever.
+
+`list_scheduled_tasks` and `cancel_scheduled_task` close the first gap; both are scoped to the
+asking chat, like the `/reminders` commands they mirror. The floor moves to 300 seconds, still far
+below any real reminder ("hourly", "daily") but no longer a plausible accident. And because a
+scheduled run goes through the same agent loop as a live message, a task can schedule further
+tasks — `MAX_PENDING_TASKS` (20 per chat) bounds what one confused turn can leave behind. The
+system prompt now states plainly that acknowledging a cancellation request without calling the tool
+leaves the task running, because that was precisely the failure.
 
 `/reminders` lists a chat's own pending tasks (`list_scheduled_tasks`, scoped to `telegram_chat_id`
 and ordered by `run_at`) with each task's local run time and, for a recurring one, its interval.
