@@ -441,8 +441,29 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if let Some(argument) = text.strip_prefix("/memory edit ").map(str::trim) {
+        let response = edit_memory_command(&database, argument).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if let Some(argument) = text.strip_prefix("/forget ").map(str::trim) {
         let response = forget_command(&database, argument).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/workspace" {
+        let response = workspace_message(&state, &database, message.chat.id.0).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(argument) = text.strip_prefix("/workspace ").map(str::trim) {
+        let response =
+            set_workspace_command(&state, &database, message.chat.id.0, argument).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if text == "/audit" {
+        let response = audit_message(&database, message.chat.id.0).await?;
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
@@ -623,15 +644,8 @@ async fn handle_document_message(
         return Ok(());
     }
 
-    let workspace = state
-        .read()
-        .await
-        .config
-        .tools
-        .as_ref()
-        .context("tools workspace is not configured")?
-        .workspace
-        .clone();
+    let tools = state.read().await.tools.clone();
+    let workspace = tools.workspace(message.chat.id.0).await?;
     let upload_dir = workspace.join("uploads");
     std::fs::create_dir_all(&upload_dir)?;
     let path = upload_dir.join(format!("{}-{filename}", Uuid::new_v4()));
@@ -743,6 +757,7 @@ async fn with_typing<T>(bot: &Bot, chat_id: ChatId, work: impl Future<Output = T
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     bot: &Bot,
     chat_id: ChatId,
@@ -824,6 +839,13 @@ pub(crate) async fn run_agent(
         trail.push(request_message);
         for call in response.tool_calls {
             let tool_started = Instant::now();
+            database.lock().await.record_audit_event(
+                chat_id.0,
+                "tool_request",
+                Some(&call.name),
+                Some(&call.arguments),
+                "requested",
+            )?;
             logging::info("tool", format!("name={} status=started", call.name));
             let progress = send_tool_progress(bot, chat_id, &call.name).await;
             let output = if call.name == "ask_user" {
@@ -840,18 +862,38 @@ pub(crate) async fn run_agent(
                         Some(preview) => {
                             match request_approval(bot, chat_id, approvals, &preview).await? {
                                 ApprovalOutcome::AllowOnce => {
+                                    database.lock().await.record_audit_event(
+                                        chat_id.0,
+                                        "approval",
+                                        Some(&call.name),
+                                        None,
+                                        "allow_once",
+                                    )?;
                                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
                                         .await
                                 }
                                 ApprovalOutcome::AlwaysAllow => {
-                                    database
-                                        .lock()
-                                        .await
-                                        .always_allow_tool(chat_id.0, &call.name)?;
+                                    let database = database.lock().await;
+                                    database.always_allow_tool(chat_id.0, &call.name)?;
+                                    database.record_audit_event(
+                                        chat_id.0,
+                                        "approval",
+                                        Some(&call.name),
+                                        None,
+                                        "always_allow",
+                                    )?;
+                                    drop(database);
                                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
                                         .await
                                 }
                                 ApprovalOutcome::Deny => {
+                                    database.lock().await.record_audit_event(
+                                        chat_id.0,
+                                        "approval",
+                                        Some(&call.name),
+                                        None,
+                                        "denied",
+                                    )?;
                                     "User denied this command. Do not run it.".to_owned()
                                 }
                             }
@@ -859,11 +901,32 @@ pub(crate) async fn run_agent(
                         None => "Error: invalid command arguments".to_owned(),
                     }
                 } else {
+                    if always_allowed {
+                        database.lock().await.record_audit_event(
+                            chat_id.0,
+                            "approval",
+                            Some(&call.name),
+                            None,
+                            "standing_allow",
+                        )?;
+                    }
                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call)).await
                 }
             };
             let (output, mut tool_images) = mcp::extract_media(output);
-            let failed = output.starts_with("Error:");
+            let failed = output.starts_with("Error:") || output.starts_with("User denied");
+            let result_details = serde_json::json!({
+                "output_chars": output.chars().count(),
+                "images": tool_images.len(),
+            })
+            .to_string();
+            database.lock().await.record_audit_event(
+                chat_id.0,
+                "tool_result",
+                Some(&call.name),
+                Some(&result_details),
+                if failed { "failed" } else { "completed" },
+            )?;
             logging::info(
                 "tool",
                 format!(
@@ -1002,14 +1065,7 @@ async fn status_message(
     chat_id: i64,
 ) -> Result<String> {
     let state = state.read().await;
-    let workspace = state
-        .config
-        .tools
-        .as_ref()
-        .expect("tools are configured before gateway startup")
-        .workspace
-        .display()
-        .to_string();
+    let tools = state.tools.clone();
     let model = match state.config.active_provider_name() {
         Some(name) => format!("{} ({name})", state.provider.active_model()),
         None => state.provider.active_model().to_owned(),
@@ -1021,6 +1077,7 @@ async fn status_message(
         state.mcp_statuses.join("\n")
     };
     drop(state);
+    let workspace = tools.workspace(chat_id).await?.display().to_string();
 
     let database = database.lock().await;
     let session = database.active_session(chat_id)?;
@@ -1130,11 +1187,11 @@ async fn memory_message(database: &Mutex<Database>) -> Result<String> {
     }
     let mut lines = vec!["Remembered facts:".to_owned()];
     for entry in &entries {
-        lines.push(format!("- {}", entry.content));
+        lines.push(format!("- #{} {}", entry.id, entry.content));
     }
     lines.push(String::new());
     lines.push(
-        "Changes here take effect in conversation after Kumo restarts. Use /forget <text> or /forget all."
+        "Changes here take effect in conversation after Kumo restarts. Use /memory edit <id> <fact>, /forget <id>, or /forget all."
             .to_owned(),
     );
     Ok(lines.join("\n"))
@@ -1145,7 +1202,7 @@ async fn memory_message(database: &Mutex<Database>) -> Result<String> {
 async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<String> {
     if argument.is_empty() {
         return Ok(
-            "Usage: /forget <text> or /forget all. Use /memory to list what is remembered."
+            "Usage: /forget <id>, /forget <text>, or /forget all. Use /memory to list IDs."
                 .to_owned(),
         );
     }
@@ -1153,6 +1210,13 @@ async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<St
     if argument.eq_ignore_ascii_case("all") {
         let count = database.clear_memory()?;
         return Ok(format!("Forgot all {count} remembered fact(s)."));
+    }
+    if let Ok(id) = argument.trim_start_matches('#').parse::<i64>() {
+        return Ok(if database.forget_memory_by_id(id)? {
+            format!("Forgot memory #{id}.")
+        } else {
+            format!("Memory #{id} does not exist. Use /memory to list IDs.")
+        });
     }
     match database.forget(argument)? {
         storage::MemoryMatch::One(_) => Ok(format!("Forgot the fact matching \"{argument}\".")),
@@ -1170,6 +1234,91 @@ async fn forget_command(database: &Mutex<Database>, argument: &str) -> Result<St
             Ok(message)
         }
     }
+}
+
+async fn edit_memory_command(database: &Mutex<Database>, argument: &str) -> Result<String> {
+    let Some((id, fact)) = argument.split_once(char::is_whitespace) else {
+        return Ok("Usage: /memory edit <id> <fact>. Use /memory to list IDs.".to_owned());
+    };
+    let Ok(id) = id.trim_start_matches('#').parse::<i64>() else {
+        return Ok("Memory ID must be a number shown by /memory.".to_owned());
+    };
+    let fact = fact.trim();
+    if fact.is_empty() {
+        return Ok("The replacement fact cannot be empty.".to_owned());
+    }
+    Ok(if database.lock().await.update_memory_by_id(id, fact)? {
+        format!("Updated memory #{id}. Restart Kumo for it to affect conversations.")
+    } else {
+        format!("Memory #{id} does not exist. Use /memory to list IDs.")
+    })
+}
+
+async fn workspace_message(
+    state: &RwLock<AppState>,
+    database: &Mutex<Database>,
+    chat_id: i64,
+) -> Result<String> {
+    let override_path = database.lock().await.workspace_for_chat(chat_id)?;
+    let tools = state.read().await.tools.clone();
+    let active = tools.workspace(chat_id).await?;
+    let source = if override_path.is_some() {
+        "chat override"
+    } else {
+        "default"
+    };
+    Ok(format!(
+        "Workspace ({source}): {}\n\nUse /workspace <path> to change it or /workspace reset to use the default.",
+        active.display()
+    ))
+}
+
+async fn set_workspace_command(
+    state: &RwLock<AppState>,
+    database: &Mutex<Database>,
+    chat_id: i64,
+    argument: &str,
+) -> Result<String> {
+    if argument.eq_ignore_ascii_case("reset") {
+        database.lock().await.clear_workspace_for_chat(chat_id)?;
+        let tools = state.read().await.tools.clone();
+        let active = tools.workspace(chat_id).await?;
+        return Ok(format!("Workspace reset to default: {}", active.display()));
+    }
+    let path = match std::path::PathBuf::from(argument).canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(format!("Workspace does not exist: {argument}")),
+    };
+    if !path.is_dir() {
+        return Ok(format!("Workspace is not a directory: {}", path.display()));
+    }
+    database
+        .lock()
+        .await
+        .set_workspace_for_chat(chat_id, &path)?;
+    Ok(format!("Workspace for this chat: {}", path.display()))
+}
+
+async fn audit_message(database: &Mutex<Database>, chat_id: i64) -> Result<String> {
+    let events = database.lock().await.list_audit_events(chat_id, 20)?;
+    if events.is_empty() {
+        return Ok("No audit events for this chat yet.".to_owned());
+    }
+    let mut lines = vec!["Recent audit events:".to_owned()];
+    for event in events {
+        let at = chrono::DateTime::from_timestamp(event.created_at, 0)
+            .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| event.created_at.to_string());
+        let tool = event
+            .tool_name
+            .map(|name| format!(" {name}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- #{} {at} {}{tool}: {}",
+            event.id, event.event_type, event.outcome
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// `/reminders`: list this chat's pending scheduled tasks (one-shot and recurring), with the
@@ -1907,6 +2056,7 @@ async fn print_status() -> Result<()> {
         summary.pending_scheduled_tasks
     );
     println!("Remembered facts:        {}", summary.memory_entries);
+    println!("Audit events:            {}", summary.audit_events);
 
     Ok(())
 }
@@ -2048,7 +2198,7 @@ fn print_help() {
     println!("  kumo onboard    Configure the model provider and workspace");
     println!("  kumo status     Show configuration and storage status, no Telegram connection");
     println!("  kumo doctor     Check configuration, provider, MCP servers, and dependencies");
-    println!("  kumo enable     Install as a user service that starts on login (Linux/macOS only)");
+    println!("  kumo enable     Install as a user service that starts on login");
     println!("  kumo disable    Remove the user service installed by `kumo enable`");
     println!("  kumo --help     Show this help");
     println!("  kumo --version  Print the version");
@@ -2244,9 +2394,11 @@ mod tests {
     fn render_memory_snapshot_lists_every_fact() {
         let entries = vec![
             storage::MemoryEntry {
+                id: 1,
                 content: "The user is a researcher.".to_owned(),
             },
             storage::MemoryEntry {
+                id: 2,
                 content: "Prefers concise answers.".to_owned(),
             },
         ];

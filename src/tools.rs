@@ -47,7 +47,7 @@ const MAX_AMBIGUOUS_FACT_CHARS: usize = 120;
 
 #[derive(Clone)]
 pub struct ToolRegistry {
-    root: PathBuf,
+    default_root: PathBuf,
     extra: Vec<Arc<dyn ExternalTool>>,
     database: Arc<Mutex<Database>>,
     timezone: chrono_tz::Tz,
@@ -76,7 +76,7 @@ impl ToolRegistry {
             bail!("workspace is not a directory: {}", root.display());
         }
         Ok(Self {
-            root,
+            default_root: root,
             extra,
             database,
             timezone,
@@ -329,11 +329,28 @@ impl ToolRegistry {
     /// Dispatch a tool call made while answering `chat_id`. Only `schedule_task` needs the chat
     /// ID today (to know where to deliver the result later); every other tool ignores it.
     pub async fn dispatch(&self, chat_id: i64, call: &ToolCall) -> String {
+        let root = if matches!(
+            call.name.as_str(),
+            "read_file" | "list_directory" | "run_command" | "delegate_to_kamui"
+        ) {
+            match self.workspace(chat_id).await {
+                Ok(root) => Some(root),
+                Err(error) => return format!("Error: {error:#}"),
+            }
+        } else {
+            None
+        };
         let result = match call.name.as_str() {
-            "read_file" => self.read_file(&call.arguments),
-            "list_directory" => self.list_directory(&call.arguments),
-            "run_command" => self.run_command(&call.arguments).await,
-            "delegate_to_kamui" => self.delegate_to_kamui(&call.arguments).await,
+            "read_file" => self.read_file(root.as_deref().unwrap(), &call.arguments),
+            "list_directory" => self.list_directory(root.as_deref().unwrap(), &call.arguments),
+            "run_command" => {
+                self.run_command(root.as_deref().unwrap(), &call.arguments)
+                    .await
+            }
+            "delegate_to_kamui" => {
+                self.delegate_to_kamui(root.as_deref().unwrap(), &call.arguments)
+                    .await
+            }
             "schedule_task" => self.schedule_task(chat_id, &call.arguments).await,
             "list_scheduled_tasks" => self.list_scheduled_tasks(chat_id).await,
             "cancel_scheduled_task" => self.cancel_scheduled_task(chat_id, &call.arguments).await,
@@ -348,10 +365,22 @@ impl ToolRegistry {
         result.unwrap_or_else(|error| format!("Error: {error:#}"))
     }
 
-    fn read_file(&self, arguments: &str) -> Result<String> {
+    pub async fn workspace(&self, chat_id: i64) -> Result<PathBuf> {
+        let configured = self.database.lock().await.workspace_for_chat(chat_id)?;
+        let root = configured.unwrap_or_else(|| self.default_root.clone());
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("could not resolve workspace {}", root.display()))?;
+        if !root.is_dir() {
+            bail!("workspace is not a directory: {}", root.display());
+        }
+        Ok(root)
+    }
+
+    fn read_file(&self, root: &Path, arguments: &str) -> Result<String> {
         let arguments: PathArguments =
             serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
-        let path = self.resolve(&arguments.path)?;
+        let path = Self::resolve(root, &arguments.path)?;
         let metadata = std::fs::metadata(&path)
             .with_context(|| format!("could not inspect {}", path.display()))?;
         if !metadata.is_file() {
@@ -364,10 +393,10 @@ impl ToolRegistry {
             .with_context(|| format!("could not read UTF-8 file {}", arguments.path))
     }
 
-    fn list_directory(&self, arguments: &str) -> Result<String> {
+    fn list_directory(&self, root: &Path, arguments: &str) -> Result<String> {
         let arguments: PathArguments =
             serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
-        let path = self.resolve(&arguments.path)?;
+        let path = Self::resolve(root, &arguments.path)?;
         if !path.is_dir() {
             bail!("path is not a directory: {}", arguments.path);
         }
@@ -391,23 +420,22 @@ impl ToolRegistry {
         Ok(entries.join("\n"))
     }
 
-    fn resolve(&self, relative: &str) -> Result<PathBuf> {
+    fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
         let relative = Path::new(relative);
         if relative.is_absolute() {
             bail!("path must be relative to the workspace");
         }
-        let path = self
-            .root
+        let path = root
             .join(relative)
             .canonicalize()
             .with_context(|| format!("path does not exist: {relative:?}"))?;
-        if !path.starts_with(&self.root) {
+        if !path.starts_with(root) {
             bail!("path escapes the configured workspace");
         }
         Ok(path)
     }
 
-    async fn run_command(&self, arguments: &str) -> Result<String> {
+    async fn run_command(&self, root: &Path, arguments: &str) -> Result<String> {
         let command = parse_command(arguments)?;
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/C")
@@ -417,7 +445,7 @@ impl ToolRegistry {
         let child = tokio::process::Command::new(shell)
             .arg(flag)
             .arg(&command)
-            .current_dir(&self.root)
+            .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -441,13 +469,13 @@ impl ToolRegistry {
     /// in the configured workspace. Kumo already gated this call on Telegram approval before
     /// dispatch, so Kamui's own tool approvals are bypassed with `--auto-approve` rather than
     /// asking twice for the same task.
-    async fn delegate_to_kamui(&self, arguments: &str) -> Result<String> {
+    async fn delegate_to_kamui(&self, root: &Path, arguments: &str) -> Result<String> {
         let task = parse_task(arguments)?;
         let child = tokio::process::Command::new("kamui")
             .arg("-p")
             .arg(&task)
             .arg("--auto-approve")
-            .current_dir(&self.root)
+            .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -919,6 +947,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uses_a_chat_specific_workspace_override() {
+        let default_root = workspace();
+        let override_root = workspace();
+        std::fs::write(override_root.join("hello.txt"), "override").unwrap();
+        let database = test_database();
+        database
+            .lock()
+            .await
+            .set_workspace_for_chat(42, &override_root)
+            .unwrap();
+        let tools =
+            ToolRegistry::new(default_root.clone(), Vec::new(), database, chrono_tz::UTC).unwrap();
+
+        let read = || ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"hello.txt"}"#.into(),
+        };
+        assert_eq!(tools.dispatch(42, &read()).await, "override");
+        assert_eq!(tools.dispatch(99, &read()).await, "hello");
+
+        std::fs::remove_dir_all(default_root).unwrap();
+        std::fs::remove_dir_all(override_root).unwrap();
     }
 
     #[tokio::test]

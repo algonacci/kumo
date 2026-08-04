@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 6;
+const CURRENT_VERSION: i64 = 7;
 
 pub struct Database {
     connection: Connection,
@@ -47,7 +47,16 @@ pub struct SessionSummary {
 }
 
 pub struct MemoryEntry {
+    pub id: i64,
     pub content: String,
+}
+
+pub struct AuditEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub tool_name: Option<String>,
+    pub outcome: String,
+    pub created_at: i64,
 }
 
 /// The outcome of resolving a memory substring. `update_memory` and `forget` act only on `One`;
@@ -65,6 +74,7 @@ pub struct StorageSummary {
     pub session_count: i64,
     pub pending_scheduled_tasks: i64,
     pub memory_entries: i64,
+    pub audit_events: i64,
 }
 
 impl Database {
@@ -104,6 +114,9 @@ impl Database {
         }
         if version < 6 {
             migrate_to_v6(&connection)?;
+        }
+        if version < 7 {
+            migrate_to_v7(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -335,10 +348,11 @@ impl Database {
     pub fn list_memory(&self) -> Result<Vec<MemoryEntry>> {
         let mut statement = self
             .connection
-            .prepare("SELECT content FROM memory ORDER BY id")?;
+            .prepare("SELECT id, content FROM memory ORDER BY id")?;
         let rows = statement.query_map([], |row| {
             Ok(MemoryEntry {
-                content: row.get(0)?,
+                id: row.get(0)?,
+                content: row.get(1)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -403,6 +417,13 @@ impl Database {
         Ok(matched)
     }
 
+    pub fn update_memory_by_id(&self, id: i64, new_content: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE memory SET content = ?2, updated_at = unixepoch() WHERE id = ?1",
+            params![id, new_content],
+        )? > 0)
+    }
+
     /// Delete an unambiguous entry matched by a case-insensitive substring. Same ambiguity
     /// handling as `update_memory`.
     pub fn forget(&self, substring: &str) -> Result<MemoryMatch> {
@@ -412,6 +433,78 @@ impl Database {
                 .execute("DELETE FROM memory WHERE id = ?1", [id])?;
         }
         Ok(matched)
+    }
+
+    pub fn forget_memory_by_id(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM memory WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    pub fn workspace_for_chat(&self, chat_id: i64) -> Result<Option<PathBuf>> {
+        self.connection
+            .query_row(
+                "SELECT workspace FROM chat_workspaces WHERE telegram_chat_id = ?1",
+                [chat_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|workspace| workspace.map(PathBuf::from))
+            .map_err(Into::into)
+    }
+
+    pub fn set_workspace_for_chat(&self, chat_id: i64, workspace: &std::path::Path) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO chat_workspaces (telegram_chat_id, workspace) VALUES (?1, ?2)
+             ON CONFLICT(telegram_chat_id) DO UPDATE SET
+                 workspace = excluded.workspace, updated_at = unixepoch()",
+            params![chat_id, workspace.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_workspace_for_chat(&self, chat_id: i64) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM chat_workspaces WHERE telegram_chat_id = ?1",
+            [chat_id],
+        )? > 0)
+    }
+
+    pub fn record_audit_event(
+        &self,
+        chat_id: i64,
+        event_type: &str,
+        tool_name: Option<&str>,
+        details: Option<&str>,
+        outcome: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO audit_events
+             (telegram_chat_id, event_type, tool_name, details, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_id, event_type, tool_name, details, outcome],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_audit_events(&self, chat_id: i64, limit: usize) -> Result<Vec<AuditEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, event_type, tool_name, outcome, created_at
+             FROM audit_events WHERE telegram_chat_id = ?1
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![chat_id, i64::try_from(limit)?], |row| {
+            Ok(AuditEvent {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                tool_name: row.get(2)?,
+                outcome: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Delete every memory entry (used by the `/forget all` Telegram command).
@@ -435,10 +528,14 @@ impl Database {
         let memory_entries =
             self.connection
                 .query_row("SELECT COUNT(*) FROM memory", [], |row| row.get(0))?;
+        let audit_events =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))?;
         Ok(StorageSummary {
             session_count,
             pending_scheduled_tasks,
             memory_entries,
+            audit_events,
         })
     }
 
@@ -810,6 +907,32 @@ fn migrate_to_v6(connection: &Connection) -> Result<()> {
              PRIMARY KEY (telegram_chat_id, tool_name)
          );
          PRAGMA user_version = 6;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Adds per-chat workspace overrides and a structured tool trail independent of session history.
+fn migrate_to_v7(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE chat_workspaces (
+             telegram_chat_id INTEGER PRIMARY KEY,
+             workspace TEXT NOT NULL,
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE audit_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             telegram_chat_id INTEGER NOT NULL,
+             event_type TEXT NOT NULL,
+             tool_name TEXT,
+             details TEXT,
+             outcome TEXT NOT NULL,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE INDEX audit_events_chat_time
+             ON audit_events(telegram_chat_id, created_at DESC, id DESC);
+         PRAGMA user_version = 7;
          COMMIT;",
     )?;
     Ok(())
@@ -1556,5 +1679,81 @@ mod tests {
         database.always_allow_tool(42, "run_command").unwrap();
         database.always_allow_tool(42, "run_command").unwrap();
         assert!(database.is_tool_always_allowed(42, "run_command").unwrap());
+    }
+
+    #[test]
+    fn memory_can_be_updated_and_deleted_by_stable_id() {
+        let database = database();
+        let id = database.remember("old fact").unwrap();
+
+        assert!(database.update_memory_by_id(id, "new fact").unwrap());
+        let entries = database.list_memory().unwrap();
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].content, "new fact");
+        assert!(database.forget_memory_by_id(id).unwrap());
+        assert!(!database.forget_memory_by_id(id).unwrap());
+    }
+
+    #[test]
+    fn workspace_overrides_are_scoped_to_chat_and_resettable() {
+        let database = database();
+        let path = PathBuf::from("/tmp/project-a");
+
+        database.set_workspace_for_chat(42, &path).unwrap();
+        assert_eq!(database.workspace_for_chat(42).unwrap(), Some(path));
+        assert_eq!(database.workspace_for_chat(99).unwrap(), None);
+        assert!(database.clear_workspace_for_chat(42).unwrap());
+        assert_eq!(database.workspace_for_chat(42).unwrap(), None);
+    }
+
+    #[test]
+    fn audit_events_survive_session_deletion() {
+        let mut database = database();
+        let session_id = database
+            .save_turn(
+                42,
+                "model-a",
+                &[Message::user("run it"), Message::assistant("done")],
+                &Usage::default(),
+                "stop",
+            )
+            .unwrap();
+        database
+            .record_audit_event(
+                42,
+                "tool_request",
+                Some("run_command"),
+                Some(r#"{"command":"cargo test"}"#),
+                "requested",
+            )
+            .unwrap();
+
+        database.delete_session(&session_id).unwrap();
+
+        let events = database.list_audit_events(42, 20).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name.as_deref(), Some("run_command"));
+        assert_eq!(events[0].outcome, "requested");
+    }
+
+    #[test]
+    fn migration_to_v7_adds_workspace_and_audit_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        migrate_to_v2(&connection).unwrap();
+        migrate_to_v3(&connection).unwrap();
+        migrate_to_v4(&connection).unwrap();
+        migrate_to_v5(&connection).unwrap();
+        migrate_to_v6(&connection).unwrap();
+        migrate_to_v7(&connection).unwrap();
+
+        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        database
+            .set_workspace_for_chat(42, std::path::Path::new("/tmp/project"))
+            .unwrap();
+        database
+            .record_audit_event(42, "approval", Some("run_command"), None, "denied")
+            .unwrap();
+        assert_eq!(database.list_audit_events(42, 10).unwrap().len(), 1);
     }
 }

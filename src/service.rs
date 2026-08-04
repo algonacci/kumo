@@ -1,22 +1,14 @@
 //! `kumo enable`/`kumo disable`: register (or remove) Kumo as a user-level background service that
 //! starts automatically on login and restarts if it crashes, using each OS's native service
-//! manager — a systemd user unit on Linux, a launchd user agent on macOS. Deliberately scoped to
+//! manager — a systemd user unit on Linux, a launchd user agent on macOS, or an on-logon Task
+//! Scheduler task on Windows. Deliberately scoped to
 //! the current user (no root/admin privileges needed) since Kumo is a personal, single-user tool,
 //! not a system service shared across accounts.
-//!
-//! Windows has no equivalent here (see `kumo::daemon` for why `start`/`stop` still work there):
-//! registering a proper auto-start-on-boot mechanism means either a Windows Service (which needs
-//! an installer, admin rights, and a different process model entirely — `kumo run` was never
-//! written to implement the Service Control Manager's start/stop protocol) or Task Scheduler XML.
-//! Neither is worth the added complexity without a concrete need, so `enable`/`disable` on Windows
-//! just explain that and point at `kumo start` instead.
 
 #[cfg(unix)]
 use std::path::PathBuf;
 
-use anyhow::Result;
-#[cfg(unix)]
-use anyhow::{Context, bail};
+use anyhow::{Context, Result, bail};
 
 /// The `PATH` a service-managed Kumo should run with, captured from the shell running `kumo
 /// enable`. Neither systemd nor launchd inherits a login shell's environment, so their default
@@ -242,18 +234,58 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
 
 #[cfg(windows)]
 pub fn enable() -> Result<()> {
-    println!(
-        "kumo enable is not supported on Windows: registering a proper start-on-boot service \
-         (a Windows Service, or a Task Scheduler task) is significantly more involved than the \
-         systemd/launchd equivalents and isn't implemented yet."
-    );
-    println!("Use `kumo start` to run Kumo in the background for this login session instead.");
+    let exe = std::env::current_exe().context("could not determine the kumo executable path")?;
+    let action = windows_task_action(&exe.to_string_lossy());
+    run_schtasks(&[
+        "/Create",
+        "/TN",
+        WINDOWS_TASK_NAME,
+        "/SC",
+        "ONLOGON",
+        "/TR",
+        &action,
+        "/RL",
+        "LIMITED",
+        "/F",
+    ])?;
+    run_schtasks(&["/Run", "/TN", WINDOWS_TASK_NAME])?;
+    println!("Kumo installed as a Windows scheduled task and started.");
+    println!("Task: {WINDOWS_TASK_NAME}");
     Ok(())
 }
 
 #[cfg(windows)]
 pub fn disable() -> Result<()> {
-    println!("Kumo has no Windows auto-start service to disable (see `kumo enable`).");
+    let query = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", WINDOWS_TASK_NAME])
+        .status()
+        .context("failed to run schtasks")?;
+    if !query.success() {
+        println!("Kumo is not installed as a Windows scheduled task.");
+        return Ok(());
+    }
+    run_schtasks(&["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])?;
+    println!("Kumo's Windows scheduled task was removed.");
+    Ok(())
+}
+
+#[cfg(windows)]
+const WINDOWS_TASK_NAME: &str = "Kumo Personal Agent";
+
+#[cfg(any(windows, test))]
+fn windows_task_action(exe: &str) -> String {
+    format!("\"{exe}\" run")
+}
+
+#[cfg(windows)]
+fn run_schtasks(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("schtasks")
+        .args(args)
+        .status()
+        .context("failed to run schtasks (is Task Scheduler available?)")?;
+    if !status.success() {
+        bail!("schtasks {} failed", args.join(" "));
+    }
     Ok(())
 }
 
@@ -263,6 +295,7 @@ mod tests {
     use super::launchd_plist;
     #[cfg(target_os = "linux")]
     use super::systemd_unit;
+    use super::windows_task_action;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -312,5 +345,13 @@ mod tests {
 
         assert!(!unit.contains("Environment="));
         assert!(unit.contains("Restart=on-failure\n"));
+    }
+
+    #[test]
+    fn windows_task_action_quotes_an_executable_path() {
+        assert_eq!(
+            windows_task_action(r"C:\Program Files\Kumo\kumo.exe"),
+            r#""C:\Program Files\Kumo\kumo.exe" run"#
+        );
     }
 }

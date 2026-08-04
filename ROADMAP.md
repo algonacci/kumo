@@ -265,9 +265,9 @@ on would misrepresent who is holding up the turn.
 ## Phase 4b: Memory
 
 - [x] `remember`/`update_memory`/`forget` tools: global facts, not scoped to any session or chat
-- [x] `/memory` and `/forget <text>`/`/forget all` Telegram commands
+- [x] `/memory`, `/memory edit <id> <fact>`, and `/forget <id|text|all>` Telegram commands
 - [x] 4 KiB cap on total stored memory, enforced by `remember`
-- [x] A way to correct an ambiguous match without knowing the exact stored wording
+- [x] Stable IDs for direct correction/deletion, plus actionable ambiguous substring results
 
 This was directly inspired by Hermes Agent's memory feature, but deliberately built as a much
 smaller slice of it. Hermes runs a background LLM review after every turn to auto-extract lessons
@@ -420,8 +420,8 @@ API key or a broken MCP server command is invisible to a check that only reads `
 
 - [x] `kumo start`/`stop`/`restart`: detached background process, matching Kamui's release
       pipeline in spirit but adding a process-management layer Kamui (a one-shot CLI) never needed
-- [x] `kumo enable`/`disable`: systemd user unit (Linux) / launchd agent (macOS), auto-restart on
-      crash, no root/admin required
+- [x] `kumo enable`/`disable`: systemd user unit (Linux), launchd agent (macOS), or an on-logon
+      Windows Task Scheduler task, no root/admin required
 - [x] `kumo status` detects a service-managed instance, not just one started by `kumo start`
 - [x] Prebuilt binaries for Windows, Linux (x64/ARM64), and macOS (Intel/Apple Silicon), plus
       `install.sh`/`install.ps1` — copied from Kamui's release workflow and installers with only
@@ -447,15 +447,13 @@ terminal; `DETACHED_PROCESS` on Windows so it has no console at all). `kumo stop
 signal Kumo's own `Ctrl+C` handler already reacts to, waiting up to 10 seconds for a graceful exit
 before escalating to a hard kill.
 
-`kumo enable`/`disable` go one step further: not just "runs in the background until you stop it or
-reboot," but "starts automatically on login and restarts itself if it crashes," using each OS's
-own service manager rather than reinventing one. Both are deliberately user-scoped (a systemd user
-unit, a launchd *agent* rather than a system daemon) since Kumo is explicitly a personal,
-single-user tool — no root or admin privileges are needed to install or remove either one. Windows
-has no equivalent shipped: a proper one means either a Windows Service (its own installer, a
-different process model `kumo run` was never written to implement — the Service Control Manager's
-start/stop protocol) or a Task Scheduler XML task, and neither was worth the complexity without a
-concrete need; `kumo start` still works fine there, just without the "restarts on boot" part.
+`kumo enable`/`disable` go one step further: the gateway starts automatically on login using each
+OS's own service manager. Every installation is deliberately user-scoped (a systemd user unit, a
+launchd *agent*, or a Windows `ONLOGON` Task Scheduler task) since Kumo is explicitly a personal,
+single-user tool — no root or admin privileges are needed. Linux and macOS also configure restart
+after a crash. Windows uses Task Scheduler rather than a Windows Service because `kumo run` does
+not implement the Service Control Manager protocol; the task starts on login and can still be
+managed immediately with `kumo start`/`stop`.
 
 Neither generated unit inherits a login shell's environment, which is fine for Kumo itself (an
 absolute `ExecStart` path) but not for the MCP servers it spawns: `uv`, `npx`, and `node` usually
@@ -538,25 +536,24 @@ that is over budget because of its tools will stay over budget however much hist
 ## Phase 5: Gateway Hardening
 
 - [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
-- [ ] Per-chat workspace selection (today one `workspace: PathBuf` serves the whole process)
+- [x] Per-chat workspace selection (`/workspace <path>` with a SQLite-backed chat override)
 - [x] Per-tool MCP trust (`trusted_tools`, alongside the existing all-or-nothing `trusted`)
-- [ ] A tool record that outlives the session it belongs to (narrowed from "structured audit log")
+- [x] A tool record that outlives the session it belongs to (`audit_events`, visible via `/audit`)
 
-Each of these is a real seam already visible in the code (`owner_user_id: u64` is a scalar;
-`ToolsConfig.workspace` is a single path) but none of them should be built ahead of an actual need.
-Kumo is explicitly a *personal* gateway — multi-user support only matters if you actually want a
-second person to reach it, and per-chat workspaces only matter once a single Telegram account is
-used for more than one project. Don't build these speculatively; this phase exists so the seams are
-named, not so they get filled on a schedule.
+These began as seams visible in the code rather than a mandate to fill every one. Multi-user support
+is still deliberately open because Kumo remains a personal gateway. Per-chat workspaces became
+concrete once one Telegram owner needed to move between projects: the onboarding workspace remains
+the default, while `chat_workspaces` stores only overrides and the tool registry resolves the root
+at dispatch time. That also makes scheduled tasks and uploads follow the chat's current selection.
 
 The audit log item was narrowed after looking at how Kamui answers the same question: it lists
 "tool audit trail" as *done*, satisfied entirely by persisting each tool request and result as part
 of the turn. Kumo's `save_turn` already does exactly that, so most of what a separate audit
-subsystem would record is recorded. The one thing that is genuinely missing is durability against
+subsystem would record was already recorded. The one genuinely missing property was durability against
 the user's own commands: `/delete` drops a session and, by `ON DELETE CASCADE`, every tool call it
-contained. So the open item is not "build an audit log" but "keep the tool record when the
-conversation it belonged to is deleted" — a much smaller question, and one worth answering only if
-losing that history ever actually matters.
+contained. `audit_events` now keeps requests, approval outcomes, and compact result metadata outside
+that cascade. It deliberately does not duplicate full tool output; conversation history remains the
+detailed record while `/audit` provides the durable operational trail.
 
 Per-tool trust is the one that stopped being speculative: a single MCP server can advertise both
 `get_price` and `send_email`, and one `trusted` flag forces a choice between confirming harmless

@@ -110,16 +110,15 @@ To have Kumo start automatically when you log in — not just "stays running unt
 install it as a user-level service:
 
 ```sh
-kumo enable     # installs and starts it (systemd on Linux, launchd on macOS)
+kumo enable     # installs and starts it (systemd, launchd, or Windows Task Scheduler)
 kumo disable    # stops it and removes the service
 ```
 
 This uses each OS's native service manager, scoped to your user account (no root/admin needed): a
-systemd user unit at `~/.config/systemd/user/kumo.service` on Linux, or a launchd agent at
-`~/Library/LaunchAgents/com.kumo.agent.plist` on macOS. Both restart Kumo automatically if it
-crashes. **Not supported on Windows** — a proper equivalent means either a Windows Service or a
-Task Scheduler task, both a fair bit more involved than systemd/launchd and not implemented; use
-`kumo start` each session there instead. Note that on Linux, a systemd *user* service normally only
+systemd user unit at `~/.config/systemd/user/kumo.service` on Linux, a launchd agent at
+`~/Library/LaunchAgents/com.kumo.agent.plist` on macOS, or an `ONLOGON` Task Scheduler task on
+Windows. Linux and macOS also restart Kumo automatically if it crashes. Note that on Linux, a
+systemd *user* service normally only
 runs while you're logged in — to have it start even before login, run
 `sudo loginctl enable-linger $USER` once (`kumo enable` prints this same reminder).
 
@@ -161,7 +160,12 @@ status if anything failed, so it's usable as a pre-flight check in a script.
   ID prefix (as shown by `/sessions`).
 - `/delete <id>` permanently deletes a session and its messages.
 - `/memory` lists every fact Kumo currently remembers about you (see Memory below).
-- `/forget <text>` or `/forget all` removes one or all remembered facts.
+- `/memory edit <id> <fact>` updates one remembered fact by the ID shown by `/memory`.
+- `/forget <id>`, `/forget <text>`, or `/forget all` removes one or all remembered facts.
+- `/workspace` shows this chat's active workspace; `/workspace <path>` overrides it and
+  `/workspace reset` returns to the configured default.
+- `/audit` shows the latest tool and approval events for this chat independently of session
+  history.
 - `/model` shows the active model.
 - `/models` lists the cached model list, with each model's context window where the provider
   reports one.
@@ -334,8 +338,11 @@ the process, so **a change made mid-conversation only takes effect after Kumo re
 keeps the prompt stable within a running process rather than changing underneath an in-progress
 turn.
 
-- `/memory` shows everything currently stored on disk (this reads the database directly, so it can
+- `/memory` shows everything currently stored on disk with a stable numeric ID (this reads the
+  database directly, so it can
   briefly show a fact a live conversation doesn't know about yet, until the next restart).
+- `/memory edit <id> <fact>` replaces an entry without relying on text matching.
+- `/forget <id>` removes an entry by ID.
 - `/forget <text>` removes one fact matched by an unambiguous substring of its exact wording.
 - `/forget all` clears everything.
 
@@ -346,6 +353,18 @@ matches more than one stored fact, and list the facts it matched so the next att
 wording unique to one of them rather than guessing.
 Total stored memory is capped at 4 KiB, since every byte of it is sent with every request; once
 full, `remember` refuses new facts until something is consolidated or removed.
+
+## Per-chat workspaces and audit
+
+The workspace chosen during onboarding remains the default. A Telegram chat can select a different
+existing directory with `/workspace <path>` without restarting Kumo; file tools, commands, Kamui
+delegation, uploads, and scheduled tasks from that chat all use the override. `/workspace reset`
+returns that chat to the default.
+
+Kumo stores tool requests, approval decisions, and compact result metadata in `audit_events`.
+These local SQLite records survive `/delete`; `/audit` shows the newest 20 for the current chat.
+Tool arguments are retained, but tool output is not duplicated into the audit table (only its
+character count and image count are stored).
 
 ## MCP servers
 
