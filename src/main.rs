@@ -1,3 +1,4 @@
+mod commands;
 mod compaction;
 mod config;
 mod daemon;
@@ -20,7 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use config::Config;
-use provider::{ImageAttachment, Message as ProviderMessage, Provider, Usage};
+use provider::{ImageAttachment, Message as ProviderMessage, ModelProvider, Provider, Usage};
 use storage::Database;
 use teloxide::{
     dispatching::Dispatcher,
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 pub(crate) struct AppState {
     config: Config,
-    provider: Provider,
+    provider: Arc<dyn ModelProvider>,
     tools: ToolRegistry,
     mcp_statuses: Vec<String>,
     /// A frozen-at-startup rendering of every remembered fact, appended to the system prompt for
@@ -70,7 +71,7 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// has to keep saying so.
 const TYPING_REFRESH: Duration = Duration::from_secs(4);
 const MAX_APPROVAL_PREVIEW_CHARS: usize = 3500;
-const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. Prefer a specialized MCP tool whenever one directly supports the requested capability; do not recreate that capability with delegate_to_kamui, run_command, or an ad hoc script. When an MCP tool returns image content, the gateway delivers it to the chat automatically, so describe the result briefly and never fabricate a Markdown download link to a local path. You may inspect the configured workspace with read-only tools. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Never claim a command ran unless its tool result confirms it. Use delegate_to_kamui only for genuine coding tasks that require reading or editing a codebase, not for generating an artifact already supported by an MCP tool. For coding tasks, prefer delegate_to_kamui over run_command because it runs a dedicated coding agent with a proper diff-reviewed file editor. When the user asks to stop, change, or remove a reminder, call list_scheduled_tasks and then cancel_scheduled_task: a scheduled task keeps running until it is cancelled, so acknowledging the request without cancelling leaves it firing. Never schedule a task in order to remember not to do something.";
+const SYSTEM_PROMPT: &str = "You are Kumo, a personal assistant running on the user's host. Prefer a specialized MCP tool whenever one directly supports the requested capability; do not recreate that capability with delegate_to_kamui, run_command, or an ad hoc script. When an MCP tool returns image content, the gateway delivers it to the chat automatically, so describe the result briefly and never fabricate a Markdown download link to a local path. You may inspect the configured workspace with read-only tools. For multi-step workspace investigation that would consume several tool rounds, use delegate_readonly so only its final answer enters this conversation. You may request shell commands when needed, but every command requires explicit user approval before Kumo executes it. Set run_command background=true for builds, tests, or other commands likely to exceed 30 seconds; use command_status or stop_command to manage those jobs. Never claim a command ran unless its tool result confirms it. Use delegate_to_kamui only for genuine coding tasks that require reading or editing a codebase, not for generating an artifact already supported by an MCP tool. For coding tasks, prefer delegate_to_kamui over run_command because it runs a dedicated coding agent with a proper diff-reviewed file editor. When the user asks to stop, change, or remove a reminder, call list_scheduled_tasks and then cancel_scheduled_task: a scheduled task keeps running until it is cancelled, so acknowledging the request without cancelling leaves it firing. Never schedule a task in order to remember not to do something.";
 /// A user's answer to an approval prompt. `AlwaysAllow` is distinct from `AllowOnce`: it also
 /// grants the calling tool blanket approval for the rest of this conversation (see
 /// `Database::always_allow_tool`), not just this one call.
@@ -163,7 +164,7 @@ async fn run_gateway(config: Config) -> Result<()> {
     );
     let bot = Bot::new(config.telegram.bot_token.clone());
     let allowed_user_id = config.telegram.owner_user_id;
-    let provider = Provider::new(config.provider()?.clone());
+    let provider: Arc<dyn ModelProvider> = Arc::new(Provider::new(config.provider()?.clone()));
     let workspace = config
         .tools
         .as_ref()
@@ -214,9 +215,18 @@ async fn run_gateway(config: Config) -> Result<()> {
             format!("recovered_tasks={reset_count} reason=previous_shutdown"),
         );
     }
+    let interrupted_jobs = database.fail_interrupted_command_jobs()?;
+    if interrupted_jobs > 0 {
+        logging::warn(
+            "jobs",
+            format!("failed_jobs={interrupted_jobs} reason=previous_shutdown"),
+        );
+    }
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     let database = Arc::new(Mutex::new(database));
-    let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?;
+    let rtk_enabled = config.tools.as_ref().is_some_and(|tools| tools.rtk);
+    let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?
+        .with_rtk(rtk_enabled);
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let questions: PendingQuestions = Arc::new(Mutex::new(HashMap::new()));
@@ -467,6 +477,22 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if text == "/jobs" {
+        let response = jobs_message(&database, message.chat.id.0).await?;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+    if let Some(id) = text.strip_prefix("/jobs stop ").map(str::trim) {
+        let tools = state.read().await.tools.clone();
+        let call = provider::ToolCall {
+            id: "telegram-jobs".to_owned(),
+            name: "stop_command".to_owned(),
+            arguments: serde_json::json!({ "id": id }).to_string(),
+        };
+        let response = tools.dispatch(message.chat.id.0, &call).await;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
     if text == "/reminders" {
         let response = reminders_message(&database, &state, message.chat.id.0).await?;
         bot.send_message(message.chat.id, response).await?;
@@ -523,6 +549,50 @@ async fn handle_message(
         bot.send_message(message.chat.id, response).await?;
         return Ok(());
     }
+    if text == "/rtk" {
+        let enabled = state.read().await.tools.rtk_enabled();
+        bot.send_message(
+            message.chat.id,
+            format!(
+                "RTK command compression: {}. Use /rtk on or /rtk off.",
+                if enabled { "on" } else { "off" }
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Some(value) = text.strip_prefix("/rtk ").map(str::trim) {
+        let response = set_rtk(&state, value).await;
+        bot.send_message(message.chat.id, response).await?;
+        return Ok(());
+    }
+
+    let expanded = if text.starts_with('/') {
+        let tools = state.read().await.tools.clone();
+        let workspace = tools.workspace(message.chat.id.0).await?;
+        if text == "/commands" {
+            let templates = commands::list(&workspace)?;
+            let response = if templates.is_empty() {
+                "No custom commands found.".to_owned()
+            } else {
+                let mut lines = vec!["Custom commands:".to_owned()];
+                for template in templates {
+                    let description = template
+                        .description
+                        .map(|value| format!(" — {value}"))
+                        .unwrap_or_default();
+                    lines.push(format!("- /{}{}", template.name, description));
+                }
+                lines.join("\n")
+            };
+            bot.send_message(message.chat.id, response).await?;
+            return Ok(());
+        }
+        commands::expand(text, &workspace)?
+    } else {
+        None
+    };
+    let text = expanded.as_deref().unwrap_or(text);
 
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
@@ -850,6 +920,16 @@ pub(crate) async fn run_agent(
             let progress = send_tool_progress(bot, chat_id, &call.name).await;
             let output = if call.name == "ask_user" {
                 ask_user(bot, chat_id, questions, &call.arguments).await?
+            } else if call.name == "delegate_readonly" {
+                let tools = state.read().await.tools.clone();
+                let subagent = with_typing(
+                    bot,
+                    chat_id,
+                    run_readonly_subagent(provider.clone(), tools, chat_id.0, &call.arguments),
+                )
+                .await?;
+                accumulate_usage(&mut usage, &subagent.usage);
+                subagent.answer
             } else {
                 let tools = state.read().await.tools.clone();
                 let always_allowed = tools.requires_confirmation(&call.name)
@@ -980,6 +1060,68 @@ pub(crate) async fn run_agent(
     ))
 }
 
+async fn run_readonly_subagent(
+    provider: Arc<dyn ModelProvider>,
+    tools: ToolRegistry,
+    chat_id: i64,
+    arguments: &str,
+) -> Result<ReadonlySubagentResult> {
+    #[derive(serde::Deserialize)]
+    struct Arguments {
+        task: String,
+    }
+
+    let arguments: Arguments =
+        serde_json::from_str(arguments).context("sub-agent arguments were not valid JSON")?;
+    let task = arguments.task.trim();
+    if task.is_empty() {
+        bail!("delegate_readonly requires a non-empty task");
+    }
+    let definitions = tools.read_only_definitions();
+    let mut messages = vec![
+        ProviderMessage::system(
+            "You are a read-only research sub-agent. Investigate the requested task using only \
+             read_file and list_directory. Never claim to run commands or modify files. Return a \
+             concise, self-contained answer with relevant workspace-relative paths.",
+        ),
+        ProviderMessage::user(task),
+    ];
+    let mut usage = Usage::default();
+    for _ in 0..6 {
+        let response = provider.chat(&messages, &definitions).await?;
+        accumulate_usage(&mut usage, &response.usage);
+        if response.tool_calls.is_empty() {
+            if response.content.trim().is_empty() {
+                bail!("read-only sub-agent returned an empty response");
+            }
+            return Ok(ReadonlySubagentResult {
+                answer: response.content,
+                usage,
+            });
+        }
+        let request = ProviderMessage::tool_request(response.content, response.tool_calls.clone());
+        messages.push(request);
+        for call in response.tool_calls {
+            let output = tools.dispatch_read_only(chat_id, &call).await;
+            messages.push(ProviderMessage::tool_result(call.id, output));
+        }
+    }
+    let response = provider.chat(&messages, &[]).await?;
+    accumulate_usage(&mut usage, &response.usage);
+    if response.content.trim().is_empty() {
+        bail!("read-only sub-agent exhausted its tool limit without an answer");
+    }
+    Ok(ReadonlySubagentResult {
+        answer: response.content,
+        usage,
+    })
+}
+
+struct ReadonlySubagentResult {
+    answer: String,
+    usage: Usage,
+}
+
 /// Assembles the turn as it will be persisted: the user's message, everything the tool rounds
 /// produced, then the answer.
 fn finish_turn(
@@ -1098,8 +1240,9 @@ async fn status_message(
         None => "none (created after the first successful reply)".to_owned(),
     };
     Ok(format!(
-        "Model: {model}\nContext window: {}\nWorkspace: {workspace}\nSession: {session}\nMCP:\n{mcp}\nDatabase: {}",
+        "Model: {model}\nContext window: {}\nWorkspace: {workspace}\nRTK: {}\nSession: {session}\nMCP:\n{mcp}\nDatabase: {}",
         context_window.map_or_else(|| "default".to_owned(), |window| window.to_string()),
+        if tools.rtk_enabled() { "on" } else { "off" },
         database.path().display()
     ))
 }
@@ -1319,6 +1462,50 @@ async fn audit_message(database: &Mutex<Database>, chat_id: i64) -> Result<Strin
         ));
     }
     Ok(lines.join("\n"))
+}
+
+async fn jobs_message(database: &Mutex<Database>, chat_id: i64) -> Result<String> {
+    let jobs = database.lock().await.list_command_jobs(chat_id, 20)?;
+    if jobs.is_empty() {
+        return Ok("No background jobs for this chat yet.".to_owned());
+    }
+    let mut lines = vec!["Background jobs:".to_owned()];
+    for job in jobs {
+        let command = truncate(&job.command.replace('\n', " "), 80);
+        let created = format_timestamp(job.created_at);
+        lines.push(format!(
+            "- {} [{}] {created} — {command}",
+            &job.id[..8],
+            job.status
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Use /jobs stop <id> to stop a running job.".to_owned());
+    Ok(lines.join("\n"))
+}
+
+async fn set_rtk(state: &RwLock<AppState>, value: &str) -> String {
+    let enabled = match value.to_ascii_lowercase().as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return "Usage: /rtk on or /rtk off.".to_owned(),
+    };
+    let mut state = state.write().await;
+    let Some(tools_config) = state.config.tools.as_mut() else {
+        return "Tools are not configured.".to_owned();
+    };
+    tools_config.rtk = enabled;
+    state.tools = state.tools.clone().with_rtk(enabled);
+    match state.config.save() {
+        Ok(_) => format!(
+            "RTK command compression {}.",
+            if enabled { "enabled" } else { "disabled" }
+        ),
+        Err(error) => {
+            logging::error("config", "could not save RTK setting", &error);
+            "RTK setting changed for this run, but Kumo could not save it.".to_owned()
+        }
+    }
 }
 
 /// `/reminders`: list this chat's pending scheduled tasks (one-shot and recurring), with the
@@ -1800,7 +1987,7 @@ async fn switch_provider(state: &RwLock<AppState>, name: &str) -> String {
     };
 
     state.config.active_provider = Some(name.to_owned());
-    state.provider = Provider::new(provider_config.clone());
+    state.provider = Arc::new(Provider::new(provider_config.clone()));
     let model = provider_config.active_model;
     match state.config.save() {
         Ok(_) => format!("Switched to {name} ({model})."),
@@ -1941,7 +2128,7 @@ async fn switch_model(state: &RwLock<AppState>, model: &str) -> String {
     }
 
     provider_config.active_model = model.to_owned();
-    state.provider = Provider::new(provider_config.clone());
+    state.provider = Arc::new(Provider::new(provider_config.clone()));
     match state.config.save() {
         Ok(_) => format!("Switched to {model}."),
         Err(error) => {
@@ -2032,7 +2219,10 @@ async fn print_status() -> Result<()> {
                 Err(_) => println!("Provider:  not configured (run `kumo onboard`)"),
             }
             match &config.tools {
-                Some(tools) => println!("Workspace: {}", tools.workspace.display()),
+                Some(tools) => {
+                    println!("Workspace: {}", tools.workspace.display());
+                    println!("RTK:       {}", if tools.rtk { "on" } else { "off" });
+                }
                 None => println!("Workspace: not configured (run `kumo onboard`)"),
             }
             println!("Timezone:  {}", config.timezone());
@@ -2057,6 +2247,7 @@ async fn print_status() -> Result<()> {
     );
     println!("Remembered facts:        {}", summary.memory_entries);
     println!("Audit events:            {}", summary.audit_events);
+    println!("Running background jobs: {}", summary.running_jobs);
 
     Ok(())
 }
@@ -2123,6 +2314,21 @@ async fn run_doctor() -> Result<()> {
                         tools.workspace.display()
                     ));
                     failures += 1;
+                }
+                if tools.rtk {
+                    let available = std::process::Command::new("rtk")
+                        .arg("--version")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success());
+                    if available {
+                        check_ok("RTK command backend is available");
+                    } else {
+                        check_fail("RTK is enabled but the `rtk` binary is not on PATH");
+                        failures += 1;
+                    }
                 }
             }
             None => {
@@ -2555,5 +2761,72 @@ mod tests {
         let answer = parse_question_callback("question:abc123:5").unwrap();
         let options = ["yes".to_owned()];
         assert!(options.get(answer.option_index).is_none());
+    }
+
+    struct FakeProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<provider::ChatResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FakeProvider {
+        fn active_model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ProviderMessage],
+            _tools: &[provider::ToolDefinition],
+        ) -> Result<provider::ChatResponse> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("fake provider ran out of responses")
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_subagent_uses_isolated_provider_and_read_tools() {
+        let root = std::env::temp_dir().join(format!("kumo-subagent-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "important detail").unwrap();
+        let database = Arc::new(Mutex::new(Database::open_in_memory_for_tests()));
+        let tools = ToolRegistry::new(root.clone(), Vec::new(), database, chrono_tz::UTC).unwrap();
+        let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                provider::ChatResponse {
+                    content: String::new(),
+                    tool_calls: vec![provider::ToolCall {
+                        id: "read-1".to_owned(),
+                        name: "read_file".to_owned(),
+                        arguments: r#"{"path":"note.txt"}"#.to_owned(),
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 2,
+                        completion_tokens: 1,
+                        total_tokens: 3,
+                    },
+                    finish_reason: "tool_calls".to_owned(),
+                },
+                provider::ChatResponse {
+                    content: "The note contains an important detail.".to_owned(),
+                    tool_calls: Vec::new(),
+                    usage: Usage {
+                        prompt_tokens: 3,
+                        completion_tokens: 1,
+                        total_tokens: 4,
+                    },
+                    finish_reason: "stop".to_owned(),
+                },
+            ])),
+        });
+
+        let result = run_readonly_subagent(provider, tools, 42, r#"{"task":"Inspect note.txt"}"#)
+            .await
+            .unwrap();
+        assert!(result.answer.contains("important detail"));
+        assert_eq!(result.usage.total_tokens, 7);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

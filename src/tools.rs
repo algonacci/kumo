@@ -51,6 +51,7 @@ pub struct ToolRegistry {
     extra: Vec<Arc<dyn ExternalTool>>,
     database: Arc<Mutex<Database>>,
     timezone: chrono_tz::Tz,
+    rtk_enabled: bool,
 }
 
 #[async_trait]
@@ -80,7 +81,17 @@ impl ToolRegistry {
             extra,
             database,
             timezone,
+            rtk_enabled: false,
         })
+    }
+
+    pub fn with_rtk(mut self, enabled: bool) -> Self {
+        self.rtk_enabled = enabled;
+        self
+    }
+
+    pub fn rtk_enabled(&self) -> bool {
+        self.rtk_enabled
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -124,12 +135,35 @@ impl ToolRegistry {
                         "command": {
                             "type": "string",
                             "description": "Shell command to run in the workspace, for example cargo test."
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "Set true for commands that may take longer than 30 seconds. Kumo starts the job immediately and reports back when it finishes."
                         }
                     },
                     "required": ["command"]
                 }),
             },
         ];
+        definitions.push(ToolDefinition {
+            name: "command_status".to_owned(),
+            description: "Check a background command's status and latest result by job id."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        });
+        definitions.push(ToolDefinition {
+            name: "stop_command".to_owned(),
+            description: "Stop a running background command by job id.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        });
         if kamui_available() {
             definitions.push(ToolDefinition {
                 name: "delegate_to_kamui".to_owned(),
@@ -293,8 +327,23 @@ impl ToolRegistry {
                 "required": ["question"]
             }),
         });
-        // ask_user is dispatched specially by run_agent (it needs the bot and chat, which
-        // ToolRegistry does not have), so it is not listed in requires_confirmation/dispatch below.
+        definitions.push(ToolDefinition {
+            name: "delegate_readonly".to_owned(),
+            description: "Delegate a multi-step workspace investigation to a fresh read-only \
+                          sub-agent. It can read files and list directories but cannot run \
+                          commands, edit files, schedule tasks, or call external tools. Use it \
+                          when intermediate exploration would otherwise fill the main context."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "A self-contained investigation task." }
+                },
+                "required": ["task"]
+            }),
+        });
+        // ask_user and delegate_readonly are dispatched specially by run_agent because they need
+        // chat/provider state that ToolRegistry deliberately does not own.
         definitions.extend(self.extra.iter().map(|tool| tool.definition()));
         definitions
     }
@@ -311,9 +360,19 @@ impl ToolRegistry {
 
     pub fn preview(&self, call: &ToolCall) -> Option<String> {
         if call.name == "run_command" {
-            parse_command(&call.arguments)
+            parse_command_arguments(&call.arguments)
                 .ok()
-                .map(|command| format!("Command: {command}"))
+                .map(|arguments| {
+                    format!(
+                        "Command{}: {}",
+                        if arguments.background {
+                            " (background)"
+                        } else {
+                            ""
+                        },
+                        arguments.command
+                    )
+                })
         } else if call.name == "delegate_to_kamui" {
             parse_task(&call.arguments)
                 .ok()
@@ -344,9 +403,11 @@ impl ToolRegistry {
             "read_file" => self.read_file(root.as_deref().unwrap(), &call.arguments),
             "list_directory" => self.list_directory(root.as_deref().unwrap(), &call.arguments),
             "run_command" => {
-                self.run_command(root.as_deref().unwrap(), &call.arguments)
+                self.run_command(root.as_deref().unwrap(), chat_id, &call.arguments)
                     .await
             }
+            "command_status" => self.command_status(chat_id, &call.arguments).await,
+            "stop_command" => self.stop_command(chat_id, &call.arguments).await,
             "delegate_to_kamui" => {
                 self.delegate_to_kamui(root.as_deref().unwrap(), &call.arguments)
                     .await
@@ -375,6 +436,23 @@ impl ToolRegistry {
             bail!("workspace is not a directory: {}", root.display());
         }
         Ok(root)
+    }
+
+    pub fn read_only_definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions()
+            .into_iter()
+            .filter(|tool| matches!(tool.name.as_str(), "read_file" | "list_directory"))
+            .collect()
+    }
+
+    pub async fn dispatch_read_only(&self, chat_id: i64, call: &ToolCall) -> String {
+        if !matches!(call.name.as_str(), "read_file" | "list_directory") {
+            return format!(
+                "Error: tool '{}' is not available to the read-only sub-agent",
+                call.name
+            );
+        }
+        self.dispatch(chat_id, call).await
     }
 
     fn read_file(&self, root: &Path, arguments: &str) -> Result<String> {
@@ -435,8 +513,9 @@ impl ToolRegistry {
         Ok(path)
     }
 
-    async fn run_command(&self, root: &Path, arguments: &str) -> Result<String> {
-        let command = parse_command(arguments)?;
+    async fn run_command(&self, root: &Path, chat_id: i64, arguments: &str) -> Result<String> {
+        let arguments = parse_command_arguments(arguments)?;
+        let command = self.rewrite_with_rtk(&arguments.command).await;
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
@@ -453,6 +532,39 @@ impl ToolRegistry {
             .spawn()
             .context("failed to start the command")?;
 
+        if arguments.background {
+            let pid = child.id().context("background command has no process id")?;
+            let id = self.database.lock().await.create_command_job(
+                chat_id,
+                &arguments.command,
+                root,
+                pid,
+            )?;
+            let database = self.database.clone();
+            let job_id = id.clone();
+            tokio::spawn(async move {
+                let result = child.wait_with_output().await;
+                let (status, output, exit_code) = match result {
+                    Ok(output) => {
+                        let status = if output.status.success() {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                        let exit_code = output.status.code();
+                        (status, format_command_output(&output), exit_code)
+                    }
+                    Err(error) => ("failed", format!("Error: {error}"), None),
+                };
+                let database = database.lock().await;
+                let _ = database.complete_command_job(&job_id, status, &output, exit_code);
+            });
+            return Ok(format!(
+                "background job started ({}), pid {pid}. Use command_status or /jobs to check it.",
+                &id[..8]
+            ));
+        }
+
         match tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
             Ok(result) => {
                 let output = result.context("failed to run the command")?;
@@ -462,6 +574,63 @@ impl ToolRegistry {
                 "Error: command timed out after {} seconds and was terminated",
                 COMMAND_TIMEOUT.as_secs()
             )),
+        }
+    }
+
+    async fn rewrite_with_rtk(&self, command: &str) -> String {
+        if !self.rtk_enabled {
+            return command.to_owned();
+        }
+        let output = tokio::process::Command::new("rtk")
+            .args(["rewrite", "--"])
+            .arg(command)
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        match output {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            }
+            _ => command.to_owned(),
+        }
+    }
+
+    async fn command_status(&self, chat_id: i64, arguments: &str) -> Result<String> {
+        let id = parse_job_id(arguments)?;
+        let Some(job) = self.database.lock().await.find_command_job(chat_id, &id)? else {
+            bail!("no single background job matches '{id}'");
+        };
+        Ok(format_job(&job))
+    }
+
+    async fn stop_command(&self, chat_id: i64, arguments: &str) -> Result<String> {
+        let id = parse_job_id(arguments)?;
+        let Some(job) = self.database.lock().await.find_command_job(chat_id, &id)? else {
+            bail!("no single background job matches '{id}'");
+        };
+        if job.status != "running" {
+            return Ok(format!("job {} is already {}", &job.id[..8], job.status));
+        }
+        let pid = job
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .context("running job has no valid process id")?;
+        let Some(killed) = kill_process_tree(pid) else {
+            return Ok(format!(
+                "job {} process already exited; its final status is pending",
+                &job.id[..8]
+            ));
+        };
+        if !killed {
+            bail!("could not stop process {pid} for job {}", &job.id[..8]);
+        }
+        if self.database.lock().await.cancel_command_job(&job.id)? {
+            Ok(format!("stopped background job {}", &job.id[..8]))
+        } else {
+            Ok(format!(
+                "job {} finished before it could be stopped",
+                &job.id[..8]
+            ))
         }
     }
 
@@ -723,6 +892,8 @@ struct PathArguments {
 #[derive(Deserialize)]
 struct CommandArguments {
     command: String,
+    #[serde(default)]
+    background: bool,
 }
 
 #[derive(Deserialize)]
@@ -732,6 +903,11 @@ struct TaskArguments {
 
 #[derive(Deserialize)]
 struct CancelTaskArguments {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct JobArguments {
     id: String,
 }
 
@@ -759,14 +935,68 @@ struct ForgetArguments {
     matching: String,
 }
 
-fn parse_command(arguments: &str) -> Result<String> {
-    let arguments: CommandArguments =
+fn parse_command_arguments(arguments: &str) -> Result<CommandArguments> {
+    let mut arguments: CommandArguments =
         serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
     let command = arguments.command.trim();
     if command.is_empty() {
         bail!("run_command requires a non-empty 'command' argument");
     }
-    Ok(command.to_owned())
+    arguments.command = command.to_owned();
+    Ok(arguments)
+}
+
+fn parse_job_id(arguments: &str) -> Result<String> {
+    let arguments: JobArguments =
+        serde_json::from_str(arguments).context("tool arguments were not valid JSON")?;
+    let id = arguments.id.trim();
+    if id.is_empty() {
+        bail!("job id cannot be empty");
+    }
+    Ok(id.to_owned())
+}
+
+pub fn format_job(job: &crate::storage::CommandJob) -> String {
+    let mut result = format!(
+        "job {}: {}\nworkspace: {}\ncommand: {}",
+        &job.id[..8],
+        job.status,
+        job.workspace,
+        job.command
+    );
+    if let Some(output) = &job.output {
+        result.push('\n');
+        result.push_str(output);
+    } else if let Some(code) = job.exit_code {
+        result.push_str(&format!("\nexit code: {code}"));
+    }
+    result
+}
+
+fn kill_process_tree(pid: u32) -> Option<bool> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let root = sysinfo::Pid::from_u32(pid);
+    system.process(root)?;
+
+    let mut stack = vec![root];
+    let mut descendants = Vec::new();
+    while let Some(parent) = stack.pop() {
+        for process in system.processes().values() {
+            if process.parent() == Some(parent) {
+                descendants.push(process.pid());
+                stack.push(process.pid());
+            }
+        }
+    }
+    let mut killed = true;
+    for child in descendants.into_iter().rev() {
+        if let Some(process) = system.process(child) {
+            killed &= process.kill();
+        }
+    }
+    killed &= system.process(root).is_some_and(sysinfo::Process::kill);
+    Some(killed)
 }
 
 fn parse_task(arguments: &str) -> Result<String> {
@@ -973,6 +1203,110 @@ mod tests {
 
         std::fs::remove_dir_all(default_root).unwrap();
         std::fs::remove_dir_all(override_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_dispatch_rejects_commands() {
+        let root = workspace();
+        let tools = registry(root.clone(), Vec::new());
+        let output = tools
+            .dispatch_read_only(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: r#"{"command":"echo no"}"#.into(),
+                },
+            )
+            .await;
+        assert!(output.contains("not available to the read-only sub-agent"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_command_finishes_and_persists_output() {
+        let root = workspace();
+        let database = test_database();
+        let tools =
+            ToolRegistry::new(root.clone(), Vec::new(), database.clone(), chrono_tz::UTC).unwrap();
+        let command = if cfg!(windows) {
+            "echo background-ok"
+        } else {
+            "printf background-ok"
+        };
+        let output = tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command, "background": true })
+                        .to_string(),
+                },
+            )
+            .await;
+        assert!(output.contains("background job started"));
+
+        let mut completed = None;
+        for _ in 0..50 {
+            let job = database.lock().await.list_command_jobs(42, 1).unwrap()[0].clone();
+            if job.status != "running" {
+                completed = Some(job);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let job = completed.expect("background command did not finish");
+        assert_eq!(job.status, "completed");
+        assert!(job.output.unwrap().contains("background-ok"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_command_cancels_a_running_background_job() {
+        let root = workspace();
+        let database = test_database();
+        let tools =
+            ToolRegistry::new(root.clone(), Vec::new(), database.clone(), chrono_tz::UTC).unwrap();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
+        tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command, "background": true })
+                        .to_string(),
+                },
+            )
+            .await;
+        let id = database.lock().await.list_command_jobs(42, 1).unwrap()[0]
+            .id
+            .clone();
+        let output = tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "2".into(),
+                    name: "stop_command".into(),
+                    arguments: serde_json::json!({ "id": &id[..8] }).to_string(),
+                },
+            )
+            .await;
+        assert!(output.contains("stopped background job"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let job = database
+            .lock()
+            .await
+            .find_command_job(42, &id[..8])
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "cancelled");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

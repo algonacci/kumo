@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 7;
+const CURRENT_VERSION: i64 = 8;
 
 pub struct Database {
     connection: Connection,
@@ -59,6 +59,19 @@ pub struct AuditEvent {
     pub created_at: i64,
 }
 
+#[derive(Clone)]
+pub struct CommandJob {
+    pub id: String,
+    pub telegram_chat_id: i64,
+    pub command: String,
+    pub workspace: String,
+    pub status: String,
+    pub pid: Option<i64>,
+    pub output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub created_at: i64,
+}
+
 /// The outcome of resolving a memory substring. `update_memory` and `forget` act only on `One`;
 /// the other two variants say precisely why nothing happened, which "it did not work" alone never
 /// did — a caller that cannot tell "no such fact" from "several such facts" can only guess again.
@@ -75,6 +88,7 @@ pub struct StorageSummary {
     pub pending_scheduled_tasks: i64,
     pub memory_entries: i64,
     pub audit_events: i64,
+    pub running_jobs: i64,
 }
 
 impl Database {
@@ -117,6 +131,9 @@ impl Database {
         }
         if version < 7 {
             migrate_to_v7(&connection)?;
+        }
+        if version < 8 {
+            migrate_to_v8(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -507,6 +524,133 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn create_command_job(
+        &self,
+        chat_id: i64,
+        command: &str,
+        workspace: &std::path::Path,
+        pid: u32,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO command_jobs
+             (id, telegram_chat_id, command, workspace, pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                chat_id,
+                command,
+                workspace.to_string_lossy(),
+                i64::from(pid)
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn complete_command_job(
+        &self,
+        id: &str,
+        status: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE command_jobs SET status = ?2, output = ?3, exit_code = ?4,
+                 finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            params![id, status, output, exit_code],
+        )? > 0;
+        if updated {
+            self.prune_terminal_command_jobs(id)?;
+        }
+        Ok(updated)
+    }
+
+    pub fn list_command_jobs(&self, chat_id: i64, limit: usize) -> Result<Vec<CommandJob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
+                    created_at
+             FROM command_jobs WHERE telegram_chat_id = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![chat_id, i64::try_from(limit)?], job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn find_command_job(&self, chat_id: i64, id_prefix: &str) -> Result<Option<CommandJob>> {
+        let pattern = format!("{id_prefix}%");
+        let mut statement = self.connection.prepare(
+            "SELECT id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
+                    created_at
+             FROM command_jobs WHERE telegram_chat_id = ?1 AND id LIKE ?2
+             ORDER BY created_at DESC LIMIT 2",
+        )?;
+        let jobs = statement
+            .query_map(params![chat_id, pattern], job_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(if jobs.len() == 1 {
+            jobs.into_iter().next()
+        } else {
+            None
+        })
+    }
+
+    pub fn cancel_command_job(&self, id: &str) -> Result<bool> {
+        let updated = self.connection.execute(
+            "UPDATE command_jobs SET status = 'cancelled', finished_at = unixepoch()
+             WHERE id = ?1 AND status = 'running'",
+            [id],
+        )? > 0;
+        if updated {
+            self.prune_terminal_command_jobs(id)?;
+        }
+        Ok(updated)
+    }
+
+    fn prune_terminal_command_jobs(&self, newest_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM command_jobs WHERE id IN (
+                 SELECT id FROM command_jobs
+                 WHERE telegram_chat_id = (
+                     SELECT telegram_chat_id FROM command_jobs WHERE id = ?1
+                 ) AND status != 'running'
+                 ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 100
+             )",
+            [newest_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn unnotified_command_jobs(&self) -> Result<Vec<CommandJob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
+                    created_at
+             FROM command_jobs
+             WHERE notified = 0 AND status IN ('completed', 'failed', 'cancelled')
+             ORDER BY finished_at, rowid",
+        )?;
+        let rows = statement.query_map([], job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_command_job_notified(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("UPDATE command_jobs SET notified = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn fail_interrupted_command_jobs(&self) -> Result<usize> {
+        Ok(self.connection.execute(
+            "UPDATE command_jobs SET status = 'failed',
+                 output = 'Kumo restarted while this command was running.',
+                 finished_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?)
+    }
+
     /// Delete every memory entry (used by the `/forget all` Telegram command).
     pub fn clear_memory(&self) -> Result<usize> {
         Ok(self.connection.execute("DELETE FROM memory", [])?)
@@ -531,11 +675,17 @@ impl Database {
         let audit_events =
             self.connection
                 .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))?;
+        let running_jobs = self.connection.query_row(
+            "SELECT COUNT(*) FROM command_jobs WHERE status = 'running'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(StorageSummary {
             session_count,
             pending_scheduled_tasks,
             memory_entries,
             audit_events,
+            running_jobs,
         })
     }
 
@@ -777,6 +927,20 @@ fn scheduled_task_from_row(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTas
     })
 }
 
+fn job_from_row(row: &rusqlite::Row) -> rusqlite::Result<CommandJob> {
+    Ok(CommandJob {
+        id: row.get(0)?,
+        telegram_chat_id: row.get(1)?,
+        command: row.get(2)?,
+        workspace: row.get(3)?,
+        status: row.get(4)?,
+        pid: row.get(5)?,
+        output: row.get(6)?,
+        exit_code: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
 fn migrate_to_v1(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "BEGIN;
@@ -933,6 +1097,33 @@ fn migrate_to_v7(connection: &Connection) -> Result<()> {
          CREATE INDEX audit_events_chat_time
              ON audit_events(telegram_chat_id, created_at DESC, id DESC);
          PRAGMA user_version = 7;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_v8(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE command_jobs (
+             id TEXT PRIMARY KEY,
+             telegram_chat_id INTEGER NOT NULL,
+             command TEXT NOT NULL,
+             workspace TEXT NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'cancelled'))
+                 DEFAULT 'running',
+             pid INTEGER,
+             output TEXT,
+             exit_code INTEGER,
+             notified INTEGER NOT NULL DEFAULT 0,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             finished_at INTEGER
+         );
+         CREATE INDEX command_jobs_chat_time
+             ON command_jobs(telegram_chat_id, created_at DESC);
+         CREATE INDEX command_jobs_notifications
+             ON command_jobs(notified, status, finished_at);
+         PRAGMA user_version = 8;
          COMMIT;",
     )?;
     Ok(())
@@ -1755,5 +1946,59 @@ mod tests {
             .record_audit_event(42, "approval", Some("run_command"), None, "denied")
             .unwrap();
         assert_eq!(database.list_audit_events(42, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn command_job_lifecycle_is_scoped_and_persistent() {
+        let database = database();
+        let id = database
+            .create_command_job(42, "cargo test", std::path::Path::new("/tmp/project"), 123)
+            .unwrap();
+        assert!(database.find_command_job(99, &id[..8]).unwrap().is_none());
+        assert_eq!(
+            database.list_command_jobs(42, 10).unwrap()[0].status,
+            "running"
+        );
+
+        assert!(
+            database
+                .complete_command_job(&id, "completed", "exit code: 0", Some(0))
+                .unwrap()
+        );
+        let job = database.find_command_job(42, &id[..8]).unwrap().unwrap();
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(database.unnotified_command_jobs().unwrap().len(), 1);
+        database.mark_command_job_notified(&id).unwrap();
+        assert!(database.unnotified_command_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn command_jobs_keep_only_the_latest_hundred_terminal_rows_per_chat() {
+        let database = database();
+        for pid in 1..=101 {
+            let id = database
+                .create_command_job(42, "true", std::path::Path::new("/tmp"), pid)
+                .unwrap();
+            database
+                .complete_command_job(&id, "completed", "exit code: 0", Some(0))
+                .unwrap();
+        }
+        assert_eq!(database.list_command_jobs(42, 200).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn migration_to_v8_adds_command_jobs() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_to_v1(&connection).unwrap();
+        migrate_to_v2(&connection).unwrap();
+        migrate_to_v3(&connection).unwrap();
+        migrate_to_v4(&connection).unwrap();
+        migrate_to_v5(&connection).unwrap();
+        migrate_to_v6(&connection).unwrap();
+        migrate_to_v7(&connection).unwrap();
+        migrate_to_v8(&connection).unwrap();
+        let database = Database::initialize(connection, PathBuf::from(":memory:")).unwrap();
+        assert!(database.list_command_jobs(42, 10).unwrap().is_empty());
     }
 }

@@ -81,6 +81,10 @@ impl ProviderConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolsConfig {
     pub workspace: PathBuf,
+    /// Rewrite supported shell commands through RTK before execution to reduce model-facing
+    /// output. Disabled by default for existing configurations.
+    #[serde(default)]
+    pub rtk: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -219,6 +223,7 @@ mod tests {
             active_provider: None,
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
+                rtk: true,
             }),
             timezone: Some("Asia/Jakarta".into()),
             mcp: BTreeMap::from([(
@@ -239,10 +244,9 @@ mod tests {
         assert_eq!(decoded.telegram.bot_username, "kumo_test_bot");
         assert_eq!(decoded.telegram.owner_user_id, 42);
         assert_eq!(decoded.provider.unwrap().active_model, "model-a");
-        assert_eq!(
-            decoded.tools.unwrap().workspace,
-            PathBuf::from("/tmp/workspace")
-        );
+        let tools = decoded.tools.unwrap();
+        assert_eq!(tools.workspace, PathBuf::from("/tmp/workspace"));
+        assert!(tools.rtk);
         assert!(decoded.mcp["files"].trusted);
         assert_eq!(decoded.timezone.as_deref(), Some("Asia/Jakarta"));
     }
@@ -415,6 +419,16 @@ mod tests {
         assert!(decoded.mcp.is_empty());
         assert!(decoded.timezone.is_none());
         assert_eq!(decoded.timezone(), chrono_tz::UTC);
+    }
+
+    #[test]
+    fn legacy_tools_config_defaults_rtk_off() {
+        let decoded: Config = toml::from_str(
+            "[telegram]\nbot_token = \"t\"\nbot_username = \"b\"\nowner_user_id = 1\n\
+             [tools]\nworkspace = \"/tmp\"",
+        )
+        .unwrap();
+        assert!(!decoded.tools.unwrap().rtk);
     }
 
     #[test]

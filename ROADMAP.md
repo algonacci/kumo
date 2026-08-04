@@ -56,7 +56,7 @@ configured context window (or a 48 KiB default), without ever deleting the origi
 - [x] Structured result rendering for a Kamui delegation (a short summary of tool calls/errors plus
       Kamui's final answer, instead of raw stdout/stderr like `run_command`)
 - [x] Tool-call round limit review (still 8, but reaching it no longer discards the turn)
-- [ ] Optional RTK execution backend for `run_command` output compression
+- [x] Optional RTK execution backend for `run_command` output compression (`tools.rtk`, `/rtk`)
 
 This was the most visible gap relative to Kamui: the README used to say plainly "Kumo cannot edit
 files yet." Rather than reimplementing Kamui's `patch_file` (exact-match replace-or-create, diff
@@ -93,8 +93,9 @@ by the cap stays distinguishable in storage from one the model chose to end — 
 keeping if the number ever does need revisiting.
 
 RTK is optional and orthogonal to permission policy (see Kamui's RTK Decision for the same framing):
-it would compress `run_command` output before it reaches the model, nothing more. Skip it until
-`run_command` output volume is actually a problem in practice.
+when enabled through `tools.rtk = true` or `/rtk on`, Kumo asks `rtk rewrite` for the compact proxy
+form before executing the approved command. Approval still shows the original command, and a
+missing or failing RTK binary falls back to that original rather than blocking execution.
 
 A Kamui delegation's raw output was the exit code plus interleaved stdout/stderr — the same
 `format_command_output` shape `run_command` uses — which meant Telegram saw Kamui's own tool-trace
@@ -535,7 +536,6 @@ that is over budget because of its tools will stay over budget however much hist
 
 ## Phase 5: Gateway Hardening
 
-- [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`)
 - [x] Per-chat workspace selection (`/workspace <path>` with a SQLite-backed chat override)
 - [x] Per-tool MCP trust (`trusted_tools`, alongside the existing all-or-nothing `trusted`)
 - [x] A tool record that outlives the session it belongs to (`audit_events`, visible via `/audit`)
@@ -568,58 +568,48 @@ simply never matching.
 
 ## Phase 6: Borrowed from Kamui
 
-- [ ] `Provider` trait, splitting the OpenAI wire mapping from the agent loop
-- [ ] User-defined commands: markdown prompt templates invoked as `/<name>` from Telegram
-- [ ] A read-only sub-agent that absorbs a multi-step task and returns only its answer
-- [ ] Background commands: start now, report later, instead of one 30-second window
+- [x] `ModelProvider` trait, splitting the OpenAI wire mapping from the agent loop
+- [x] User-defined commands: markdown prompt templates invoked as `/<name>` from Telegram
+- [x] A read-only sub-agent that absorbs a multi-step task and returns only its answer
+- [x] Background commands: start now, report later, instead of one 30-second window
 
 These come from reading Kamui's source directly rather than from a feature list. Kamui is the
 larger project (roughly 20k lines to Kumo's 8k) and solves several problems Kumo has since grown
 into; what follows is what survived asking "does this fit a Telegram gateway, or only a terminal?"
 Ideas that did not survive are recorded at the end, so they do not get re-proposed.
 
-**`Provider` trait** (`src/provider/mod.rs` in Kamui). Kamui defines `trait Provider: Send + Sync`
-with the OpenAI adapter behind it in `provider/openai.rs`; Kumo's `Provider` is a concrete struct
-that reaches for reqwest directly. This is not an abstraction for its own sake — it has already
-cost Kumo twice. The round-limit degradation in Phase 2 could only be tested at the seam
-(`finish_turn`), not through `run_agent`, because nothing in the agent loop can run without a live
-provider; and this same missing seam is the reason a native Anthropic or Gemini backend was filed
-as impractical. Both message types are already identical across the two projects (`Message`,
-`ToolCall`, `ImageAttachment` were copied from Kamui when image input landed), so the shape is
-known to fit.
+**`ModelProvider` trait.** The agent loop now stores `Arc<dyn ModelProvider>` while the existing
+OpenAI-compatible `Provider` implements that interface. Wire mapping remains unchanged, but tests
+and the read-only sub-agent can inject a deterministic provider without a live HTTP endpoint.
 
 **User-defined commands** (`src/commands.rs` in Kamui, ~330 lines with tests). Markdown files with
 optional frontmatter, loaded from a global and a project directory, invoked as `/<name>` and
 expanded into a full prompt. This fits Kumo *better* than it fits Kamui, for a reason specific to
 the interface: typing a long, carefully worded prompt is unpleasant on a phone keyboard, which is
-exactly where Kumo is used. `/standup` expanding into a paragraph of instructions is a bigger win
-in Telegram than at a terminal where the prompt can be pasted or edited in place. The loader itself
-is self-contained; what changes is only where the invocation comes from.
+exactly where Kumo is used. Kumo loads global templates from its config directory and project
+templates from `.kumo/commands`, with the project version winning. `{{args}}` expands the
+invocation tail and `/commands` lists names plus optional frontmatter descriptions.
 
 **A read-only sub-agent** (`spawn_agent` in Kamui). Kamui hands a self-contained task to a
 sub-agent with a fresh system prompt and no shared history, and returns only its final answer, so
 the sub-agent's own tool calls never enter the parent's context. Its tools are restricted to the
 read-only set specifically so that no approval flow has to be reproduced inside it. Kumo has a
 sharper reason to want this than Kamui does: after Phase 4h, tool schemas and history compete for
-one budget, and a single MCP server here contributes 61 tools. A research task that burns six
-rounds of tool calls currently spends all of that in the conversation Kumo is trying to keep small;
-routed through a sub-agent it costs one paragraph. The restriction to read-only tools carries over
-unchanged — Kumo's approval prompts are per chat, and a sub-agent that could trigger them would
-raise exactly the interleaving question Kamui deferred.
+one budget. A task routed through `delegate_readonly` gets a fresh prompt and at most six rounds of
+`read_file`/`list_directory`; only its final answer enters the parent's trail. Commands, edits,
+MCP tools, memory, scheduling, and approval flows are unavailable inside it.
 
 **Background commands** (`run_command(background: true)`, `command_status`, `stop_command`,
-`/jobs` in Kamui). Kumo's `run_command` is bounded by a 30-second timeout, so a build or a test
-suite is simply not runnable. In a terminal, a background job is a convenience — the user is
-sitting there and could watch it. Through Telegram it is closer to a requirement: the user is by
-definition not at the machine, and "start it, tell me when it is done" is the natural shape. Kumo
-also already has the delivery half built, since the scheduler can send a chat a message on its own
-without an inbound prompt.
+`/jobs` in Kamui). Foreground commands retain the 30-second bound. With `background: true`, Kumo
+stores the job and PID in SQLite, waits outside the agent turn, and sends the compact result through
+the scheduler poller. `command_status`, `stop_command`, `/jobs`, and `/jobs stop <id>` expose the
+lifecycle. A restart marks interrupted in-process jobs failed rather than pretending they survive.
 
 Not taken: **Kamui Dispatch**, a planned relay backend plus phone app so a phone can trigger Kamui
 on a host machine. Kamui's own roadmap describes it as three pieces of software that are
 deliberately not part of the Kamui binary — a phone client, a relay, and a host-side agent that
-invokes `kamui -p`. That is a description of what Kumo already is. Also not taken: RTK (already
-filed in Phase 2 on its own merits), semantic code search and `@file`/`@diff` context (Kamui is
+invokes `kamui -p`. That is a description of what Kumo already is. Still not taken: semantic code
+search and `@file`/`@diff` context (Kamui is
 repository-aware by design; Kumo inspects one workspace read-only and delegates code work), and
 Kamui's `patch_file` (Phase 2 settled that editing belongs to Kamui, not to a second implementation
 inside Kumo).
@@ -631,7 +621,7 @@ inside Kumo).
       editing would be required to show partial output, and polling-based Telegram bots gain less
       from this than a terminal does)
 - [ ] Native Anthropic / Gemini provider (still not planned — OpenAI-compatible base URLs already
-      cover OpenRouter, Ollama, LM Studio, Groq, DeepSeek, LiteLLM; the `Provider` trait in Phase 6
+      cover OpenRouter, Ollama, LM Studio, Groq, DeepSeek, LiteLLM; the `ModelProvider` trait in Phase 6
       would remove the structural objection, but not the "no concrete need" one)
 
 This stopped being speculative the moment a provider was actually swapped: `kumo onboard`
@@ -652,6 +642,12 @@ merged, the same precedence Kamui gives its profiles. `Config::provider`/`provid
 whichever entry is active, so `/model`, `/models refresh`, and `/context` write to the right one
 without knowing profiles exist at all; `active_provider` naming something that no longer exists
 falls back to the first entry instead of leaving the gateway with no provider.
+
+## Wishlist
+
+- [ ] Multiple authorized Telegram users (owner list, not a single `owner_user_id`) — revisit when
+  Kumo genuinely needs to serve another person; authorization, memory ownership, workspaces, jobs,
+  and audit visibility would all need an explicit user-scoping policy
 
 ## Not Planned
 

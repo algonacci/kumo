@@ -173,7 +173,12 @@ fn setup_tools() -> Result<ToolsConfig> {
             .interact_text()?;
         let path = std::path::PathBuf::from(value.trim());
         match path.canonicalize() {
-            Ok(path) if path.is_dir() => return Ok(ToolsConfig { workspace: path }),
+            Ok(path) if path.is_dir() => {
+                return Ok(ToolsConfig {
+                    workspace: path,
+                    rtk: false,
+                });
+            }
             _ => eprintln!("That workspace directory does not exist."),
         }
     }

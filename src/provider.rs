@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +10,20 @@ use crate::config::ProviderConfig;
 pub struct Provider {
     client: Client,
     config: ProviderConfig,
+}
+
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    fn active_model(&self) -> &str;
+    async fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatResponse>;
+
+    async fn summarize(&self, messages: &[Message]) -> Result<String> {
+        let response = self.chat(messages, &[]).await?;
+        if response.content.trim().is_empty() {
+            bail!("provider returned an empty summary");
+        }
+        Ok(response.content)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -173,16 +188,15 @@ impl Provider {
             config,
         }
     }
+}
 
-    pub fn active_model(&self) -> &str {
+#[async_trait]
+impl ModelProvider for Provider {
+    fn active_model(&self) -> &str {
         &self.config.active_model
     }
 
-    pub async fn chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<ChatResponse> {
+    async fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<ChatResponse> {
         let response = authorized(
             self.client
                 .post(endpoint(&self.config.base_url, "chat/completions")),
@@ -226,14 +240,6 @@ impl Provider {
             usage: response.usage,
             finish_reason: choice.finish_reason,
         })
-    }
-
-    pub async fn summarize(&self, messages: &[Message]) -> Result<String> {
-        let response = self.chat(messages, &[]).await?;
-        if response.content.trim().is_empty() {
-            bail!("provider returned an empty summary");
-        }
-        Ok(response.content)
     }
 }
 

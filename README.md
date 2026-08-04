@@ -166,6 +166,9 @@ status if anything failed, so it's usable as a pre-flight check in a script.
   `/workspace reset` returns to the configured default.
 - `/audit` shows the latest tool and approval events for this chat independently of session
   history.
+- `/jobs` lists recent background commands; `/jobs stop <id>` stops one that is still running.
+- `/commands` lists user-defined Markdown command templates available in this workspace.
+- `/rtk`, `/rtk on`, and `/rtk off` inspect or change optional RTK command compression.
 - `/model` shows the active model.
 - `/models` lists the cached model list, with each model's context window where the provider
   reports one.
@@ -183,6 +186,20 @@ resolves to nothing.
 Normal text messages continue the active session for that Telegram chat. Completed turns are stored
 in SQLite, including tool requests, tool results, and token usage. A session is created lazily only
 after the first complete answer is delivered. Failed or partially delivered turns are not stored.
+
+## User-defined commands
+
+Create reusable prompt templates as `<name>.md` under the global Kumo config `commands` directory,
+or under `<workspace>/.kumo/commands`. A workspace template overrides a global template with the
+same name. Invoke it as `/<name> optional arguments`; `{{args}}` in the Markdown body is replaced by
+those arguments. An optional frontmatter block may provide a description for `/commands`:
+
+```markdown
+---
+description: Summarize current project progress
+---
+Read the project and prepare a standup update for {{args}}.
+```
 
 A photo (with or without a caption) is downloaded and attached to the request as an image, so a
 vision-capable model can see it directly — no separate image-understanding tool or MCP server
@@ -258,7 +275,13 @@ The model may call these tools while answering:
 
 - `read_file` reads UTF-8 files up to 64 KiB inside the configured workspace.
 - `list_directory` lists up to 200 entries inside the configured workspace.
-- `run_command` runs a shell command in the workspace only after explicit Telegram approval.
+- `run_command` runs a shell command in the workspace only after explicit Telegram approval. Set
+  `background: true` for a long build or test; Kumo returns a job ID immediately and sends the
+  result later.
+- `command_status` and `stop_command` inspect or stop a background job. `/jobs` and
+  `/jobs stop <id>` expose the same controls directly.
+- `delegate_readonly` gives a multi-step workspace investigation to a fresh sub-agent with only
+  `read_file` and `list_directory`, then returns only its final answer to the main conversation.
 - `delegate_to_kamui` hands a coding task to [Kamui](https://github.com/algonacci/kamui) — reading,
   editing, or running commands against files in the workspace — only after explicit Telegram
   approval. Kamui runs its own agent loop (`kamui -p <task> --auto-approve`) with a proper
@@ -306,6 +329,13 @@ when it runs (respecting any standing Always-allow grant), so an unattended task
 to the usual 2-minute approval window) for the owner to respond. `ask_user` waits the same two
 minutes; if nobody answers in time, the question is withdrawn (its buttons stop working) and the
 model is told the user didn't answer, so the turn can still finish rather than hanging indefinitely.
+
+Background commands are stored in SQLite and continue outside the initiating agent turn. The
+scheduler checks for finished jobs every 30 seconds and delivers their output to the owning chat.
+Because process handles are in-memory, a Kumo restart marks any interrupted job failed; it does not
+claim that the process survived. Kumo retains the latest 100 terminal jobs per chat, never pruning
+a running one. Enable RTK output rewriting with `/rtk on` or `rtk = true` under `[tools]`. Kumo
+falls back to the original approved command if RTK is unavailable.
 
 A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
 incoming messages, so a scheduled task and a live conversation never run their agent loops at the

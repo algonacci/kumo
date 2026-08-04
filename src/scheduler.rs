@@ -54,6 +54,29 @@ async fn run_due_tasks(
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
 
+    let finished_jobs = database.lock().await.unnotified_command_jobs()?;
+    for job in finished_jobs {
+        let chat_id = ChatId(job.telegram_chat_id);
+        let message = format!(
+            "Background command finished:\n{}",
+            crate::tools::format_job(&job)
+        );
+        let mut delivered = true;
+        for chunk in crate::message_chunks(&message, 4000) {
+            if let Err(error) = bot.send_message(chat_id, chunk).await {
+                delivered = false;
+                eprintln!(
+                    "Could not notify chat {chat_id} about job {}: {error:#}",
+                    &job.id[..8]
+                );
+                break;
+            }
+        }
+        if delivered {
+            database.lock().await.mark_command_job_notified(&job.id)?;
+        }
+    }
+
     // Tasks that missed their window by too long (e.g. Kumo was offline) are skipped rather than
     // run late and silently; tell the owning chat why nothing happened at the scheduled time.
     let stale = database
