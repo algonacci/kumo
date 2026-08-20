@@ -24,6 +24,27 @@ const MAX_COMMAND_OUTPUT: usize = 16 * 1024;
 /// Coding tasks delegated to Kamui can run a whole agent loop (read, edit, test), so they get more
 /// headroom than a single shell command.
 const KAMUI_TIMEOUT: Duration = Duration::from_secs(300);
+/// Ceiling on a `background: true` job's total lifetime, and the only bound one gets: a foreground
+/// command is killed at `COMMAND_TIMEOUT` and a Kamui delegation at `KAMUI_TIMEOUT`, but a
+/// background job used to run until it exited or someone stopped it, so a runaway outlived the
+/// conversation that started it and went on holding whatever it held.
+///
+/// Kamui bounds the same feature at the same 30 minutes, and the number survives the move for the
+/// opposite reason to the one that chose it there. Kamui is a start-and-exit CLI: its jobs die
+/// with the process, so its ceiling is a second backstop behind one that fires every time the user
+/// quits. Kumo is meant to stay up for weeks, so nothing else will ever collect a forgotten job —
+/// here the ceiling is the entire guarantee, which argues for keeping it short rather than
+/// stretching it for the longer-lived host. Thirty minutes is still 60x the foreground bound and
+/// 6x a Kamui delegation, so it clears the builds and test suites `background: true` exists for,
+/// and a job that reaches it says so in its own row and notifies the chat instead of vanishing.
+///
+/// This is a backstop against a runaway process, not a limit on legitimate work: an operator whose
+/// real workload needs longer should raise it rather than route around it.
+const BACKGROUND_MAX: Duration = Duration::from_secs(30 * 60);
+/// How long to keep draining a timed-out job's pipes once its process tree has been killed. What
+/// it printed before the kill is the most useful thing it leaves behind, but waiting for that
+/// without a bound of its own would re-open the hole `BACKGROUND_MAX` exists to close.
+const BACKGROUND_KILL_GRACE: Duration = Duration::from_secs(5);
 /// How far into the future a scheduled task may be set, as a sanity bound against the model
 /// misparsing a relative date (e.g. the wrong year).
 const MAX_SCHEDULE_HORIZON: chrono::Duration = chrono::Duration::days(366);
@@ -52,6 +73,10 @@ pub struct ToolRegistry {
     database: Arc<Mutex<Database>>,
     timezone: chrono_tz::Tz,
     rtk_enabled: bool,
+    /// Ceiling on a `background: true` job (see `BACKGROUND_MAX`). Carried per registry rather
+    /// than read from the constant at the point of use so an operator setting can replace it the
+    /// same way `rtk_enabled` replaces its default.
+    background_max: Duration,
 }
 
 #[async_trait]
@@ -82,11 +107,21 @@ impl ToolRegistry {
             database,
             timezone,
             rtk_enabled: false,
+            background_max: BACKGROUND_MAX,
         })
     }
 
     pub fn with_rtk(mut self, enabled: bool) -> Self {
         self.rtk_enabled = enabled;
+        self
+    }
+
+    /// Replace the default background-job ceiling (`BACKGROUND_MAX`). Same shape as `with_rtk`,
+    /// so wiring an operator setting to it is one call at the construction site.
+    ///
+    /// Wired to `[tools] background_max_secs` in `kumo.toml`; absent leaves `BACKGROUND_MAX`.
+    pub fn with_background_max(mut self, limit: Duration) -> Self {
+        self.background_max = limit;
         self
     }
 
@@ -138,7 +173,11 @@ impl ToolRegistry {
                         },
                         "background": {
                             "type": "boolean",
-                            "description": "Set true for commands that may take longer than 30 seconds. Kumo starts the job immediately and reports back when it finishes."
+                            "description": format!(
+                                "Set true for commands that may take longer than {} seconds. Kumo starts the job immediately and reports back when it finishes. A background job is still bounded: it is terminated if it is still running after {} seconds.",
+                                COMMAND_TIMEOUT.as_secs(),
+                                self.background_max.as_secs()
+                            )
                         }
                     },
                     "required": ["command"]
@@ -542,20 +581,44 @@ impl ToolRegistry {
             )?;
             let database = self.database.clone();
             let job_id = id.clone();
+            let background_max = self.background_max;
             tokio::spawn(async move {
-                let result = child.wait_with_output().await;
-                let (status, output, exit_code) = match result {
-                    Ok(output) => {
-                        let status = if output.status.success() {
-                            "completed"
-                        } else {
-                            "failed"
-                        };
-                        let exit_code = output.status.code();
-                        (status, format_command_output(&output), exit_code)
-                    }
-                    Err(error) => ("failed", format!("Error: {error}"), None),
-                };
+                // Boxed so the ceiling below can borrow the wait rather than consume it: a plain
+                // `tokio::time::timeout(_, child.wait_with_output())` would drop the child when it
+                // elapsed, and `kill_on_drop` would then take the shell down and orphan whatever
+                // it had spawned — which is the runaway this bound exists to catch.
+                let mut wait = Box::pin(child.wait_with_output());
+                let (status, output, exit_code) =
+                    match tokio::time::timeout(background_max, &mut wait).await {
+                        Ok(Ok(output)) => {
+                            let status = if output.status.success() {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                            let exit_code = output.status.code();
+                            (status, format_command_output(&output), exit_code)
+                        }
+                        Ok(Err(error)) => ("failed", format!("Error: {error}"), None),
+                        Err(_) => {
+                            // The child is still owned by `wait`, so the tree is still walkable
+                            // from its root. `kill_process_tree` blocks while it confirms the
+                            // processes are gone, so it runs off the async workers.
+                            let killed =
+                                tokio::task::spawn_blocking(move || kill_process_tree(pid))
+                                    .await
+                                    .unwrap_or(None);
+                            let drained = tokio::time::timeout(BACKGROUND_KILL_GRACE, wait)
+                                .await
+                                .ok()
+                                .and_then(Result::ok);
+                            (
+                                "failed",
+                                format_background_timeout(background_max, killed, drained.as_ref()),
+                                None,
+                            )
+                        }
+                    };
                 let database = database.lock().await;
                 let _ = database.complete_command_job(&job_id, status, &output, exit_code);
             });
@@ -1100,6 +1163,46 @@ fn format_command_output(output: &std::process::Output) -> String {
     truncate_utf8(result, MAX_COMMAND_OUTPUT)
 }
 
+/// What a job that hit `BACKGROUND_MAX` records as its result.
+///
+/// This text is load-bearing rather than decorative. The row's status has to be one of the four
+/// values the `command_jobs` schema admits, and of those only `failed` is honest here: `cancelled`
+/// is what `stop_command` writes and would claim the owner ended the job, and `completed` would
+/// claim it finished. That leaves `failed`, which a command exiting non-zero also writes — so this
+/// line is the only thing separating a runaway that Kumo terminated from a command that simply
+/// returned an error, both in `command_status` and in the chat notice the scheduler sends.
+///
+/// `killed` is `kill_process_tree`'s verified answer, not what `kill` returned: `None` means the
+/// tree was already gone, `Some(true)` that it was confirmed gone afterwards, and `Some(false)`
+/// that something was still alive when the confirmation gave up — which the owner has to be told,
+/// because the ceiling did not actually collect the process it promised to collect.
+fn format_background_timeout(
+    limit: Duration,
+    killed: Option<bool>,
+    drained: Option<&std::process::Output>,
+) -> String {
+    let mut result = format!(
+        "Error: background job exceeded the {}-second limit and was terminated",
+        limit.as_secs()
+    );
+    if killed == Some(false) {
+        result.push_str(
+            "\nwarning: its process tree was still alive after the kill; check the host by hand",
+        );
+    }
+    if let Some(output) = drained {
+        if !output.stdout.is_empty() {
+            result.push_str("\nstdout:\n");
+            result.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            result.push_str("\nstderr:\n");
+            result.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    truncate_utf8(result, MAX_COMMAND_OUTPUT)
+}
+
 fn truncate_utf8(mut value: String, limit: usize) -> String {
     if value.len() <= limit {
         return value;
@@ -1348,6 +1451,147 @@ mod tests {
             .unwrap();
         assert_eq!(job.status, "cancelled");
         discard(root);
+    }
+
+    /// The regression test for the gap this ceiling closes: before it, this command ran for its
+    /// full 20 seconds and the row stayed `running` the whole time, because nothing but
+    /// `stop_command` or the process itself could end a background job.
+    ///
+    /// The ceiling is dialled down to one second so the test proves the mechanism rather than the
+    /// number; `background_ceiling_defaults_to_half_an_hour` covers the number.
+    #[tokio::test]
+    async fn background_job_is_terminated_when_it_exceeds_the_ceiling() {
+        let root = workspace();
+        let database = test_database();
+        let tools = ToolRegistry::new(root.clone(), Vec::new(), database.clone(), chrono_tz::UTC)
+            .unwrap()
+            .with_background_max(Duration::from_secs(1));
+        let command = if cfg!(windows) {
+            "ping -n 20 127.0.0.1 >NUL"
+        } else {
+            "sleep 20"
+        };
+        tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command, "background": true })
+                        .to_string(),
+                },
+            )
+            .await;
+
+        let mut finished = None;
+        for _ in 0..250 {
+            let job = database.lock().await.list_command_jobs(42, 1).unwrap()[0].clone();
+            if job.status != "running" {
+                finished = Some(job);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let job = finished.expect("background job outlived its ceiling");
+
+        // `failed`, never `cancelled`: the owner did not stop this job, Kumo did, and the row is
+        // read back by `command_status` and by the scheduler's chat notice.
+        assert_eq!(job.status, "failed");
+        let output = job.output.expect("a terminated job records why it ended");
+        assert!(
+            output.contains("exceeded the 1-second limit and was terminated"),
+            "the row has to say what happened, got: {output}"
+        );
+        // `kill_process_tree` confirms the processes are gone rather than trusting `kill`; the
+        // warning is only added when that confirmation fails, so its absence is the proof.
+        assert!(
+            !output.contains("still alive after the kill"),
+            "the process tree was not confirmed gone: {output}"
+        );
+        discard(root);
+    }
+
+    /// A job that reaches the ceiling still gets to keep what it printed on the way there.
+    #[tokio::test]
+    async fn a_terminated_job_keeps_the_output_it_produced() {
+        let root = workspace();
+        let database = test_database();
+        let tools = ToolRegistry::new(root.clone(), Vec::new(), database.clone(), chrono_tz::UTC)
+            .unwrap()
+            .with_background_max(Duration::from_secs(1));
+        let command = if cfg!(windows) {
+            "echo before-the-ceiling && ping -n 20 127.0.0.1 >NUL"
+        } else {
+            "printf before-the-ceiling; sleep 20"
+        };
+        tools
+            .dispatch(
+                42,
+                &ToolCall {
+                    id: "1".into(),
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command, "background": true })
+                        .to_string(),
+                },
+            )
+            .await;
+
+        let mut finished = None;
+        for _ in 0..250 {
+            let job = database.lock().await.list_command_jobs(42, 1).unwrap()[0].clone();
+            if job.status != "running" {
+                finished = Some(job);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let job = finished.expect("background job outlived its ceiling");
+        let output = job.output.expect("a terminated job records why it ended");
+        assert!(output.contains("was terminated"), "got: {output}");
+        assert!(output.contains("before-the-ceiling"), "got: {output}");
+        discard(root);
+    }
+
+    /// The default is the whole guarantee for a gateway that never exits, so it is worth pinning:
+    /// a silent change to it would only show up as a runaway nobody collected.
+    #[test]
+    fn background_ceiling_defaults_to_half_an_hour() {
+        assert_eq!(BACKGROUND_MAX, Duration::from_secs(1800));
+        let root = workspace();
+        let tools = registry(root.clone(), Vec::new());
+        assert_eq!(tools.background_max, BACKGROUND_MAX);
+
+        // The model is told the bound exists, so it does not reach for `background: true` as a way
+        // around every limit.
+        let run_command = tools
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == "run_command")
+            .expect("run_command is always defined");
+        let background = run_command.parameters["properties"]["background"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            background.contains("terminated if it is still running after 1800 seconds"),
+            "got: {background}"
+        );
+        discard(root);
+    }
+
+    #[test]
+    fn a_timed_out_job_reports_an_unconfirmed_kill() {
+        let confirmed = format_background_timeout(Duration::from_secs(1800), Some(true), None);
+        assert!(confirmed.contains("exceeded the 1800-second limit and was terminated"));
+        assert!(!confirmed.contains("still alive after the kill"));
+
+        // Already gone by the time the ceiling fired: nothing to warn about.
+        let vanished = format_background_timeout(Duration::from_secs(1800), None, None);
+        assert!(!vanished.contains("still alive after the kill"));
+
+        // Confirmation gave up with something still running — the one case the owner has to act on.
+        let survived = format_background_timeout(Duration::from_secs(1800), Some(false), None);
+        assert!(survived.contains("still alive after the kill"));
     }
 
     #[tokio::test]
