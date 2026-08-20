@@ -1933,10 +1933,13 @@ pub(crate) fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn models_message(config: &Config) -> String {
-    let provider = config
-        .provider
-        .as_ref()
-        .expect("provider is configured before gateway startup");
+    // `config.provider()` resolves the *active* entry; the `provider` field alone is `None` as
+    // soon as onboarding migrates a second provider into `[providers.*]`, which is why reading
+    // the field here used to panic on exactly the installs that had more than one to list.
+    let provider = match config.provider() {
+        Ok(provider) => provider,
+        Err(error) => return error.to_string(),
+    };
     let mut message = format!("Available models (current: {}):\n", provider.active_model);
     for model in &provider.models {
         let line = match provider.context_windows.get(model) {
@@ -2003,10 +2006,11 @@ async fn switch_provider(state: &RwLock<AppState>, name: &str) -> String {
 /// unknown model, small enough to compact away history a large model could still hold. `/context`
 /// is the way to tell Kumo the real number when the provider will not.
 fn context_window_message(config: &Config) -> String {
-    let provider = config
-        .provider
-        .as_ref()
-        .expect("provider is configured before gateway startup");
+    // Same resolution as `models_message` — and the same reason. See the note there.
+    let provider = match config.provider() {
+        Ok(provider) => provider,
+        Err(error) => return error.to_string(),
+    };
     match provider.active_context_window() {
         Some(window) => {
             let source = if provider
@@ -2417,6 +2421,28 @@ mod tests {
     #[test]
     fn splits_long_unicode_messages_without_corruption() {
         assert_eq!(message_chunks("abé日", 2), vec!["ab", "é日"]);
+    }
+
+    /// Onboarding a second provider moves the flat `[provider]` block into `[providers.*]` and
+    /// leaves the field itself `None`. Both message builders used to read that field directly and
+    /// panicked here — on precisely the installs with more than one provider to report.
+    #[test]
+    fn listing_models_and_context_survives_a_second_provider() {
+        let config: Config = toml::from_str(
+            "active_provider = \"b\"\n\
+             \n[providers.b]\nbase_url = \"https://b.example.com/v1\"\napi_key = \"k\"\n\
+             active_model = \"model-b\"\nmodels = [\"model-b\"]\n\
+             \n[telegram]\nbot_token = \"123:secret\"\nbot_username = \"bot\"\n\
+             owner_user_id = 42\n",
+        )
+        .unwrap();
+        assert!(
+            config.provider.is_none(),
+            "the flat block is what onboarding empties"
+        );
+
+        assert!(models_message(&config).contains("model-b"));
+        assert!(!context_window_message(&config).is_empty());
     }
 
     #[test]
