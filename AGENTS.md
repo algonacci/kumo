@@ -262,9 +262,11 @@ Verified on this repository, on Windows, at this commit.
   a deliberate concession to macOS, where reading another process's argv needs privileges. Two
   copies of the same binary running for any reason will read as "the gateway is running".
 - **Killing a background job on Windows leaves the workspace directory briefly locked.** The
-  process tree is killed through `sysinfo` (`tools.rs:976`); the cwd handle outlives the kill by
-  enough that an immediate `remove_dir_all` fails with OS error 32. This is what makes one test red
-  (see Verification).
+  process tree is killed through `sysinfo` (`tools.rs:976`) and the processes are gone before
+  `stop_command` returns, but Windows frees the working directory only once the last handle to the
+  exited process closes, which the runtime does on its own schedule — seconds later, in practice.
+  Test teardown retries around this (`tools::tests::discard`); production code that deletes a
+  workspace right after stopping a job would need to do the same.
 - **RTK is optional everywhere.** `tools.rtk` off, or a missing `rtk` binary, must always leave the
   original command running. Never make RTK a dependency of execution.
 
@@ -281,20 +283,18 @@ cargo clippy --all-targets -- -D warnings
 There is no CI workflow that runs any of them — `.github/workflows/release.yml` is tag-triggered and
 only builds and packages release binaries for five targets. This file's list is the whole gate.
 
-Two of the three are not green on a clean checkout at `6bc1e1c`, so do not read either as your own
-breakage:
+`cargo test` and `cargo fmt --check` are green on Windows (161 + 2 passed). Clippy is not, and that
+one is expected:
 
 - **Clippy reports 5 pre-existing warnings, all `collapsible_if`:** `markdown.rs:67`, `:76`, `:87`,
   `:98`, and `main.rs:1679`. With `-D warnings` the build therefore fails before and after any
   unrelated change. Compare warning *lists*, not exit codes, and fix these only as a deliberate
   cleanup commit of their own.
-- **`tools::tests::stop_command_cancels_a_running_background_job` fails on Windows**, deterministically
-  (3/3 runs), at `tools.rs:1309`: every assertion in the test passes and the final
-  `remove_dir_all(root)` panics with "The process cannot access the file because it is being used by
-  another process". It is the teardown, not the behaviour under test. On this machine `cargo test` is
-  159 passed / 1 failed.
-
-`cargo fmt --check` is clean. Add tests next to the code they cover, in `#[cfg(test)] mod tests` at
+- **One CLI test is `#[cfg(unix)]`.** `status_reports_an_unconfigured_isolated_home` cannot be
+  arranged on Windows: `directories` resolves the config directory through the Known Folder API, so
+  `HOME`/`XDG_CONFIG_HOME` do not move it and `status` finds the real one. Giving Windows that
+  coverage needs an explicit config-directory override, the way `KUMO_DATA_DIR` already overrides
+  the data directory. Add tests next to the code they cover, in `#[cfg(test)] mod tests` at
 the bottom of the module; `tests/` holds only the CLI integration test and there is no reason to add
 a second file there. No test may require `kamui`, `rtk`, an MCP server, a Telegram token or a live
 provider — `tests::readonly_subagent_uses_isolated_provider_and_read_tools` shows the pattern of
@@ -306,13 +306,6 @@ Honest list of what does not work or is not covered. Keep it current: it is read
 so a stale entry sends the next agent to fix something already fixed — and a fixed entry left here is
 a lie told with authority.
 
-- **`/models` and `/context` panic on a multi-provider install.** `models_message`
-  (`main.rs:1936`) and `context_window_message` (`main.rs:2006`) read the flat `[provider]` block
-  with `.expect(...)`, while everything else resolves through `Config::provider()`. Once a second
-  provider is configured, onboarding takes the flat block (`onboarding.rs:93`) and leaves it `None`,
-  so those two handlers unwrap a `None`. `refresh_models` (`main.rs:2070`) and `run_doctor`
-  (`main.rs:2289`) read the same field and merely report "Model provider is not configured", which
-  is wrong but harmless. Fix is mechanical: use `config.provider()`.
 - **Nothing in the agent loop is tested against a live provider**, and by construction cannot be.
   `run_agent`, the approval flow, the scheduler dispatch and the Telegram handlers have no test
   coverage; what is covered is tools, storage, compaction, markdown, config and the sub-agent.

@@ -27,6 +27,13 @@ fn invalid_cli_input_fails_with_usage_guidance() {
     assert!(stderr.contains("kumo --help"));
 }
 
+/// Unix only, because the isolation this test depends on cannot be arranged on Windows: the
+/// `directories` crate resolves the config directory through the Known Folder API rather than the
+/// environment, so `HOME` and `XDG_CONFIG_HOME` do not move it and `status` finds the real
+/// `%APPDATA%\kumo\kumo.toml` of whoever is running the suite. Giving Windows this coverage would
+/// mean an explicit override for the config directory, the way `KUMO_DATA_DIR` already overrides
+/// the data one — a deliberate addition, not something to slip in for a test.
+#[cfg(unix)]
 #[test]
 fn status_reports_an_unconfigured_isolated_home() {
     let home = std::env::temp_dir().join(format!("kumo-cli-{}", std::process::id()));

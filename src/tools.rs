@@ -989,14 +989,32 @@ fn kill_process_tree(pid: u32) -> Option<bool> {
             }
         }
     }
-    let mut killed = true;
-    for child in descendants.into_iter().rev() {
-        if let Some(process) = system.process(child) {
-            killed &= process.kill();
+    for child in descendants.iter().rev() {
+        if let Some(process) = system.process(*child) {
+            process.kill();
         }
     }
-    killed &= system.process(root).is_some_and(sysinfo::Process::kill);
-    Some(killed)
+    if let Some(process) = system.process(root) {
+        process.kill();
+    }
+
+    // Trust what the process table says afterwards, not what `kill` returned. Killing a shell's
+    // last child makes the shell exit on its own, so the follow-up kill lands on a process that
+    // has already gone and reports failure — which is the success case wearing the wrong answer.
+    // Reporting that as "could not stop process" told the user a stop had failed when it had not.
+    for _ in 0..40 {
+        let mut after = sysinfo::System::new();
+        after.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let alive = after.process(root).is_some()
+            || descendants
+                .iter()
+                .any(|child| after.process(*child).is_some());
+        if !alive {
+            return Some(true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Some(false)
 }
 
 fn parse_task(arguments: &str) -> Result<String> {
@@ -1136,6 +1154,29 @@ mod tests {
         root
     }
 
+    /// Remove a test workspace, tolerating Windows releasing handles late.
+    ///
+    /// A killed background process is gone before `stop_command` returns — `kill_process_tree`
+    /// now verifies that rather than trusting what `kill` reported — but Windows frees its
+    /// working directory only once the last handle to the exited process is closed, which the
+    /// runtime does on its own schedule. So `remove_dir_all` can fail with a sharing violation
+    /// seconds after every assertion in the test has passed.
+    ///
+    /// Retrying costs nothing when the first attempt succeeds, which is every test but the one
+    /// that kills something. A failure that outlives the retries is still reported, because a
+    /// directory that never frees is a real problem rather than a slow one.
+    fn discard(root: PathBuf) {
+        for _ in 0..240 {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        std::fs::remove_dir_all(&root)
+            .unwrap_or_else(|error| panic!("cannot remove {}: {error}", root.display()));
+    }
+
     fn test_database() -> Arc<Mutex<Database>> {
         Arc::new(Mutex::new(Database::open_in_memory_for_tests()))
     }
@@ -1176,7 +1217,7 @@ mod tests {
                 .contains("hello.txt")
         );
 
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[tokio::test]
@@ -1220,7 +1261,7 @@ mod tests {
             )
             .await;
         assert!(output.contains("not available to the read-only sub-agent"));
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[tokio::test]
@@ -1259,7 +1300,7 @@ mod tests {
         let job = completed.expect("background command did not finish");
         assert_eq!(job.status, "completed");
         assert!(job.output.unwrap().contains("background-ok"));
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[tokio::test]
@@ -1306,7 +1347,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(job.status, "cancelled");
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[tokio::test]
@@ -1328,7 +1369,7 @@ mod tests {
             .await;
 
         assert!(output.contains("escapes the configured workspace"));
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
         std::fs::remove_file(outside).unwrap();
     }
 
@@ -1354,7 +1395,7 @@ mod tests {
 
         assert!(output.starts_with("exit code: 0"));
         assert!(output.contains("hello"));
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[test]
@@ -1385,7 +1426,7 @@ mod tests {
         assert!(tools.requires_confirmation(&call.name));
         assert_eq!(tools.preview(&call).as_deref(), Some("Fake {}"));
         assert_eq!(tools.dispatch(42, &call).await, "pong");
-        std::fs::remove_dir_all(root).unwrap();
+        discard(root);
     }
 
     #[test]

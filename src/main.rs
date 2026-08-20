@@ -2071,8 +2071,12 @@ async fn set_context_window(state: &RwLock<AppState>, tokens: &str) -> String {
 async fn refresh_models(state: &RwLock<AppState>) -> String {
     let (base_url, api_key) = {
         let state = state.read().await;
-        let Some(provider) = state.config.provider.as_ref() else {
-            return "Model provider is not configured.".to_owned();
+        // The active entry, not the flat block — the same distinction that used to make
+        // `/models` panic. Reading the field here reported "not configured" on an install that
+        // has several providers, which is the opposite of the truth.
+        let provider = match state.config.provider() {
+            Ok(provider) => provider,
+            Err(error) => return error.to_string(),
         };
         (provider.base_url.clone(), provider.api_key.clone())
     };
