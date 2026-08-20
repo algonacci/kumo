@@ -350,6 +350,12 @@ Honest list of what does not work or is not covered. Keep it current: it is read
 so a stale entry sends the next agent to fix something already fixed — and a fixed entry left here is
 a lie told with authority.
 
+- **`**` still pairs across a whole message, so two globs bold the text between them.** The
+  underscore fix removed the emphasis marker that broke identifiers, but `**` is unchanged and
+  unguarded: a message containing `src/**/*.rs and lib/**/*.rs` closes the first `**` on the
+  second and bolds everything in between. A single glob is safe, because nothing closes it, which
+  is why this survived the underscore work — the failure needs two. Same class as the bug that was
+  fixed, and the same test would catch it.
 - **Nothing in the agent loop is tested against a live provider**, and by construction cannot be.
   `run_agent`, the approval flow, the scheduler dispatch and the Telegram handlers have no test
   coverage; what is covered is tools, storage, compaction, markdown, config and the sub-agent.
