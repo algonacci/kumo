@@ -612,8 +612,11 @@ impl ToolRegistry {
                                 .await
                                 .ok()
                                 .and_then(Result::ok);
+                            // Its own status since `user_version = 9`: a job that ran out of
+                            // time is not a command that exited non-zero, and telling them apart
+                            // used to mean reading the output line.
                             (
-                                "failed",
+                                "timed_out",
                                 format_background_timeout(background_max, killed, drained.as_ref()),
                                 None,
                             )
@@ -1494,9 +1497,10 @@ mod tests {
         }
         let job = finished.expect("background job outlived its ceiling");
 
-        // `failed`, never `cancelled`: the owner did not stop this job, Kumo did, and the row is
-        // read back by `command_status` and by the scheduler's chat notice.
-        assert_eq!(job.status, "failed");
+        // Its own status, and never `cancelled`: the owner did not stop this job, Kumo did, and
+        // running out of time is not the same as exiting non-zero. The row is read back by
+        // `command_status` and by the scheduler's chat notice.
+        assert_eq!(job.status, "timed_out");
         let output = job.output.expect("a terminated job records why it ended");
         assert!(
             output.contains("exceeded the 1-second limit and was terminated"),

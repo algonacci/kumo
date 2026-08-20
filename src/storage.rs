@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage};
 
-const CURRENT_VERSION: i64 = 8;
+const CURRENT_VERSION: i64 = 9;
 
 pub struct Database {
     connection: Connection,
@@ -157,6 +157,9 @@ impl Database {
         }
         if version < 8 {
             migrate_to_v8(&connection)?;
+        }
+        if version < 9 {
+            migrate_to_v9(&connection)?;
         }
         Ok(Self { connection, path })
     }
@@ -650,7 +653,7 @@ impl Database {
             "SELECT id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
                     created_at
              FROM command_jobs
-             WHERE notified = 0 AND status IN ('completed', 'failed', 'cancelled')
+             WHERE notified = 0 AND status IN ('completed', 'failed', 'cancelled', 'timed_out')
              ORDER BY finished_at, rowid",
         )?;
         let rows = statement.query_map([], job_from_row)?;
@@ -1221,6 +1224,46 @@ fn migrate_to_v8(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Give a background job that ran out of time a status of its own.
+///
+/// It shared `failed` with a command that exited non-zero, so telling the two apart meant reading
+/// the output line. SQLite cannot alter a CHECK constraint, so the table is rebuilt; every existing
+/// row keeps the status it already had, because which of the old `failed` rows were timeouts is not
+/// recoverable and guessing would be worse than leaving them as they were recorded.
+fn migrate_to_v9(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "BEGIN;
+         CREATE TABLE command_jobs_v9 (
+             id TEXT PRIMARY KEY,
+             telegram_chat_id INTEGER NOT NULL,
+             command TEXT NOT NULL,
+             workspace TEXT NOT NULL,
+             status TEXT NOT NULL
+                 CHECK (status IN ('running', 'completed', 'failed', 'cancelled', 'timed_out'))
+                 DEFAULT 'running',
+             pid INTEGER,
+             output TEXT,
+             exit_code INTEGER,
+             notified INTEGER NOT NULL DEFAULT 0,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             finished_at INTEGER
+         );
+         INSERT INTO command_jobs_v9
+             SELECT id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
+                    notified, created_at, finished_at
+             FROM command_jobs;
+         DROP TABLE command_jobs;
+         ALTER TABLE command_jobs_v9 RENAME TO command_jobs;
+         CREATE INDEX command_jobs_chat_time
+             ON command_jobs(telegram_chat_id, created_at DESC);
+         CREATE INDEX command_jobs_notifications
+             ON command_jobs(notified, status, finished_at);
+         PRAGMA user_version = 9;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn active_session_id_in(transaction: &Transaction<'_>, chat_id: i64) -> Result<Option<String>> {
     transaction
         .query_row(
@@ -1710,6 +1753,95 @@ mod tests {
             second_claim.is_empty(),
             "a claimed (running) task must not be claimed a second time"
         );
+    }
+
+    /// The v9 rebuild is the risky kind of migration: SQLite cannot alter a CHECK constraint, so
+    /// the table is recreated and its rows copied. A copy that quietly drops rows, loses a column,
+    /// or forgets an index looks exactly like a working migration until someone goes looking for
+    /// an old job.
+    #[test]
+    fn migrating_to_v9_keeps_every_job_and_admits_the_new_status() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .unwrap();
+        migrate_to_v1(&connection).unwrap();
+        for migrate in [
+            migrate_to_v2,
+            migrate_to_v3,
+            migrate_to_v4,
+            migrate_to_v5,
+            migrate_to_v6,
+            migrate_to_v7,
+            migrate_to_v8,
+        ] {
+            migrate(&connection).unwrap();
+        }
+
+        connection
+            .execute_batch(
+                "INSERT INTO command_jobs
+                     (id, telegram_chat_id, command, workspace, status, pid, output, exit_code,
+                      notified, created_at, finished_at)
+                 VALUES ('old-1', 42, 'cargo build', '/w', 'failed', 7, 'boom', 1, 0, 100, 110),
+                        ('old-2', 42, 'cargo test', '/w', 'completed', 8, 'fine', 0, 1, 120, 130);",
+            )
+            .unwrap();
+
+        migrate_to_v9(&connection).unwrap();
+
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+
+        // One string per row rather than a five-wide tuple: the point is that no column was lost,
+        // and comparing rendered rows says that as precisely with a type worth reading.
+        let rows: Vec<String> = connection
+            .prepare(
+                "SELECT id || '|' || status || '|' || exit_code || '|' || output || '|' ||
+                        created_at
+                 FROM command_jobs ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                "old-1|failed|1|boom|100".to_owned(),
+                "old-2|completed|0|fine|120".to_owned(),
+            ],
+            "every column of every row survives, and an old `failed` is not reinterpreted"
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO command_jobs (id, telegram_chat_id, command, workspace, status)
+                 VALUES ('new-1', 42, 'sleep 999', '/w', 'timed_out');",
+            )
+            .expect("the new status is admitted by the rebuilt CHECK");
+        assert!(
+            connection
+                .execute_batch(
+                    "INSERT INTO command_jobs (id, telegram_chat_id, command, workspace, status)
+                     VALUES ('new-2', 42, 'x', '/w', 'nonsense');"
+                )
+                .is_err(),
+            "the CHECK still rejects a status that is not one of the five"
+        );
+
+        let indexes: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'command_jobs' AND name LIKE 'command_jobs_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "both indexes are recreated on the new table");
     }
 
     #[test]

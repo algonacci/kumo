@@ -341,7 +341,7 @@ Background commands are stored in SQLite and continue outside the initiating age
 scheduler checks for finished jobs every 30 seconds and delivers their output to the owning chat.
 A background job is capped at 30 minutes — a backstop against a runaway process, not a limit on
 legitimate long-running work. A job that reaches the cap has its process tree killed and is reported
-as having been terminated by the cap, which is distinct from a job you stopped yourself.
+as `timed_out`, which is its own status: distinct from a job you stopped yourself (`cancelled`) and from a command that exited non-zero (`failed`).
 Because process handles are in-memory, a Kumo restart marks any interrupted job failed; it does not
 claim that the process survived. Kumo retains the latest 100 terminal jobs per chat, never pruning
 a running one. The cap is half an hour by default; set `background_max_secs` under `[tools]` if your

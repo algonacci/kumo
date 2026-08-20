@@ -49,7 +49,7 @@ src/
 ├── tools.rs       everything the model can call. The Tool registry, its JSON schemas, path
 │                  safety, run_command, RTK rewriting, delegate_to_kamui, scheduling, memory,
 │                  background jobs. Permission policy is NOT here (see below).
-├── storage.rs     SQLite: schema and sequential migrations (CURRENT_VERSION = 8, storage.rs:10),
+├── storage.rs     SQLite: schema and sequential migrations (CURRENT_VERSION = 9, storage.rs:10),
 │                  sessions/messages/usage, scheduled tasks, command jobs, memory, audit events,
 │                  always-allow grants, per-chat workspaces. Also owns data_dir/KUMO_DATA_DIR.
 ├── config.rs      kumo.toml: shape, load/save, flat vs named providers, MCP trust, timezone,
@@ -219,6 +219,15 @@ word boundaries and is strong emphasis under those same rules, so it would still
 Re-adding underscore emphasis means re-breaking every identifier in a code answer, which is most of
 what this gateway sends.
 
+**A job that ran out of time has its own status.** `command_jobs.status` gained `timed_out` in
+`migrate_to_v9`. It used to share `failed` with a command that exited non-zero, so telling them
+apart meant reading the output line — and the two are not the same event: one is the command's own
+answer, the other is Kumo's. `cancelled` stays reserved for a stop the owner asked for. SQLite
+cannot alter a CHECK constraint, so v9 rebuilds the table; existing rows keep the status they were
+recorded with, because which old `failed` rows were timeouts is not recoverable and guessing would
+invent history. Anything enumerating terminal statuses has to include it — `unnotified_command_jobs`
+does; `prune_terminal_command_jobs` asks `status != 'running'` and needed no change.
+
 **Permission policy lives in the agent loop, not in tools.** A tool answers `requires_confirmation`;
 `run_agent` decides what to do about it. That is why an MCP tool, `run_command` and
 `delegate_to_kamui` all get the identical prompt, audit rows and standing-grant behaviour without
@@ -363,11 +372,6 @@ a lie told with authority.
   is left `running` and the claim at `storage.rs:838` holds. What is *not* covered is the work
   itself: a task still running at the grace limit (a five-minute Kamui delegation, say) is cut off
   and re-run from the start on the next dispatch, since a scheduled turn has no resume point.
-- **A timed-out background job is recorded as `failed`, not as its own status.** The
-  `command_jobs.status` CHECK (`storage.rs:1192`) admits only `running`/`completed`/`failed`/
-  `cancelled`, so a job that hits the ceiling shares a status with a command that exited non-zero,
-  and only its `output` line ("exceeded the N-second limit and was terminated") tells them apart.
-  A distinct `timed_out` needs a `migrate_to_v9` and a `CURRENT_VERSION` bump.
 - **A turn failure is reported by class, but the class is only as good as its tagging.**
   `deliver_agent_turn` (`main.rs:949`) now reports provider, tool, storage and Telegram failures as
   what they are (`turn_failure_report`, `main.rs:175`), from the `TurnFailure` wrapper each site in
