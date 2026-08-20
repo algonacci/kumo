@@ -283,11 +283,14 @@ Verified on this repository, on Windows, at this commit.
 - **`cmd /C` vs `sh -c`.** `tools.rs:519-523`. A command the model composes with `&&`, quoting,
   `$VAR` or `>NUL` behaves differently per platform, and Kumo does not normalise any of it. Tests
   that shell out pick a per-platform command string (`tools.rs:1271-1275`) — follow that pattern.
-- **MCP servers are spawned directly, with no shell.** `mcp.rs:103-108` calls
-  `Command::new(&server.command)`. Rust's `Command` cannot execute a `.cmd` batch shim, which is how
-  npm installs `npx`, and how `uvx` often arrives — so the README's `command = "npx"` example is the
-  Unix shape. On Windows configure `command = "cmd"` with `args = ["/C", "npx", ...]`. This is the
-  same trap Kage records for its own harness spawning.
+- **MCP servers are spawned directly, with no shell — but a bare name is resolved first.**
+  `Command::new` does not consult `PATHEXT`, so `command = "npx"` failed with "program not found"
+  while `npx.cmd` sat on `PATH`; that is how npm installs `npx` and how `uvx` often arrives.
+  `resolve_program` (`mcp.rs`) now searches `PATH` × `PATHEXT` on Windows and hands the spawn the
+  file a shell would have run. A name that already carries a path or an extension is untouched, and
+  one that matches nothing falls through so the spawn error still names what the user wrote.
+  Routing through `cmd /C` would also have worked and was rejected: it re-parses every configured
+  argument, which is a quoting hazard the config never asked for. Off Windows this is a passthrough.
 - **A failing MCP server's stderr is discarded** (`.stderr(Stdio::null())`, `mcp.rs:106`), so the
   only diagnosis available is the connection error text `kumo doctor` prints. Debug a stubborn
   server by running its command by hand first.
@@ -350,12 +353,6 @@ Honest list of what does not work or is not covered. Keep it current: it is read
 so a stale entry sends the next agent to fix something already fixed — and a fixed entry left here is
 a lie told with authority.
 
-- **`**` still pairs across a whole message, so two globs bold the text between them.** The
-  underscore fix removed the emphasis marker that broke identifiers, but `**` is unchanged and
-  unguarded: a message containing `src/**/*.rs and lib/**/*.rs` closes the first `**` on the
-  second and bolds everything in between. A single glob is safe, because nothing closes it, which
-  is why this survived the underscore work — the failure needs two. Same class as the bug that was
-  fixed, and the same test would catch it.
 - **Nothing in the agent loop is tested against a live provider**, and by construction cannot be.
   `run_agent`, the approval flow, the scheduler dispatch and the Telegram handlers have no test
   coverage; what is covered is tools, storage, compaction, markdown, config and the sub-agent.
@@ -378,9 +375,6 @@ a lie told with authority.
   fallible call added to the agent loop without a `.classify(...)` is misreported as a Kumo bug
   rather than as whatever it is. The user-facing text is built from the class alone and never
   quotes the error, so the log reference id is still the only way to see the detail.
-- **An uploaded document's path is absolute, but `read_file` rejects absolute paths**
-  (`tools.rs:502`). The upload prompt hands the model `<workspace>/uploads/...` in full
-  (`main.rs:927`), which works for MCP data tools and fails for Kumo's own reader.
 - **Chunking tracks code fences by line, so a fence written mid-line is invisible to it.**
   `message_chunks` (`main.rs:2224`) now splits at a line boundary, closing and re-opening a fenced
   block across the boundary, and falls back to a space where no inline entity is open before it

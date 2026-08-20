@@ -99,8 +99,47 @@ pub async fn connect_all(
     Connections { tools, statuses }
 }
 
+/// Resolve a bare program name the way a shell would on Windows, and only there.
+///
+/// `Command::new` spawns a program; it does not consult `PATHEXT`. Most of the MCP ecosystem is
+/// launched through `npx`, `uvx` or `npm`, which on Windows are `.cmd` shims rather than `.exe`
+/// files — so the README's own `command = "npx"` example failed with "program not found" while
+/// the shim sat on `PATH`. Spawning through `cmd /C` would fix that too, but it would also hand
+/// every configured argument to a shell for re-parsing, which is a quoting hazard nobody asked
+/// for. Finding the file the shell would have found keeps the spawn direct.
+///
+/// A name that already carries a path or an extension is left alone, and so is one nothing
+/// matches — that falls through to the original spawn error, which names the command the user
+/// actually wrote.
+#[cfg(windows)]
+fn resolve_program(command: &str) -> std::ffi::OsString {
+    use std::path::Path;
+
+    if command.contains(['/', '\\']) || Path::new(command).extension().is_some() {
+        return command.into();
+    }
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let Some(path) = std::env::var_os("PATH") else {
+        return command.into();
+    };
+    for directory in std::env::split_paths(&path) {
+        for extension in extensions.split(';').filter(|ext| !ext.is_empty()) {
+            let candidate = directory.join(format!("{command}{extension}"));
+            if candidate.is_file() {
+                return candidate.into_os_string();
+            }
+        }
+    }
+    command.into()
+}
+
+#[cfg(not(windows))]
+fn resolve_program(command: &str) -> std::ffi::OsString {
+    command.into()
+}
+
 async fn connect(name: &str, server: &McpServerConfig) -> Result<Vec<Arc<dyn ExternalTool>>> {
-    let mut command = tokio::process::Command::new(&server.command);
+    let mut command = tokio::process::Command::new(resolve_program(&server.command));
     command.args(&server.args);
     let (transport, _stderr) = TokioChildProcess::builder(command)
         .stderr(Stdio::null())
@@ -255,6 +294,53 @@ pub(crate) fn extract_media(output: String) -> (String, Vec<McpImage>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The failure this guards against is Windows-only, and so is the fix: `Command::new("npx")`
+    /// reports "program not found" while `npx.cmd` sits on `PATH`, because spawning does not
+    /// consult `PATHEXT`.
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_shim_name_resolves_to_the_file_a_shell_would_run() {
+        let resolved = resolve_program("cmd");
+        let resolved = std::path::Path::new(&resolved);
+        assert!(
+            resolved.is_file(),
+            "a bare name on PATH must resolve to a real file, got {}",
+            resolved.display()
+        );
+        assert!(
+            resolved.extension().is_some(),
+            "and it must carry the extension"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_name_that_matches_nothing_is_left_for_the_spawn_error_to_report() {
+        assert_eq!(
+            resolve_program("kumo-no-such-program"),
+            std::ffi::OsString::from("kumo-no-such-program")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_explicit_path_or_extension_is_never_rewritten() {
+        assert_eq!(
+            resolve_program("node.exe"),
+            std::ffi::OsString::from("node.exe")
+        );
+        assert_eq!(
+            resolve_program("C:/tools/thing"),
+            std::ffi::OsString::from("C:/tools/thing")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolution_is_a_passthrough_off_windows() {
+        assert_eq!(resolve_program("npx"), std::ffi::OsString::from("npx"));
+    }
 
     #[test]
     fn renders_text_content_parts() {

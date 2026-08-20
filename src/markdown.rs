@@ -83,8 +83,8 @@ fn render_inline(text: &str) -> String {
                 continue;
             }
         }
-        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            if let Some(end) = find_str(&chars, i + 2, "**") {
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' && opens_bold(&chars, i) {
+            if let Some(end) = find_bold_close(&chars, i + 2) {
                 out.push('*');
                 out.push_str(&render_inline(
                     &chars[i + 2..end].iter().collect::<String>(),
@@ -143,6 +143,37 @@ fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
         .map(|i| i + from)
 }
 
+/// Whether the `**` at `at` may open bold: only at the start of the message or after whitespace.
+///
+/// Without this, `**` pairs across a whole message the way `_` used to. `src/**/*.rs and
+/// lib/**/*.rs` closes the first glob's `**` on the second one's and bolds everything between.
+/// Flanking rules do not help here — `/` is punctuation, so that `**` is a legal opener under
+/// CommonMark and a strict renderer bolds it too. A word boundary is the thing that separates
+/// emphasis someone meant from two globs that happen to share a message.
+fn opens_bold(chars: &[char], at: usize) -> bool {
+    match at.checked_sub(1).map(|prev| chars[prev]) {
+        None => true,
+        Some(previous) => previous.is_whitespace(),
+    }
+}
+
+/// The `**` that closes a bold run: it must be followed by the end of the message, whitespace, or
+/// punctuation, so `**` sitting inside a word (or a path) cannot end one.
+fn find_bold_close(chars: &[char], from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(end) = find_str(chars, at, "**") {
+        let closes = match chars.get(end + 2) {
+            None => true,
+            Some(next) => next.is_whitespace() || next.is_ascii_punctuation(),
+        };
+        if closes {
+            return Some(end);
+        }
+        at = end + 2;
+    }
+    None
+}
+
 fn find_str(chars: &[char], from: usize, needle: &str) -> Option<usize> {
     let needle: Vec<char> = needle.chars().collect();
     if from + needle.len() > chars.len() {
@@ -171,6 +202,33 @@ mod tests {
 
     /// An identifier must survive the round trip: the underscores reach Telegram escaped, which
     /// renders as the literal name rather than as an italic entity.
+    #[test]
+    fn two_globs_in_one_message_do_not_bold_the_text_between_them() {
+        let rendered = to_telegram_markdown_v2("src/**/*.rs and lib/**/*.rs");
+        // Every asterisk must arrive escaped. An unescaped one is an entity marker, which means a
+        // glob was read as emphasis — with the bug the run from `src/**` to `lib/**` opened bold
+        // and swallowed `/*.rs and lib/` into it.
+        let unescaped = rendered
+            .char_indices()
+            .filter(|(at, ch)| *ch == '*' && !rendered[..*at].ends_with('\\'))
+            .count();
+        assert_eq!(unescaped, 0, "a glob was rendered as emphasis: {rendered}");
+        assert!(
+            rendered.contains("and"),
+            "the words themselves survive: {rendered}"
+        );
+    }
+
+    #[test]
+    fn bold_still_works_where_someone_meant_it() {
+        assert_eq!(to_telegram_markdown_v2("**loud**"), "*loud*");
+        assert_eq!(
+            to_telegram_markdown_v2("say **loud** now"),
+            "say *loud* now"
+        );
+        assert_eq!(to_telegram_markdown_v2("**loud**."), r"*loud*\.");
+    }
+
     #[test]
     fn leaves_underscores_in_identifiers_literal() {
         assert_eq!(

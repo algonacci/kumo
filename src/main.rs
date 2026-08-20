@@ -869,6 +869,26 @@ async fn handle_photo_message(
     .await
 }
 
+/// The prompt an upload turns into, naming the file both ways.
+///
+/// The two kinds of reader need different spellings and the model cannot tell them apart from one
+/// path. Kumo's own `read_file` requires a workspace-relative path and rejects an absolute one
+/// outright (`ToolRegistry::resolve`), while an MCP server is a separate process with its own
+/// working directory and can only use the absolute form. Handing over the absolute path alone is
+/// what made the built-in reader unusable on an upload: the feature's most obvious next step
+/// failed with "path must be relative to the workspace".
+fn upload_prompt(workspace: &std::path::Path, path: &std::path::Path, instruction: &str) -> String {
+    let relative = path
+        .strip_prefix(workspace)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!(
+        "The user uploaded a data file at `{relative}` (relative to the workspace — use this path with read_file). Its absolute path, for tools that run outside the workspace, is `{}`. {instruction}",
+        path.display()
+    )
+}
+
 async fn handle_document_message(
     bot: Bot,
     message: Message,
@@ -931,10 +951,7 @@ async fn handle_document_message(
     } else {
         caption
     };
-    let prompt = format!(
-        "The user uploaded a data file at `{}`. {instruction}",
-        path.display()
-    );
+    let prompt = upload_prompt(&workspace, &path, instruction);
     bot.send_chat_action(message.chat.id, ChatAction::Typing)
         .await?;
     let history = prepare_history(&state, &database, message.chat.id.0).await?;
@@ -2899,6 +2916,32 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload used to be announced by its absolute path alone, which `read_file` refuses —
+    /// so the tool most likely to be reached for next could not open the file just delivered.
+    #[test]
+    fn an_upload_is_announced_by_a_path_read_file_will_accept() {
+        let workspace = std::path::Path::new("/srv/kumo/workspace");
+        let path = workspace.join("uploads").join("abc-sales.csv");
+        let prompt = upload_prompt(workspace, &path, "Summarise it.");
+
+        assert!(
+            prompt.contains("`uploads/abc-sales.csv`"),
+            "the workspace-relative path must be offered: {prompt}"
+        );
+        assert!(
+            !prompt.contains("`/srv/kumo/workspace/uploads/abc-sales.csv` (relative"),
+            "the relative slot must not be filled with an absolute path: {prompt}"
+        );
+        assert!(
+            prompt.contains(&path.display().to_string()),
+            "the absolute path still has to reach tools outside the workspace: {prompt}"
+        );
+        assert!(
+            prompt.ends_with("Summarise it."),
+            "the caption survives: {prompt}"
+        );
+    }
 
     #[test]
     fn splits_long_unicode_messages_without_corruption() {
