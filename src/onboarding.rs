@@ -177,6 +177,7 @@ fn setup_tools() -> Result<ToolsConfig> {
                 return Ok(ToolsConfig {
                     workspace: path,
                     rtk: false,
+                    background_max_secs: None,
                 });
             }
             _ => eprintln!("That workspace directory does not exist."),

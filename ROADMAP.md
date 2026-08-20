@@ -113,8 +113,9 @@ result.
 - [x] Timezone-aware scheduling (onboarding asks for an IANA timezone, stored in `kumo.toml`)
 - [x] Background scheduler polling loop, sharing the turn lock with live messages
 - [x] Survives a restart: tasks live in SQLite, not memory, and are picked up on the next poll
-- [x] Stale tasks (missed by more than an hour, e.g. Kumo was offline) are skipped with a notice
-      instead of run late silently
+- [x] Stale *occurrences* (missed by more than an hour, e.g. Kumo was offline) are skipped with a
+      notice instead of run late silently — ending a one-shot task, and moving a recurring one on to
+      its next occurrence rather than ending it
 - [x] Atomic claim (`pending` → `running`) so a crash mid-run cannot double-dispatch a task, plus
       startup recovery for any task a hard crash left stuck in `running`
 - [x] A failed task notifies the chat with the error, not just the terminal log
@@ -152,10 +153,18 @@ pure in-memory scheduler wouldn't have to answer, both addressed in a `user_vers
 that widened the `status` CHECK constraint to add `running` and `expired`:
 
 - **How late is too late?** If Kumo is offline for hours, a task's `run_at` can be arbitrarily far in
-  the past by the time polling resumes. `expire_stale_scheduled_tasks` marks anything more than an
-  hour past due as `expired` instead of dispatching it, and the scheduler sends the owning chat a
-  short notice explaining the reminder was skipped — better than either silence or a reminder firing
-  hours late with no context.
+  the past by the time polling resumes. `expire_stale_scheduled_tasks` refuses to dispatch anything
+  more than an hour past due, and the scheduler sends the owning chat a short notice explaining what
+  was skipped — better than either silence or a reminder firing hours late with no context. What
+  "skipped" costs depends on the task, and treating those two cases alike was a bug that survived
+  into production: a one-shot task has nothing but that occurrence, so it becomes `expired`, which is
+  terminal; a recurring task has the rest of its life, so only the missed *occurrences* are dropped —
+  the row stays `pending` with `run_at` advanced by whole intervals to the first occurrence that is
+  not in the past. Advancing in whole intervals keeps a 09:00 daily reminder at 09:00, and advancing
+  all the way to `now` rather than by a single interval is what stops a task that slept through
+  twelve occurrences from delivering all twelve in the following six minutes. The recurring notice
+  says how many occurrences were skipped and when the next one is; the one-shot notice says plainly
+  that the task will not run at all.
 - **What if Kumo crashes mid-task?** A plain read-then-execute-then-write has a window where a hard
   kill (`kill -9`, an OOM, a host reboot) leaves a task `pending` after it already partially ran, so
   a naive restart would run it again. `claim_due_scheduled_tasks` closes that window by moving a task
@@ -604,6 +613,11 @@ MCP tools, memory, scheduling, and approval flows are unavailable inside it.
 stores the job and PID in SQLite, waits outside the agent turn, and sends the compact result through
 the scheduler poller. `command_status`, `stop_command`, `/jobs`, and `/jobs stop <id>` expose the
 lifecycle. A restart marks interrupted in-process jobs failed rather than pretending they survive.
+A background job is bounded too: 30 minutes, after which Kumo kills its process tree and records the
+job as terminated by the ceiling rather than as cancelled. Kamui bounds the same feature at the same
+number as a second backstop behind process exit; for a gateway that is meant to stay up for weeks
+this ceiling is the only backstop there is, which is the argument for keeping it short rather than
+stretching it. It is not yet reachable from `kumo.toml`.
 
 Not taken: **Kamui Dispatch**, a planned relay backend plus phone app so a phone can trigger Kamui
 on a host machine. Kamui's own roadmap describes it as three pieces of software that are

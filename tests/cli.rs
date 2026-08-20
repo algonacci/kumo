@@ -1,4 +1,8 @@
-use std::{fs, process::Command};
+use std::process::Command;
+// Only the Unix-gated test below touches the filesystem; importing it unconditionally warns on
+// Windows, where that test does not exist.
+#[cfg(unix)]
+use std::fs;
 
 fn kumo() -> Command {
     Command::new(env!("CARGO_BIN_EXE_kumo"))

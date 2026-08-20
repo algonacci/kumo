@@ -201,6 +201,11 @@ description: Summarize current project progress
 Read the project and prepare a standup update for {{args}}.
 ```
 
+A template cannot be named after one of the built-in [Telegram commands](#telegram-commands)
+(`status`, `model`, `jobs` and the rest): the built-in always answers first, so the template could
+never run. Such a file is not loaded at all, and `/commands` lists it separately, naming the file
+and the command it collides with, so you can rename it.
+
 A photo (with or without a caption) is downloaded and attached to the request as an image, so a
 vision-capable model can see it directly — no separate image-understanding tool or MCP server
 involved. Whether the active model can actually see it is not something Kumo checks in advance: the
@@ -212,9 +217,11 @@ CSV, XLSX, and XLSM documents are saved under `uploads` in the configured worksp
 path and caption are passed to the model, allowing MCP data tools to read the file and return a
 generated chart as a Telegram photo. Documents are capped at 20 MiB.
 
-The model's answer is rendered with Telegram's MarkdownV2 formatting: `**bold**`, `_italic_`,
+The model's answer is rendered with Telegram's MarkdownV2 formatting: `**bold**`,
 `` `inline code` ``, fenced code blocks, and `[links](url)` all render as Telegram entities instead
-of raw punctuation. If Telegram rejects the formatted message (for example, an entity split across a
+of raw punctuation. Underscores are deliberately never treated as emphasis, so `snake_case_name` and
+`__init__` arrive as written rather than as an italic or bold fragment; `_italic_` is therefore shown
+literally too. If Telegram rejects the formatted message (for example, an entity split across a
 message-length chunk boundary), Kumo falls back to sending that chunk as plain text rather than
 losing the reply.
 
@@ -332,10 +339,14 @@ model is told the user didn't answer, so the turn can still finish rather than h
 
 Background commands are stored in SQLite and continue outside the initiating agent turn. The
 scheduler checks for finished jobs every 30 seconds and delivers their output to the owning chat.
+A background job is capped at 30 minutes — a backstop against a runaway process, not a limit on
+legitimate long-running work. A job that reaches the cap has its process tree killed and is reported
+as having been terminated by the cap, which is distinct from a job you stopped yourself.
 Because process handles are in-memory, a Kumo restart marks any interrupted job failed; it does not
 claim that the process survived. Kumo retains the latest 100 terminal jobs per chat, never pruning
-a running one. Enable RTK output rewriting with `/rtk on` or `rtk = true` under `[tools]`. Kumo
-falls back to the original approved command if RTK is unavailable.
+a running one. The cap is half an hour by default; set `background_max_secs` under `[tools]` if your
+real work needs longer. Enable RTK output rewriting with `/rtk on` or `rtk = true` under `[tools]`.
+Kumo falls back to the original approved command if RTK is unavailable.
 
 A background scheduler checks for due tasks every 30 seconds and shares the same turn lock as
 incoming messages, so a scheduled task and a live conversation never run their agent loops at the
@@ -344,8 +355,11 @@ required, and a task survives a Kumo restart: it stays in the database and is pi
 poll after Kumo comes back up.
 
 If Kumo was offline (or otherwise didn't poll in time) and a task is found more than an hour past its
-scheduled time, it is skipped rather than run late — the chat gets a short notice explaining the
-reminder was missed, instead of either staying silent or firing hours late with no explanation. A
+scheduled time, that occurrence is skipped rather than run late — the chat gets a short notice
+explaining the reminder was missed, instead of either staying silent or firing hours late with no
+explanation. For a one-off reminder that is the end of it, and the notice says so. A recurring
+reminder is not cancelled by having been missed: the skipped occurrences are dropped, the notice says
+how many and when the next one is due, and the reminder carries on at its usual time of day. A
 task that is claimed for execution moves to a `running` state before it starts, so a hard crash or
 `kill -9` mid-run cannot cause it to be dispatched twice; on the next startup, any task still stuck in
 `running` (only possible after such a crash — a clean shutdown never leaves one there) is reset back

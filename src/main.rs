@@ -84,6 +84,105 @@ pub(crate) enum ApprovalOutcome {
 
 pub(crate) type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>>;
 
+/// Which part of the system a failed turn actually failed in. `run_agent` returns one
+/// `anyhow::Error` for every one of these, and without the distinction `deliver_agent_turn` has to
+/// guess — it used to guess "provider" every time, which sends the owner to check a service that
+/// is fine while the real fault (a tool, the database, Telegram itself) goes unnamed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FailureKind {
+    /// The model or the service in front of it: a transport error, a rejected request, or an
+    /// empty answer.
+    Provider,
+    /// A tool Kumo dispatched, including the read-only sub-agent.
+    Tool,
+    /// Kumo's own SQLite database.
+    Storage,
+    /// Sending or editing a Telegram message Kumo needed for the turn (an approval prompt, a
+    /// question).
+    Telegram,
+    /// Anything else — a bug in Kumo, or a failure that carries no class.
+    Internal,
+}
+
+impl FailureKind {
+    /// The value logged next to the reference id, so the log line says which class was reported.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Tool => "tool",
+            Self::Storage => "storage",
+            Self::Telegram => "telegram",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Wraps a turn error with the class of thing that failed. Constructed at the point of failure
+/// inside `run_agent` (where what failed is still known) and read back by `deliver_agent_turn`;
+/// `run_agent` keeps returning a plain `anyhow::Error` so `scheduler.rs` is unaffected.
+#[derive(Debug)]
+pub(crate) struct TurnFailure {
+    kind: FailureKind,
+    source: anyhow::Error,
+}
+
+impl TurnFailure {
+    pub(crate) fn new(kind: FailureKind, source: anyhow::Error) -> Self {
+        Self { kind, source }
+    }
+}
+
+impl std::fmt::Display for TurnFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} failure: {}", self.kind.as_str(), self.source)
+    }
+}
+
+impl std::error::Error for TurnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Tags a fallible step inside the agent loop with the class of failure it can produce.
+trait Classify<T> {
+    fn classify(self, kind: FailureKind) -> Result<T>;
+}
+
+impl<T, E> Classify<T> for std::result::Result<T, E>
+where
+    E: Into<anyhow::Error>,
+{
+    fn classify(self, kind: FailureKind) -> Result<T> {
+        self.map_err(|error| anyhow::Error::new(TurnFailure::new(kind, error.into())))
+    }
+}
+
+/// The class an error was tagged with, or `Internal` for one that was never tagged. An untagged
+/// error is deliberately *not* reported as a provider fault: an unclassified failure is a Kumo
+/// problem until someone says otherwise.
+fn failure_kind(error: &anyhow::Error) -> FailureKind {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TurnFailure>())
+        .map_or(FailureKind::Internal, |failure| failure.kind)
+}
+
+/// The sentence the owner gets for a failed turn. Deliberately built from the *class* alone: the
+/// underlying error text carries file paths, base URLs, SQL and occasionally an API key, none of
+/// which mean anything in a Telegram chat and all of which would be quoted back into it. The
+/// reference id is the only handle into the log, exactly as before.
+fn turn_failure_report(error: &anyhow::Error, reference: &str) -> String {
+    let detail = match failure_kind(error) {
+        FailureKind::Provider => "The model provider could not answer",
+        FailureKind::Tool => "A tool failed while answering, so the turn was dropped",
+        FailureKind::Storage => "Kumo could not reach its own database, so the turn was dropped",
+        FailureKind::Telegram => "Kumo could not finish sending a message needed for this turn",
+        FailureKind::Internal => "Kumo hit an internal error and could not finish this turn",
+    };
+    format!("{detail}. Check the Kumo log for reference {reference}.")
+}
+
 /// State for one in-flight `ask_user` question: which chat it was asked in (so `handle_message`
 /// can tell whether incoming text should answer it instead of starting a new turn), the offered
 /// button labels (so a callback's option *index* — kept short to fit Telegram's 64-byte callback
@@ -171,6 +270,25 @@ async fn run_gateway(config: Config) -> Result<()> {
         .context("tools are not configured; run `kumo onboard`")?
         .workspace
         .clone();
+    // A template named after a built-in can never be reached, and the owner has no reason to
+    // suspect it: name the collision at startup, where the rest of the "what is loaded" reporting
+    // already lives. Per-chat workspaces can hold their own templates, so this covers the default
+    // workspace and the global directory; `/commands` reports whichever workspace is in use.
+    match commands::list(&workspace) {
+        Ok(set) => {
+            for shadowed in set.shadowed {
+                logging::warn(
+                    "commands",
+                    format!(
+                        "template={} status=not_loaded reason=builtin_name command=/{}",
+                        shadowed.path.display(),
+                        shadowed.name
+                    ),
+                );
+            }
+        }
+        Err(error) => logging::warn("commands", format!("status=unreadable error={error:#}")),
+    }
     let mcp = mcp::connect_all(&config.mcp).await;
     let mcp_statuses = mcp
         .statuses
@@ -225,8 +343,16 @@ async fn run_gateway(config: Config) -> Result<()> {
     let memory_snapshot = render_memory_snapshot(&database.list_memory()?);
     let database = Arc::new(Mutex::new(database));
     let rtk_enabled = config.tools.as_ref().is_some_and(|tools| tools.rtk);
-    let tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?
+    let background_max = config
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.background_max_secs)
+        .map(Duration::from_secs);
+    let mut tools = ToolRegistry::new(workspace, mcp.tools, database.clone(), config.timezone())?
         .with_rtk(rtk_enabled);
+    if let Some(limit) = background_max {
+        tools = tools.with_background_max(limit);
+    }
     let turn_lock = Arc::new(Mutex::new(()));
     let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
     let questions: PendingQuestions = Arc::new(Mutex::new(HashMap::new()));
@@ -302,6 +428,10 @@ async fn run_gateway(config: Config) -> Result<()> {
                 handle_callback(bot, query, allowed_user_id, approvals, questions).await
             },
         ));
+    // Kept out of the dependency map, which takes ownership of the originals: shutdown needs both
+    // to stop the scheduler without cutting a scheduled task in half.
+    let shutdown_database = database.clone();
+    let shutdown_turn_lock = turn_lock.clone();
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(teloxide::dptree::deps![
             state,
@@ -331,9 +461,89 @@ async fn run_gateway(config: Config) -> Result<()> {
             logging::info("gateway", "status=stopped");
         }
     }
-    scheduler_task.abort();
+    stop_scheduler(
+        scheduler_task,
+        &shutdown_turn_lock,
+        &shutdown_database,
+        SCHEDULER_SHUTDOWN_GRACE,
+    )
+    .await;
 
     Ok(())
+}
+
+/// How long shutdown waits for a scheduled task that is already running to reach a terminal state
+/// before it stops waiting. Bounded on purpose: a `Ctrl+C` that hangs is worse than a row this
+/// process resets on its way out. Thirty seconds covers a provider call and a foreground command
+/// (`tools::COMMAND_TIMEOUT` is 30 s too) but deliberately not a five-minute Kamui delegation; the
+/// pending approvals and questions are cleared just before this, so nothing here is waiting on the
+/// owner.
+const SCHEDULER_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// What shutdown found when it went to stop the scheduler. Returned rather than only logged so the
+/// behaviour is testable without a Telegram bot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SchedulerShutdown {
+    /// False when the grace period ran out with a task still in flight.
+    idle: bool,
+    /// Rows left `running` that shutdown put back to `pending` itself.
+    recovered: usize,
+}
+
+/// Stop the scheduler without leaving a scheduled task stranded.
+///
+/// `claim_due_scheduled_tasks` moves a due row to `running` and `complete_scheduled_task` moves it
+/// out again; aborting the scheduler task between the two leaves the row `running` for the next
+/// startup to recover, which made both `storage.rs`'s doc comment and the ROADMAP's claim — that
+/// only a hard crash can do that — false. So: wait for the scheduler to be between tasks (it holds
+/// `turn_lock` for the whole of each one), then abort, then put back anything still claimed. The
+/// wait is bounded by `grace`; if it expires the abort happens anyway and the reset is what keeps
+/// the promise, since the very narrow window between the claim and the first `turn_lock` acquire
+/// is not covered by the lock either.
+async fn stop_scheduler(
+    scheduler_task: tokio::task::JoinHandle<()>,
+    turn_lock: &Mutex<()>,
+    database: &Mutex<Database>,
+    grace: Duration,
+) -> SchedulerShutdown {
+    let guard = tokio::time::timeout(grace, turn_lock.lock()).await;
+    let idle = guard.is_ok();
+    if !idle {
+        logging::warn(
+            "scheduler",
+            format!(
+                "shutdown=timed_out after_secs={} action=abort_and_recover",
+                grace.as_secs()
+            ),
+        );
+    }
+    scheduler_task.abort();
+    // Held until after the abort: releasing it earlier would let the scheduler start the next due
+    // task in the gap.
+    drop(guard);
+
+    let recovered = match database.lock().await.reset_stuck_running_tasks() {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            logging::error("scheduler", "shutdown=reset_failed", &error);
+            0
+        }
+    };
+    if recovered > 0 {
+        logging::warn(
+            "scheduler",
+            format!("shutdown=recovered_tasks={recovered} status=pending"),
+        );
+    }
+    let shutdown = SchedulerShutdown { idle, recovered };
+    logging::info(
+        "scheduler",
+        format!(
+            "status=stopped idle={} recovered={}",
+            shutdown.idle, shutdown.recovered
+        ),
+    );
+    shutdown
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -571,20 +781,7 @@ async fn handle_message(
         let tools = state.read().await.tools.clone();
         let workspace = tools.workspace(message.chat.id.0).await?;
         if text == "/commands" {
-            let templates = commands::list(&workspace)?;
-            let response = if templates.is_empty() {
-                "No custom commands found.".to_owned()
-            } else {
-                let mut lines = vec!["Custom commands:".to_owned()];
-                for template in templates {
-                    let description = template
-                        .description
-                        .map(|value| format!(" — {value}"))
-                        .unwrap_or_default();
-                    lines.push(format!("- /{}{}", template.name, description));
-                }
-                lines.join("\n")
-            };
+            let response = commands_message(commands::list(&workspace)?);
             bot.send_message(message.chat.id, response).await?;
             return Ok(());
         }
@@ -784,28 +981,46 @@ async fn deliver_agent_turn(
                 send_formatted(bot, chat_id, &chunk).await?;
             }
             send_mcp_images(bot, chat_id, &turn.images).await?;
-            database.lock().await.save_turn(
+            let saved = database.lock().await.save_turn(
                 chat_id.0,
                 &turn.model,
                 &turn.record,
                 &turn.usage,
                 &turn.finish_reason,
-            )?;
+            );
+            // The answer is already delivered, so a storage failure here is not "the turn failed";
+            // it is "the turn happened and Kumo will not remember it", which is what the owner
+            // needs to be told rather than a silent log line.
+            if let Err(error) = saved {
+                let reference = &Uuid::new_v4().to_string()[..8];
+                logging::error(
+                    "agent",
+                    format!("request_id={reference} status=not_saved kind=storage"),
+                    &error,
+                );
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "That answer was delivered but could not be saved to Kumo's database, so \
+                         it is not part of the conversation history. Check the Kumo log for \
+                         reference {reference}."
+                    ),
+                )
+                .await?;
+            }
         }
         Err(error) => {
             let reference = &Uuid::new_v4().to_string()[..8];
             logging::error(
                 "agent",
-                format!("request_id={reference} status=failed"),
+                format!(
+                    "request_id={reference} status=failed kind={}",
+                    failure_kind(&error).as_str()
+                ),
                 &error,
             );
-            bot.send_message(
-                chat_id,
-                format!(
-                    "The model provider could not answer. Check the Kumo log for reference {reference}."
-                ),
-            )
-            .await?;
+            bot.send_message(chat_id, turn_failure_report(&error, reference))
+                .await?;
         }
     }
     Ok(())
@@ -871,8 +1086,9 @@ pub(crate) async fn run_agent(
 
     for _ in 0..MAX_TOOL_ROUNDS {
         let model_started = Instant::now();
-        let response =
-            with_typing(bot, chat_id, provider.chat(&messages, &tool_definitions)).await?;
+        let response = with_typing(bot, chat_id, provider.chat(&messages, &tool_definitions))
+            .await
+            .classify(FailureKind::Provider)?;
         logging::info(
             "model",
             format!(
@@ -886,7 +1102,11 @@ pub(crate) async fn run_agent(
         accumulate_usage(&mut usage, &response.usage);
         if response.tool_calls.is_empty() {
             if response.content.trim().is_empty() {
-                bail!("provider returned an empty response");
+                return Err(TurnFailure::new(
+                    FailureKind::Provider,
+                    anyhow::anyhow!("provider returned an empty response"),
+                )
+                .into());
             }
             return Ok(finish_turn(
                 user_message,
@@ -909,17 +1129,23 @@ pub(crate) async fn run_agent(
         trail.push(request_message);
         for call in response.tool_calls {
             let tool_started = Instant::now();
-            database.lock().await.record_audit_event(
-                chat_id.0,
-                "tool_request",
-                Some(&call.name),
-                Some(&call.arguments),
-                "requested",
-            )?;
+            database
+                .lock()
+                .await
+                .record_audit_event(
+                    chat_id.0,
+                    "tool_request",
+                    Some(&call.name),
+                    Some(&call.arguments),
+                    "requested",
+                )
+                .classify(FailureKind::Storage)?;
             logging::info("tool", format!("name={} status=started", call.name));
             let progress = send_tool_progress(bot, chat_id, &call.name).await;
             let output = if call.name == "ask_user" {
-                ask_user(bot, chat_id, questions, &call.arguments).await?
+                ask_user(bot, chat_id, questions, &call.arguments)
+                    .await
+                    .classify(FailureKind::Telegram)?
             } else if call.name == "delegate_readonly" {
                 let tools = state.read().await.tools.clone();
                 let subagent = with_typing(
@@ -927,7 +1153,8 @@ pub(crate) async fn run_agent(
                     chat_id,
                     run_readonly_subagent(provider.clone(), tools, chat_id.0, &call.arguments),
                 )
-                .await?;
+                .await
+                .classify(FailureKind::Tool)?;
                 accumulate_usage(&mut usage, &subagent.usage);
                 subagent.answer
             } else {
@@ -936,44 +1163,60 @@ pub(crate) async fn run_agent(
                     && database
                         .lock()
                         .await
-                        .is_tool_always_allowed(chat_id.0, &call.name)?;
+                        .is_tool_always_allowed(chat_id.0, &call.name)
+                        .classify(FailureKind::Storage)?;
                 if tools.requires_confirmation(&call.name) && !always_allowed {
                     match tools.preview(&call) {
                         Some(preview) => {
-                            match request_approval(bot, chat_id, approvals, &preview).await? {
+                            match request_approval(bot, chat_id, approvals, &preview)
+                                .await
+                                .classify(FailureKind::Telegram)?
+                            {
                                 ApprovalOutcome::AllowOnce => {
-                                    database.lock().await.record_audit_event(
-                                        chat_id.0,
-                                        "approval",
-                                        Some(&call.name),
-                                        None,
-                                        "allow_once",
-                                    )?;
+                                    database
+                                        .lock()
+                                        .await
+                                        .record_audit_event(
+                                            chat_id.0,
+                                            "approval",
+                                            Some(&call.name),
+                                            None,
+                                            "allow_once",
+                                        )
+                                        .classify(FailureKind::Storage)?;
                                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
                                         .await
                                 }
                                 ApprovalOutcome::AlwaysAllow => {
                                     let database = database.lock().await;
-                                    database.always_allow_tool(chat_id.0, &call.name)?;
-                                    database.record_audit_event(
-                                        chat_id.0,
-                                        "approval",
-                                        Some(&call.name),
-                                        None,
-                                        "always_allow",
-                                    )?;
+                                    database
+                                        .always_allow_tool(chat_id.0, &call.name)
+                                        .classify(FailureKind::Storage)?;
+                                    database
+                                        .record_audit_event(
+                                            chat_id.0,
+                                            "approval",
+                                            Some(&call.name),
+                                            None,
+                                            "always_allow",
+                                        )
+                                        .classify(FailureKind::Storage)?;
                                     drop(database);
                                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call))
                                         .await
                                 }
                                 ApprovalOutcome::Deny => {
-                                    database.lock().await.record_audit_event(
-                                        chat_id.0,
-                                        "approval",
-                                        Some(&call.name),
-                                        None,
-                                        "denied",
-                                    )?;
+                                    database
+                                        .lock()
+                                        .await
+                                        .record_audit_event(
+                                            chat_id.0,
+                                            "approval",
+                                            Some(&call.name),
+                                            None,
+                                            "denied",
+                                        )
+                                        .classify(FailureKind::Storage)?;
                                     "User denied this command. Do not run it.".to_owned()
                                 }
                             }
@@ -982,13 +1225,17 @@ pub(crate) async fn run_agent(
                     }
                 } else {
                     if always_allowed {
-                        database.lock().await.record_audit_event(
-                            chat_id.0,
-                            "approval",
-                            Some(&call.name),
-                            None,
-                            "standing_allow",
-                        )?;
+                        database
+                            .lock()
+                            .await
+                            .record_audit_event(
+                                chat_id.0,
+                                "approval",
+                                Some(&call.name),
+                                None,
+                                "standing_allow",
+                            )
+                            .classify(FailureKind::Storage)?;
                     }
                     with_typing(bot, chat_id, tools.dispatch(chat_id.0, &call)).await
                 }
@@ -1000,13 +1247,17 @@ pub(crate) async fn run_agent(
                 "images": tool_images.len(),
             })
             .to_string();
-            database.lock().await.record_audit_event(
-                chat_id.0,
-                "tool_result",
-                Some(&call.name),
-                Some(&result_details),
-                if failed { "failed" } else { "completed" },
-            )?;
+            database
+                .lock()
+                .await
+                .record_audit_event(
+                    chat_id.0,
+                    "tool_result",
+                    Some(&call.name),
+                    Some(&result_details),
+                    if failed { "failed" } else { "completed" },
+                )
+                .classify(FailureKind::Storage)?;
             logging::info(
                 "tool",
                 format!(
@@ -1041,10 +1292,18 @@ pub(crate) async fn run_agent(
         "agent",
         format!("tool_round_limit={MAX_TOOL_ROUNDS} action=request_final_answer"),
     );
-    let response = with_typing(bot, chat_id, provider.chat(&messages, &[])).await?;
+    let response = with_typing(bot, chat_id, provider.chat(&messages, &[]))
+        .await
+        .classify(FailureKind::Provider)?;
     accumulate_usage(&mut usage, &response.usage);
     if response.content.trim().is_empty() {
-        bail!("model exceeded the {MAX_TOOL_ROUNDS}-round tool limit without answering");
+        return Err(TurnFailure::new(
+            FailureKind::Provider,
+            anyhow::anyhow!(
+                "model exceeded the {MAX_TOOL_ROUNDS}-round tool limit without answering"
+            ),
+        )
+        .into());
     }
 
     Ok(finish_turn(
@@ -1440,6 +1699,40 @@ async fn set_workspace_command(
         .await
         .set_workspace_for_chat(chat_id, &path)?;
     Ok(format!("Workspace for this chat: {}", path.display()))
+}
+
+/// The `/commands` reply. A template whose name collides with a built-in is named here rather than
+/// omitted: the file exists on disk and the owner expects it to work, so "it is not loaded, and
+/// this is why" is the only answer that tells them what to do about it.
+fn commands_message(set: commands::CommandSet) -> String {
+    let mut lines = Vec::new();
+    if set.templates.is_empty() {
+        lines.push("No custom commands found.".to_owned());
+    } else {
+        lines.push("Custom commands:".to_owned());
+        for template in set.templates {
+            let description = template
+                .description
+                .map(|value| format!(" — {value}"))
+                .unwrap_or_default();
+            lines.push(format!("- /{}{}", template.name, description));
+        }
+    }
+    if !set.shadowed.is_empty() {
+        lines.push(String::new());
+        lines.push("Not loaded — these names are built-in Kumo commands:".to_owned());
+        for shadowed in set.shadowed {
+            lines.push(format!(
+                "- {} would answer to /{}, which is built in. Rename the file to use it.",
+                shadowed.path.file_name().map_or_else(
+                    || shadowed.name.clone(),
+                    |name| name.to_string_lossy().into_owned()
+                ),
+                shadowed.name
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 async fn audit_message(database: &Mutex<Database>, chat_id: i64) -> Result<String> {
@@ -1913,23 +2206,208 @@ async fn finish_tool_progress(
     }
 }
 
+/// The fenced-code-block marker, in the raw Markdown a chunk is cut out of and in the MarkdownV2
+/// `markdown::to_telegram_markdown_v2` produces from it.
+const CODE_FENCE: &str = "```";
+
+/// Split `message` into chunks of at most `max_chars` characters, preferring boundaries that leave
+/// every chunk valid Markdown on its own.
+///
+/// Chunking happens on the model's *raw* Markdown: `deliver_agent_turn` chunks first, and
+/// `send_formatted` then converts each chunk with `markdown::to_telegram_markdown_v2` and sends it
+/// with `ParseMode::MarkdownV2`. So a boundary in the wrong place does not merely split a rendered
+/// message, it changes what the converter is handed — the tail of a fenced block arrives with no
+/// opening fence and is escaped as prose, and half a `[label](url)` becomes literal text. Order of
+/// preference:
+///
+/// 1. a line boundary outside any code fence,
+/// 2. a line boundary inside a code fence, closing the fence at the end of the chunk and
+///    re-opening it (with its original info string) at the start of the next,
+/// 3. a space within a line at a point where no inline entity is open,
+/// 4. a character boundary — reached only by a single unbroken token longer than the limit.
+///
+/// Only the last of those can still cut an entity, and `send_formatted`'s plain-text fallback is
+/// still the backstop for it. Fence tracking is line-based, so the rare fence written mid-line is
+/// not seen; the converter pairs those differently and the fallback covers the disagreement.
 pub(crate) fn message_chunks(message: &str, max_chars: usize) -> Vec<String> {
     if message.is_empty() {
         return Vec::new();
     }
+    let mut writer = ChunkWriter::new(max_chars);
+    // `split_inclusive` keeps each line's own newline, so chunks rejoin into the original text
+    // apart from the fence markers re-opening deliberately adds.
+    for line in message.split_inclusive('\n') {
+        writer.write_line(line);
+    }
+    writer.finish()
+}
 
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in message.chars() {
-        if current.chars().count() == max_chars {
-            chunks.push(std::mem::take(&mut current));
+/// Accumulates lines into chunks for `message_chunks`, keeping track of the code fence a chunk
+/// boundary would otherwise leave hanging open.
+struct ChunkWriter {
+    max_chars: usize,
+    chunks: Vec<String>,
+    current: String,
+    /// The opening fence line (with its info string, without its newline) of the block being
+    /// written, if any. `Some` means a chunk that ends here has to close the fence and the next
+    /// one has to re-open it.
+    fence: Option<String>,
+    /// Characters of `current` that are a re-opened fence rather than message content, so an
+    /// only-a-fence chunk is never emitted and never counts as progress.
+    seed: usize,
+}
+
+impl ChunkWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            max_chars: max_chars.max(1),
+            chunks: Vec::new(),
+            current: String::new(),
+            fence: None,
+            seed: 0,
         }
-        current.push(character);
     }
-    if !current.is_empty() {
-        chunks.push(current);
+
+    /// Characters still available in this chunk, holding back room for the closing fence a split
+    /// inside a code block has to append.
+    fn room(&self) -> usize {
+        let reserved = if self.fence.is_some() {
+            CODE_FENCE.chars().count() + 1
+        } else {
+            0
+        };
+        self.max_chars
+            .saturating_sub(reserved)
+            .saturating_sub(self.current.chars().count())
     }
-    chunks
+
+    fn has_content(&self) -> bool {
+        self.current.chars().count() > self.seed
+    }
+
+    /// Emit the current chunk, closing an open fence, and seed the next chunk by re-opening it.
+    fn flush(&mut self) {
+        if !self.has_content() {
+            return;
+        }
+        let mut chunk = std::mem::take(&mut self.current);
+        self.seed = 0;
+        if let Some(fence) = self.fence.clone() {
+            if !chunk.ends_with('\n') {
+                chunk.push('\n');
+            }
+            chunk.push_str(CODE_FENCE);
+            self.current.push_str(&fence);
+            self.current.push('\n');
+            self.seed = self.current.chars().count();
+        }
+        self.chunks.push(chunk);
+    }
+
+    fn write_line(&mut self, line: &str) {
+        let is_fence = line.trim_start().starts_with(CODE_FENCE);
+        if is_fence && self.fence.is_some() {
+            // Leave the block *before* writing the closing fence: `room` has been holding exactly
+            // this many characters back for it, so it always fits and never triggers a split that
+            // would strand the block open.
+            self.fence = None;
+            let newline = if line.ends_with('\n') { "\n" } else { "" };
+            self.write_text(&format!("{CODE_FENCE}{newline}"));
+            return;
+        }
+        self.write_text(line);
+        if is_fence {
+            self.fence = Some(line.trim_end_matches('\n').to_owned());
+        }
+    }
+
+    /// Append `text` to the current chunk, flushing (and, inside a fence, re-opening) as often as
+    /// the limit requires.
+    fn write_text(&mut self, text: &str) {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let room = self.room();
+            if rest.chars().count() <= room {
+                self.current.push_str(rest);
+                return;
+            }
+            if self.has_content() {
+                self.flush();
+                continue;
+            }
+            // A single line longer than a whole chunk: split inside it, at the least damaging
+            // point available. `max(1)` keeps the loop making progress even for a limit so small
+            // that the re-opened fence alone fills it.
+            let take = safe_break(rest, room).max(1);
+            let split = rest
+                .char_indices()
+                .nth(take)
+                .map_or(rest.len(), |(index, _)| index);
+            let (head, tail) = rest.split_at(split);
+            self.current.push_str(head);
+            self.flush();
+            rest = tail;
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.has_content() {
+            self.chunks.push(std::mem::take(&mut self.current));
+        }
+        self.chunks
+    }
+}
+
+/// How many characters of `text` to keep when the whole of it does not fit in `limit`. Prefers the
+/// last space at which no inline code span, `**bold**` run or `[label](url)` link is open, so the
+/// piece carried into the next chunk is not the tail of a half-written entity; falls back to the
+/// last space of any kind, and then to `limit` itself for an unbroken token.
+fn safe_break(text: &str, limit: usize) -> usize {
+    let characters: Vec<char> = text.chars().collect();
+    let limit = limit.min(characters.len());
+    let mut code = false;
+    let mut bold = false;
+    // 0: outside a link, 1: inside the `[label]`, 2: inside the `(url)`.
+    let mut link = 0u8;
+    let mut last_space = None;
+    let mut last_open_space = None;
+    let mut index = 0;
+    while index < limit {
+        let character = characters[index];
+        if character == '`' {
+            code = !code;
+            index += 1;
+            continue;
+        }
+        if !code {
+            if character == '*' && characters.get(index + 1) == Some(&'*') {
+                bold = !bold;
+                index += 2;
+                continue;
+            }
+            match link {
+                0 if character == '[' => link = 1,
+                1 if character == ']' && characters.get(index + 1) == Some(&'(') => {
+                    link = 2;
+                    index += 2;
+                    continue;
+                }
+                // A `[` that never becomes a link (a citation marker, a list of keys) must not
+                // make the whole rest of the message unsplittable.
+                1 if character == '\n' => link = 0,
+                2 if character == ')' => link = 0,
+                _ => {}
+            }
+        }
+        if character == ' ' {
+            last_space = Some(index + 1);
+            if !code && !bold && link == 0 {
+                last_open_space = Some(index + 1);
+            }
+        }
+        index += 1;
+    }
+    last_open_space.or(last_space).unwrap_or(limit)
 }
 
 fn models_message(config: &Config) -> String {
@@ -2427,6 +2905,131 @@ mod tests {
         assert_eq!(message_chunks("abé日", 2), vec!["ab", "é日"]);
     }
 
+    /// Every chunk is converted and sent on its own, so a chunk that ends inside a fenced block
+    /// hands `markdown::to_telegram_markdown_v2` an opening fence with no close (and the next
+    /// chunk a body with no opening fence). Splitting has to close and re-open the block instead.
+    #[test]
+    fn a_split_inside_a_code_fence_closes_and_reopens_it() {
+        let code: String = (0..40)
+            .map(|line| format!("let value_{line} = compute({line});\n"))
+            .collect();
+        let message = format!("Here is the code:\n\n```rust\n{code}```\n\nThat is all.");
+
+        let chunks = message_chunks(&message, 400);
+
+        assert!(chunks.len() > 1, "the fixture has to actually split");
+        for chunk in &chunks {
+            assert!(
+                chunk.matches("```").count() % 2 == 0,
+                "a chunk must not leave a fence open: {chunk:?}"
+            );
+            assert!(
+                chunk.chars().count() <= 400,
+                "chunk over the limit: {chunk:?}"
+            );
+        }
+        // Every line of code still arrives, and the re-opened fences carry the info string.
+        for line in code.lines() {
+            assert!(
+                chunks.iter().any(|chunk| chunk.contains(line)),
+                "lost code line {line:?}"
+            );
+        }
+        assert!(
+            chunks
+                .iter()
+                .skip(1)
+                .any(|chunk| chunk.starts_with("```rust")),
+            "a continued block has to re-open with its own info string: {chunks:?}"
+        );
+    }
+
+    /// The plain-prose case: a boundary belongs at a line break, not in the middle of a sentence.
+    #[test]
+    fn prose_is_split_at_line_boundaries() {
+        let message: String = (0..60)
+            .map(|line| format!("Line number {line}.\n"))
+            .collect();
+
+        let chunks = message_chunks(&message, 200);
+
+        assert!(chunks.len() > 1);
+        for chunk in chunks.iter().take(chunks.len() - 1) {
+            assert!(chunk.ends_with('\n'), "chunk cut mid-line: {chunk:?}");
+        }
+        assert_eq!(chunks.concat(), message, "no content added or lost");
+    }
+
+    /// A link cut in half stops being a link: `[label](htt` renders as literal text and the rest
+    /// of the URL lands in the next message.
+    #[test]
+    fn a_link_is_never_cut_in_half() {
+        // The padding puts the link across the 240-character mark, so a plain count-to-the-limit
+        // split lands inside its URL.
+        let message = format!(
+            "{}[the docs](https://example.com/a/very/long/path/to/documentation) and more text",
+            "padding ".repeat(24)
+        );
+
+        let chunks = message_chunks(&message, 120);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.matches('[').count(),
+                chunk.matches(']').count(),
+                "half a link in {chunk:?}"
+            );
+            assert!(
+                !chunk.contains("](") || chunk.contains(')'),
+                "a link target was cut: {chunk:?}"
+            );
+        }
+        assert!(
+            chunks.iter().any(|chunk| chunk
+                .contains("[the docs](https://example.com/a/very/long/path/to/documentation)")),
+            "the link has to survive whole: {chunks:?}"
+        );
+    }
+
+    /// An inline code span is an entity too, and the same rule applies to it.
+    #[test]
+    fn an_inline_code_span_is_not_split() {
+        // The span straddles the 100-character mark, which is where a count-only split would cut.
+        let message = format!(
+            "{}`cargo test --all-features` finishes the job",
+            "word ".repeat(19)
+        );
+
+        let chunks = message_chunks(&message, 100);
+
+        for chunk in &chunks {
+            assert!(
+                chunk.matches('`').count() % 2 == 0,
+                "an unclosed code span in {chunk:?}"
+            );
+        }
+    }
+
+    /// The fallback: one token longer than a whole chunk still has to be delivered, not dropped or
+    /// looped over.
+    #[test]
+    fn an_unbroken_token_still_gets_chunked() {
+        let message = "x".repeat(250);
+
+        let chunks = message_chunks(&message, 100);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.concat(), message);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 100));
+    }
+
+    #[test]
+    fn an_empty_message_produces_no_chunks() {
+        assert!(message_chunks("", 4000).is_empty());
+        assert_eq!(message_chunks("short", 4000), vec!["short"]);
+    }
+
     /// Onboarding a second provider moves the flat `[provider]` block into `[providers.*]` and
     /// leaves the field itself `None`. Both message builders used to read that field directly and
     /// panicked here — on precisely the installs with more than one provider to report.
@@ -2858,5 +3461,240 @@ mod tests {
         assert!(result.answer.contains("important detail"));
         assert_eq!(result.usage.total_tokens, 7);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every class of turn failure used to reach the owner as "the model provider could not
+    /// answer", which sends them to check a service that is fine while the real fault goes
+    /// unnamed. Each class has to describe itself.
+    #[test]
+    fn a_failed_turn_is_reported_as_the_thing_that_actually_failed() {
+        let report = |kind| {
+            turn_failure_report(
+                &TurnFailure::new(kind, anyhow::anyhow!("underlying detail")).into(),
+                "ref12345",
+            )
+        };
+
+        let provider = report(FailureKind::Provider);
+        let tool = report(FailureKind::Tool);
+        let storage = report(FailureKind::Storage);
+        let telegram = report(FailureKind::Telegram);
+
+        assert!(provider.contains("model provider"), "{provider}");
+        assert!(tool.contains("tool"), "{tool}");
+        assert!(storage.contains("database"), "{storage}");
+        assert!(telegram.contains("message"), "{telegram}");
+        for other in [&tool, &storage, &telegram] {
+            assert!(
+                !other.contains("model provider"),
+                "a non-provider failure must not blame the provider: {other}"
+            );
+        }
+        for report in [&provider, &tool, &storage, &telegram] {
+            assert!(report.contains("ref12345"), "{report}");
+        }
+    }
+
+    /// An error that nothing classified is Kumo's problem until proven otherwise — it must not
+    /// fall back to blaming the provider, which is precisely the old behaviour.
+    #[test]
+    fn an_unclassified_failure_is_reported_as_internal_not_as_the_provider() {
+        let error = anyhow::anyhow!("a bug in Kumo");
+
+        assert_eq!(failure_kind(&error), FailureKind::Internal);
+        let report = turn_failure_report(&error, "ref00001");
+        assert!(report.contains("internal error"), "{report}");
+        assert!(!report.contains("model provider"), "{report}");
+    }
+
+    /// The class survives the layers `anyhow` adds on the way out of the agent loop.
+    #[test]
+    fn a_classified_failure_keeps_its_class_under_added_context() {
+        let error: anyhow::Error =
+            TurnFailure::new(FailureKind::Storage, anyhow::anyhow!("database is locked")).into();
+
+        let wrapped = error.context("while recording an audit event");
+
+        assert_eq!(failure_kind(&wrapped), FailureKind::Storage);
+    }
+
+    /// The report is the only thing the owner sees, and a Telegram chat is not a log: it must
+    /// carry the reference id and nothing from the error itself.
+    #[test]
+    fn a_failure_report_never_leaks_paths_or_secrets() {
+        let error: anyhow::Error = TurnFailure::new(
+            FailureKind::Provider,
+            anyhow::anyhow!(
+                "POST https://api.example.com/v1/chat failed: 401 for key sk-live-abc123 \
+                 (config C:\\Users\\owner\\AppData\\Roaming\\kumo\\kumo.toml)"
+            ),
+        )
+        .into();
+
+        let report = turn_failure_report(&error, "ref99999");
+
+        for secret in ["sk-live-abc123", "kumo.toml", "api.example.com", "401"] {
+            assert!(!report.contains(secret), "leaked {secret}: {report}");
+        }
+        assert!(report.contains("ref99999"), "{report}");
+    }
+
+    /// A template named after a built-in never runs, so `/commands` has to say so by name rather
+    /// than listing it as if it worked or omitting it as if it were not there.
+    #[test]
+    fn commands_message_names_a_template_shadowed_by_a_builtin() {
+        let set = commands::CommandSet {
+            templates: Vec::new(),
+            shadowed: vec![commands::ShadowedCommand {
+                name: "status".to_owned(),
+                path: std::path::PathBuf::from("/home/owner/.kumo/commands/status.md"),
+            }],
+        };
+
+        let message = commands_message(set);
+
+        assert!(message.contains("status.md"), "{message}");
+        assert!(message.contains("/status"), "{message}");
+        assert!(message.contains("Rename"), "{message}");
+    }
+
+    /// The routing block in this file is the definition of "built-in"; `commands::RESERVED` is a
+    /// copy of it. A new built-in added without a matching reserved entry re-opens the gap
+    /// silently, so the copy is checked against the source it copies.
+    #[test]
+    fn builtin_commands_are_all_reserved() {
+        let source = include_str!("main.rs");
+        let mut routed: Vec<String> = Vec::new();
+        for (marker, terminator) in [("text == \"/", '"'), ("text.strip_prefix(\"/", ' ')] {
+            for occurrence in source.split(marker).skip(1) {
+                let name: String = occurrence
+                    .chars()
+                    .take_while(|character| {
+                        *character != terminator && character.is_ascii_alphanumeric()
+                    })
+                    .collect();
+                if !name.is_empty() {
+                    routed.push(name);
+                }
+            }
+        }
+        assert!(
+            routed.len() > 10,
+            "the scan found no built-ins, so it stopped testing anything: {routed:?}"
+        );
+        for name in routed {
+            assert!(
+                commands::is_reserved(&name),
+                "/{name} is routed as a built-in but missing from commands::RESERVED, so a \
+                 {name}.md template would be silently unreachable"
+            );
+        }
+    }
+
+    /// `Ctrl+C` used to abort the scheduler outright, which could cut a task between
+    /// `claim_due_scheduled_tasks` (which sets `running`) and `complete_scheduled_task`, leaving
+    /// the row `running` — the state both `storage.rs` and the ROADMAP said only a hard crash
+    /// could produce. Shutdown waits for the in-flight task instead.
+    #[tokio::test]
+    async fn shutdown_waits_for_an_in_flight_scheduled_task() {
+        let database = Arc::new(Mutex::new(Database::open_in_memory_for_tests()));
+        let turn_lock = Arc::new(Mutex::new(()));
+        let id = database
+            .lock()
+            .await
+            .create_scheduled_task(42, "ping", 0, None)
+            .unwrap();
+        let claimed = database.lock().await.claim_due_scheduled_tasks(1).unwrap();
+        assert_eq!(claimed.len(), 1, "the fixture has to leave a running row");
+
+        // Stands in for the scheduler mid-task: it holds the turn lock across the run, exactly as
+        // scheduler.rs does, and completes the row before letting go.
+        let scheduler = tokio::spawn({
+            let database = database.clone();
+            let turn_lock = turn_lock.clone();
+            async move {
+                let guard = turn_lock.lock().await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                database
+                    .lock()
+                    .await
+                    .complete_scheduled_task(&id, "completed")
+                    .unwrap();
+                drop(guard);
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let shutdown =
+            stop_scheduler(scheduler, &turn_lock, &database, Duration::from_secs(5)).await;
+
+        assert!(
+            shutdown.idle,
+            "shutdown must wait for the task, not abort it"
+        );
+        assert_eq!(
+            shutdown.recovered, 0,
+            "a task allowed to finish needs no recovery"
+        );
+        assert_eq!(
+            database.lock().await.reset_stuck_running_tasks().unwrap(),
+            0,
+            "no row may be left running by a graceful shutdown"
+        );
+    }
+
+    /// The wait is bounded: a task that will not finish must not hold shutdown open. What it
+    /// leaves behind is put back to `pending` here rather than being discovered as a stale
+    /// `running` row on the next start.
+    #[tokio::test]
+    async fn shutdown_gives_up_on_a_stuck_task_and_marks_its_row() {
+        let database = Arc::new(Mutex::new(Database::open_in_memory_for_tests()));
+        let turn_lock = Arc::new(Mutex::new(()));
+        database
+            .lock()
+            .await
+            .create_scheduled_task(42, "ping", 0, None)
+            .unwrap();
+        database.lock().await.claim_due_scheduled_tasks(1).unwrap();
+
+        let scheduler = tokio::spawn({
+            let turn_lock = turn_lock.clone();
+            async move {
+                let _guard = turn_lock.lock().await;
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let started = Instant::now();
+        let shutdown =
+            stop_scheduler(scheduler, &turn_lock, &database, Duration::from_millis(100)).await;
+
+        assert!(
+            !shutdown.idle,
+            "the stuck task should have timed out the wait"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown has to stay bounded, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(shutdown.recovered, 1, "the abandoned row has to be marked");
+        assert_eq!(
+            database.lock().await.reset_stuck_running_tasks().unwrap(),
+            0,
+            "nothing may be left running"
+        );
+        // Put back to pending, so the task is not lost: it is due again immediately.
+        assert_eq!(
+            database
+                .lock()
+                .await
+                .list_scheduled_tasks(42)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

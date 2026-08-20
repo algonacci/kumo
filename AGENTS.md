@@ -12,7 +12,7 @@ the family: Kamui is a general-purpose coding CLI, Kage orchestrates engineering
 the messaging gateway. Anything that would make Kumo a second coding agent, a second workflow
 engine, or a multi-platform bot framework belongs in one of the others or in no project at all.
 
-Roughly 9.9k lines across 14 modules, with ~160 unit tests living beside the code they cover and
+Roughly 10.6k lines across 14 modules, with ~195 unit tests living beside the code they cover and
 one small CLI integration test.
 
 ## The shape of a turn
@@ -21,17 +21,17 @@ Every claim in this file hangs off this chain, so it is worth holding in your he
 
 ```text
 Telegram update
- └─ owner check                      main.rs:353 (message) / main.rs:1665 (callback)
-    └─ pending ask_user on this chat? text answers it, no new turn   main.rs:378-397
-       └─ turn_lock                  main.rs:402/406/413, scheduler.rs:106
-          └─ built-in /command routing               main.rs:415-568
-             └─ user template expansion (commands.rs)  main.rs:569-593
-                └─ prepare_history → compaction if over budget  main.rs:1150
-                   └─ run_agent, ≤ 8 tool rounds     main.rs:831
-                      ├─ ask_user / delegate_readonly intercepted before dispatch  main.rs:921-933
-                      ├─ requires_confirmation → request_approval → Telegram buttons  main.rs:935-978
+ └─ owner check                      main.rs:555 (message) / main.rs:1950 (callback)
+    └─ pending ask_user on this chat? text answers it, no new turn   main.rs:585-598
+       └─ turn_lock                  main.rs:604/608/615, scheduler.rs:106
+          └─ built-in /command routing               main.rs:617-770
+             └─ user template expansion (commands.rs)  main.rs:772-784
+                └─ prepare_history → compaction if over budget  main.rs:1401
+                   └─ run_agent, ≤ 8 tool rounds     main.rs:1038
+                      ├─ ask_user / delegate_readonly intercepted before dispatch  main.rs:1137-1152
+                      ├─ requires_confirmation → request_approval → Telegram buttons  main.rs:1154-1216
                       └─ tools.dispatch                    tools.rs:390
-                   └─ save_turn, only on success   main.rs:787
+                   └─ save_turn, only on success   main.rs:976
 ```
 
 A scheduled task enters that same chain at `run_agent` (`scheduler.rs:199`) with the same arguments a
@@ -86,23 +86,23 @@ Where a change belongs:
 
 ## Behaviour that is easy to get wrong
 
-**Authorization is two checks, not one.** `main.rs:353` drops any message not from
-`telegram.owner_user_id`; `main.rs:1665` drops any callback query from anyone else. A new update
+**Authorization is two checks, not one.** `main.rs:555` drops any message not from
+`telegram.owner_user_id`; `main.rs:1950` drops any callback query from anyone else. A new update
 kind (edited messages, inline queries, channel posts) is a *third* entry point and needs its own
-check — the branches in `run_gateway` (`main.rs:276`, `main.rs:297`) are the complete list of what
+check — the branches in `run_gateway` (`main.rs:394`, `main.rs:415`) are the complete list of what
 is wired up today.
 
-**Approval is a one-shot nonce with a 2-minute fuse.** `request_approval` (`main.rs:1600`) makes a
+**Approval is a one-shot nonce with a 2-minute fuse.** `request_approval` (`main.rs:1885`) makes a
 UUID nonce, parks a `oneshot::Sender` in the shared `PendingApprovals` map, and sends three buttons
 whose callback data is `approval:<nonce>:<allow|always|deny>`. `handle_callback` *removes* the map
-entry before resolving it (`main.rs:1673`), so a second tap on the same message resolves nothing;
-`APPROVAL_TIMEOUT` (`main.rs:69`, 120 s) elapsing removes it too and yields `Deny` (`main.rs:1646`),
-and a dropped sender yields `Deny` as well (`main.rs:1644`). Denial is the failure mode in every
+entry before resolving it (`main.rs:1958`), so a second tap on the same message resolves nothing;
+`APPROVAL_TIMEOUT` (`main.rs:69`, 120 s) elapsing removes it too and yields `Deny` (`main.rs:1931`),
+and a dropped sender yields `Deny` as well (`main.rs:1929`). Denial is the failure mode in every
 direction, which is the property to preserve. The keyboard is cleared afterwards either way
-(`main.rs:1650`), so an expired prompt's buttons stop working.
+(`main.rs:1935`), so an expired prompt's buttons stop working.
 
 **The turn lock and the concurrency setting are one mechanism.** Approvals only work because the
-dispatcher is built with `.distribution_function(|_| None::<()>)` (`main.rs:313`): teloxide's default
+dispatcher is built with `.distribution_function(|_| None::<()>)` (`main.rs:435`): teloxide's default
 groups updates by chat and processes them *sequentially*, so with the default the callback carrying
 the owner's tap would queue behind the message handler that is blocked waiting for that very tap —
 every approval would time out at 120 seconds. Serialization instead comes from `turn_lock`, an
@@ -110,14 +110,23 @@ every approval would time out at 120 seconds. Serialization instead comes from `
 (`scheduler.rs:106`). Restoring teloxide's default distribution, or holding `turn_lock` around a
 callback, deadlocks the product.
 
-**A pending `ask_user` question swallows the next text message.** The check at `main.rs:378-397`
+**A pending `ask_user` question swallows the next text message.** The check at `main.rs:585-598`
 runs before command routing, so while a question is open, typing `/status` answers the question with
 the literal string `/status`. This is intentional (the turn that asked is already holding the lock),
 but it means any new pre-turn text handling must decide where it sits relative to that block.
 
+**A new built-in command has to be added to `commands::RESERVED` in the same change.** Built-ins are
+matched before template expansion, so a user's `<name>.md` for a built-in name can never run.
+`commands.rs` refuses to load one and reports the collision instead — in `/commands`
+(`commands_message`, `main.rs:1699`) and in a startup warning (`main.rs:277-291`) — but only for
+names the list knows about. `RESERVED` (`commands.rs:17`) is a hand-kept copy of the routing block,
+so `tests::builtin_commands_are_all_reserved` reads the built-ins back out of `main.rs`'s own source
+and fails if the two disagree. A name added to the routing block and not to `RESERVED` re-opens the
+gap silently, which is exactly how it arrived the first time.
+
 **"Always allow" is per tool, per chat, and survives more than you would guess.** The grant is a row
 in `always_allowed_tools` keyed by `(telegram_chat_id, tool_name)` (`storage.rs:900`), checked at
-`main.rs:939`. It is not scoped to a session id: only `/new` clears it (`main.rs:420`). `/resume`
+`main.rs:1158`. It is not scoped to a session id: only `/new` clears it (`main.rs:622`). `/resume`
 into an older session, and `/delete` of the session it was granted in, leave the grant standing. It
 is tool-grained, so one tap on a `run_command` prompt pre-approves *every* later command string in
 that chat.
@@ -144,16 +153,16 @@ typo there fails open into "still gated", visible only as a lower trusted count 
 
 **The round cap degrades, it does not fail.** After `MAX_TOOL_ROUNDS` (8, `main.rs:65`) the loop
 makes one final request with no tools offered and saves the result with finish reason
-`tool_round_limit` (`main.rs:1039-1058`). The point is that approved commands and their results are
+`tool_round_limit` (`main.rs:1283-1310`). The point is that approved commands and their results are
 never thrown away by Kumo's own limit. Do not restore a `bail!` there.
 
 **Memory is a snapshot frozen at startup.** `AppState.memory_snapshot` is rendered once
-(`main.rs:225`) and appended to every system prompt. `remember`/`update_memory`/`forget` write
+(`main.rs:343`) and appended to every system prompt. `remember`/`update_memory`/`forget` write
 SQLite immediately, so `/memory` shows the change and the conversation does not until restart. That
 is deliberate (a system prompt should not change mid-turn, and re-reading defeats prompt-prefix
-caching); `/memory`'s own doc comment says so at `main.rs:1321`.
+caching); `/memory`'s own doc comment says so at `main.rs:1572`.
 
-**Compaction budgets the whole request, not the messages.** `prepare_history` (`main.rs:1150`) sums
+**Compaction budgets the whole request, not the messages.** `prepare_history` (`main.rs:1401`) sums
 the system prompt, the memory snapshot, `tool_schema_bytes`, and the current summary as overhead,
 subtracts it from the threshold (~4 bytes/token × half the window, `compaction.rs:14`), and never
 lets history fall below 8 KiB (`compaction.rs:12`) — because summarizing messages cannot shrink a
@@ -162,8 +171,13 @@ tool schema. Connecting a large MCP server therefore legitimately compacts soone
 **Commands run through a shell; the shell differs by platform.** `run_command` (`tools.rs:516`)
 spawns `cmd /C <command>` on Windows and `sh -c <command>` elsewhere, in the chat's workspace, with
 stdin null, `kill_on_drop`, a 30-second timeout and 16 KiB of captured output (`tools.rs:22-23`).
-A `background: true` call has **no timeout at all** — it is stored in `command_jobs` with its PID and
-reaped by a detached task; only `stop_command`/`/jobs stop` or the process itself ends it.
+A `background: true` call is stored in `command_jobs` with its PID and reaped by a detached task,
+bounded by `BACKGROUND_MAX` (30 min, `tools.rs:43`) rather than by `COMMAND_TIMEOUT`. Reaching that
+ceiling kills the process tree through `kill_process_tree` — the reaper holds the child in a boxed
+future precisely so the tree is still walkable from a live root, because dropping the child first
+would let `kill_on_drop` take the shell down and orphan its children — and records the job as
+`failed` with a line saying it was terminated, never as `cancelled`, which is what a user-initiated
+`stop_command` writes.
 
 **RTK rewrites the command after approval.** With `tools.rtk` on, `rewrite_with_rtk`
 (`tools.rs:580`) runs `rtk rewrite -- <command>` and uses its stdout; any failure, empty output, or
@@ -175,7 +189,7 @@ presentation-level transformation.
 
 **Uploads write to the workspace with no approval.** A CSV/XLSX/XLSM document is saved under
 `<workspace>/uploads/<uuid>-<name>` by Kumo itself before the model sees anything
-(`main.rs:718-729`). That is Kumo writing, not a tool call, so no prompt is involved; the model is
+(`main.rs:908-919`). That is Kumo writing, not a tool call, so no prompt is involved; the model is
 handed the absolute path.
 
 ## Decisions and their reasons
@@ -194,21 +208,39 @@ so a Kumo-specific plugin API would duplicate MCP for nothing. The exception is 
 the gateway can have: receiving a Telegram photo is native, *interpreting* it is the model's job
 (ROADMAP Phase 4c).
 
+**An underscore is never an emphasis marker.** `markdown.rs` renders `**bold**` and nothing else as
+emphasis; `_x_` and `__x__` reach Telegram as escaped literal underscores. This reverses Kumo's
+original choice (single-`_` italic was honoured until it was found to mangle `snake_case`) and lands
+where Kamui already was for its terminal renderer (ROADMAP Phase 6): mangling an identifier is worse
+than under-styling prose. CommonMark's flanking rules are *not* a sufficient fix and were rejected
+for that reason — they rescue intra-word cases like `a_b_c`, but `__init__` has its delimiters at
+word boundaries and is strong emphasis under those same rules, so it would still render as a bold
+`init`. Single-`*` italic is not accepted either, because it would corrupt globs like `src/*.rs`.
+Re-adding underscore emphasis means re-breaking every identifier in a code answer, which is most of
+what this gateway sends.
+
 **Permission policy lives in the agent loop, not in tools.** A tool answers `requires_confirmation`;
 `run_agent` decides what to do about it. That is why an MCP tool, `run_command` and
 `delegate_to_kamui` all get the identical prompt, audit rows and standing-grant behaviour without
 any of them containing approval code.
 
 **Scheduling is a SQLite row and a 30-second poll.** No timer wheel, no external cron. A task
-survives a restart because it is still `pending`; `claim_due_scheduled_tasks` (`storage.rs:817`)
+survives a restart because it is still `pending`; `claim_due_scheduled_tasks` (`storage.rs:877`)
 moves it to `running` inside the transaction that reads it, so a crash cannot double-dispatch, and
-`reset_stuck_running_tasks` (`storage.rs:843`) recovers it at startup (`main.rs:211`).
+`reset_stuck_running_tasks` (`storage.rs:903`) recovers it at startup (`main.rs:329`).
 
 **Recurrence is a second count, not cron.** The model already computes `run_at` from the user's
 timezone; asking it for a cron string adds failure surface for cases ("daily", "hourly") that are one
-multiplication. Rescheduling is folded into `complete_scheduled_task` (`storage.rs:856`) so no other
-code path needs an "is this recurring" branch. A failed recurring task is marked `failed` and not
-retried — a broken reminder should reach the owner, not loop.
+multiplication. Rescheduling after a *successful* run is folded into `complete_scheduled_task`
+(`storage.rs:916`), so the ordinary claim/complete path needs no "is this recurring" branch. There is
+exactly one other place that has to know, and it is not optional:
+`expire_stale_scheduled_tasks` (`storage.rs:825`) must not apply the one-shot expiry rule to a
+recurring schedule. Expiry is terminal, so doing that killed a daily reminder outright because Kumo
+was asleep for one of its occurrences. A recurring task instead skips the missed occurrences and
+keeps its phase — `next_occurrence` (`storage.rs:987`) advances `run_at` by whole intervals to the
+first one that is not in the past, and `StaleTaskOutcome` carries which of the two happened out to
+the scheduler so the chat is told the truth about it (`scheduler.rs:191`). A failed recurring task is
+still marked `failed` and not retried — a broken reminder should reach the owner, not loop.
 
 **`MIN_REPEAT_INTERVAL` is 300 s and `MAX_PENDING_TASKS` is 20** (`tools.rs:35`, `tools.rs:39`).
 Both are guards against one confused turn, not user-facing tuning: a per-minute reminder that fires
@@ -222,7 +254,7 @@ than live in a command the reader has to already know.
 side effect. The tools that intent invokes go through the ordinary prompt when the task runs, and an
 unattended run can wait out the full 2 minutes for the owner.
 
-**The typing indicator wraps work, never a wait.** `with_typing` (`main.rs:819`) is applied to
+**The typing indicator wraps work, never a wait.** `with_typing` (`main.rs:1026`) is applied to
 provider calls and tool dispatch but deliberately not to `request_approval` or `ask_user`: showing
 "typing" while the owner is the one being waited on misreports who is holding up the turn.
 
@@ -283,18 +315,23 @@ cargo clippy --all-targets -- -D warnings
 There is no CI workflow that runs any of them — `.github/workflows/release.yml` is tag-triggered and
 only builds and packages release binaries for five targets. This file's list is the whole gate.
 
-`cargo test` and `cargo fmt --check` are green on Windows (161 + 2 passed). Clippy is not, and that
+`cargo test` and `cargo fmt --check` are green on Windows (195 + 2 passed). Clippy is not, and that
 one is expected:
 
-- **Clippy reports 5 pre-existing warnings, all `collapsible_if`:** `markdown.rs:67`, `:76`, `:87`,
-  `:98`, and `main.rs:1679`. With `-D warnings` the build therefore fails before and after any
-  unrelated change. Compare warning *lists*, not exit codes, and fix these only as a deliberate
-  cleanup commit of their own.
+- **Clippy reports 3 pre-existing warnings, all `collapsible_if`:** `markdown.rs:77`, `:86`, and
+  `main.rs:1964`. With `-D warnings` the build therefore fails before and after any unrelated
+  change. Compare warning *lists*, not exit codes, and fix these only as a deliberate cleanup commit
+  of their own. (This was 5; two of them sat in the underscore-emphasis branches that the
+  never-an-emphasis-marker decision above deleted, and the remaining two moved down ten lines with
+  the module comment that records it.)
 - **One CLI test is `#[cfg(unix)]`.** `status_reports_an_unconfigured_isolated_home` cannot be
   arranged on Windows: `directories` resolves the config directory through the Known Folder API, so
   `HOME`/`XDG_CONFIG_HOME` do not move it and `status` finds the real one. Giving Windows that
   coverage needs an explicit config-directory override, the way `KUMO_DATA_DIR` already overrides
-  the data directory. Add tests next to the code they cover, in `#[cfg(test)] mod tests` at
+  the data directory. Because that test is its only user, `use std::fs` in `tests/cli.rs:1` is a
+  fourth pre-existing warning (`unused_imports`) on Windows and not on Unix — expect it, and do not
+  "fix" it by deleting an import Unix needs. Add tests next to the code they cover, in
+  `#[cfg(test)] mod tests` at
 the bottom of the module; `tests/` holds only the CLI integration test and there is no reason to add
 a second file there. No test may require `kamui`, `rtk`, an MCP server, a Telegram token or a live
 provider — `tests::readonly_subagent_uses_isolated_provider_and_read_tools` shows the pattern of
@@ -309,36 +346,44 @@ a lie told with authority.
 - **Nothing in the agent loop is tested against a live provider**, and by construction cannot be.
   `run_agent`, the approval flow, the scheduler dispatch and the Telegram handlers have no test
   coverage; what is covered is tools, storage, compaction, markdown, config and the sub-agent.
-- **A recurring task missed by more than an hour dies permanently.**
-  `expire_stale_scheduled_tasks` (`storage.rs:790`) marks any `pending` row past the cutoff
-  `expired`, with no exception for recurrence, and `expired` is terminal. Kumo offline over lunch
-  silently ends a daily reminder; the chat is told the task was skipped, not that it will never fire
-  again.
-- **A graceful `Ctrl+C` during a scheduled run leaves its row `running`.** `scheduler_task.abort()`
-  (`main.rs:334`) can cut the task's agent loop before `complete_scheduled_task`. Recovery works —
-  startup resets it to `pending` — but the ROADMAP's claim (Phase 3) and the doc comment at
-  `storage.rs:838` that only a hard crash can leave a task `running` are not accurate.
-- **A background command has no upper bound.** Unlike foreground commands (30 s) and Kamui
-  delegations (5 min), a `background: true` job runs until it exits or is stopped. Kamui's sibling
-  feature has a `background_max_secs` backstop; Kumo has none.
-- **Every turn failure is reported as a provider failure.** `deliver_agent_turn` (`main.rs:797`)
-  answers any `run_agent` error with "The model provider could not answer", including errors that
-  came from `ask_user`, a Telegram send, or storage. The log reference id is the only way to tell
-  them apart.
-- **A user template named after a built-in command is silently unreachable.** Built-ins are matched
-  first (`main.rs:415-568`) and `commands.rs` has no reserved-name list, unlike Kamui's
-  `commands::RESERVED`. A `status.md` template simply never runs, with no warning.
+- **A recurring task late by *less* than the stale window replays its backlog.**
+  `complete_scheduled_task` (`storage.rs:916`) advances a recurring task by exactly one interval
+  from its old `run_at`, never consulting `now`. A task claimed while it is several intervals late
+  — Kumo offline for 50 minutes with a 5-minute reminder, which is inside `STALE_AFTER` and so is
+  dispatched normally — completes to a `run_at` that is *still* in the past, so the next poll claims
+  it again, and again, delivering the whole backlog 30 seconds apart. Past the one-hour window
+  `expire_stale_scheduled_tasks` skips forward to the next occurrence and the burst cannot happen;
+  below it, nothing does.
+- **A `Ctrl+C` that outlasts the scheduler's 30-second grace still interrupts a scheduled run.**
+  `stop_scheduler` (`main.rs:495`) waits up to `SCHEDULER_SHUTDOWN_GRACE` (`main.rs:473`, 30 s) for
+  the scheduler to be between tasks — it holds `turn_lock` for the whole of each one — before
+  aborting it, and resets whatever is still `running` back to `pending` on the way out, so no row
+  is left `running` and the claim at `storage.rs:838` holds. What is *not* covered is the work
+  itself: a task still running at the grace limit (a five-minute Kamui delegation, say) is cut off
+  and re-run from the start on the next dispatch, since a scheduled turn has no resume point.
+- **A timed-out background job is recorded as `failed`, not as its own status.** The
+  `command_jobs.status` CHECK (`storage.rs:1192`) admits only `running`/`completed`/`failed`/
+  `cancelled`, so a job that hits the ceiling shares a status with a command that exited non-zero,
+  and only its `output` line ("exceeded the N-second limit and was terminated") tells them apart.
+  A distinct `timed_out` needs a `migrate_to_v9` and a `CURRENT_VERSION` bump.
+- **A turn failure is reported by class, but the class is only as good as its tagging.**
+  `deliver_agent_turn` (`main.rs:949`) now reports provider, tool, storage and Telegram failures as
+  what they are (`turn_failure_report`, `main.rs:175`), from the `TurnFailure` wrapper each site in
+  `run_agent` attaches. An error nobody tagged reports as an *internal* Kumo error, so a new
+  fallible call added to the agent loop without a `.classify(...)` is misreported as a Kumo bug
+  rather than as whatever it is. The user-facing text is built from the class alone and never
+  quotes the error, so the log reference id is still the only way to see the detail.
 - **An uploaded document's path is absolute, but `read_file` rejects absolute paths**
   (`tools.rs:502`). The upload prompt hands the model `<workspace>/uploads/...` in full
-  (`main.rs:737`), which works for MCP data tools and fails for Kumo's own reader.
-- **`_italic_` is honoured, so `snake_case` renders wrong.** `markdown.rs:98` treats the underscores
-  in an identifier as an italic entity. The output is still valid MarkdownV2 — Telegram accepts it —
-  so the failure is a mangled identifier, not a rejected message. Kamui refused single-`_` italics
-  for exactly this reason; Kumo chose the other side and has not revisited it.
-- **Message chunking is character-count only.** `message_chunks` (`main.rs:1916`) splits at 4000
-  characters with no regard for code fences or entities, and relies on `send_formatted`'s plain-text
-  fallback (`main.rs:1817-1823`) when Telegram rejects the result. A long fenced block therefore
-  loses its formatting rather than its content.
+  (`main.rs:927`), which works for MCP data tools and fails for Kumo's own reader.
+- **Chunking tracks code fences by line, so a fence written mid-line is invisible to it.**
+  `message_chunks` (`main.rs:2224`) now splits at a line boundary, closing and re-opening a fenced
+  block across the boundary, and falls back to a space where no inline entity is open before it
+  will cut characters. It decides what is code from lines that *start* with ```` ``` ````, while
+  `markdown::to_telegram_markdown_v2` pairs any occurrence anywhere; for input where those two
+  disagree a chunk can still be mis-fenced, and `send_formatted`'s plain-text fallback
+  (`main.rs:2102-2108`) is what catches it. A single token longer than a whole chunk is also still cut
+  by character count — there is nothing else to cut it at.
 
 ## Definition of done
 

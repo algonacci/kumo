@@ -85,6 +85,12 @@ pub struct ToolsConfig {
     /// output. Disabled by default for existing configurations.
     #[serde(default)]
     pub rtk: bool,
+    /// Upper bound on a background job, in seconds. Absent means the built-in ceiling
+    /// (`tools::BACKGROUND_MAX`). A gateway that runs genuinely long builds can raise it; the
+    /// bound exists so a runaway process cannot outlive the conversation that started it, not
+    /// because half an hour is right for every workload.
+    #[serde(default)]
+    pub background_max_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -224,6 +230,7 @@ mod tests {
             tools: Some(ToolsConfig {
                 workspace: PathBuf::from("/tmp/workspace"),
                 rtk: true,
+                background_max_secs: None,
             }),
             timezone: Some("Asia/Jakarta".into()),
             mcp: BTreeMap::from([(
@@ -345,6 +352,27 @@ mod tests {
 
         assert_eq!(config.provider().unwrap().active_model, "new");
         assert_eq!(config.active_provider_name().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn the_background_ceiling_is_absent_unless_an_operator_sets_it() {
+        let without: ToolsConfig = toml::from_str(
+            "workspace = \"/tmp/w\"
+",
+        )
+        .expect("the setting is optional");
+        assert_eq!(
+            without.background_max_secs, None,
+            "absent leaves the built-in ceiling"
+        );
+
+        let with: ToolsConfig = toml::from_str(
+            "workspace = \"/tmp/w\"
+background_max_secs = 5400
+",
+        )
+        .unwrap();
+        assert_eq!(with.background_max_secs, Some(5400));
     }
 
     #[test]
