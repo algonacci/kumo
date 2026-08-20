@@ -239,7 +239,14 @@ recurring schedule. Expiry is terminal, so doing that killed a daily reminder ou
 was asleep for one of its occurrences. A recurring task instead skips the missed occurrences and
 keeps its phase — `next_occurrence` (`storage.rs:987`) advances `run_at` by whole intervals to the
 first one that is not in the past, and `StaleTaskOutcome` carries which of the two happened out to
-the scheduler so the chat is told the truth about it (`scheduler.rs:191`). A failed recurring task is
+the scheduler so the chat is told the truth about it (`scheduler.rs:191`).
+
+`complete_scheduled_task` uses the same helper, and must: advancing by a single interval from the
+old `run_at` reschedules a late task into its own past, so the next poll claims it again — a
+five-minute reminder fifty minutes behind delivered ten messages thirty seconds apart. The two
+callers differ only in strictness, and the difference is not cosmetic. The stale sweep passes
+`now`, because an occurrence landing exactly on `now` is due and the same poll should run it.
+Completion passes `now + 1`, because the occurrence at `now` is the one that just ran. A failed recurring task is
 still marked `failed` and not retried — a broken reminder should reach the owner, not loop.
 
 **`MIN_REPEAT_INTERVAL` is 300 s and `MAX_PENDING_TASKS` is 20** (`tools.rs:35`, `tools.rs:39`).
@@ -346,14 +353,6 @@ a lie told with authority.
 - **Nothing in the agent loop is tested against a live provider**, and by construction cannot be.
   `run_agent`, the approval flow, the scheduler dispatch and the Telegram handlers have no test
   coverage; what is covered is tools, storage, compaction, markdown, config and the sub-agent.
-- **A recurring task late by *less* than the stale window replays its backlog.**
-  `complete_scheduled_task` (`storage.rs:916`) advances a recurring task by exactly one interval
-  from its old `run_at`, never consulting `now`. A task claimed while it is several intervals late
-  — Kumo offline for 50 minutes with a 5-minute reminder, which is inside `STALE_AFTER` and so is
-  dispatched normally — completes to a `run_at` that is *still* in the past, so the next poll claims
-  it again, and again, delivering the whole backlog 30 seconds apart. Past the one-hour window
-  `expire_stale_scheduled_tasks` skips forward to the next occurrence and the burst cannot happen;
-  below it, nothing does.
 - **A `Ctrl+C` that outlasts the scheduler's 30-second grace still interrupts a scheduled run.**
   `stop_scheduler` (`main.rs:495`) waits up to `SCHEDULER_SHUTDOWN_GRACE` (`main.rs:473`, 30 s) for
   the scheduler to be between tasks — it holds `turn_lock` for the whole of each one — before

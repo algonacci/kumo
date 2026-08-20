@@ -913,7 +913,14 @@ impl Database {
     /// it up again next time rather than it ending here; a recurring task that *failed* still gets
     /// marked `failed` like a one-shot would; a failing recurring reminder should surface the error
     /// rather than silently keep retrying forever.
-    pub fn complete_scheduled_task(&self, id: &str, status: &str) -> Result<()> {
+    /// `now` decides where a recurring task lands next. Adding one interval to the old `run_at`
+    /// looks equivalent and is not: a task that ran late — Kumo was busy, the host slept through
+    /// several occurrences without crossing the stale window — would be rescheduled into the past
+    /// and become due again immediately, delivering its whole backlog in a burst. A five-minute
+    /// reminder fifty minutes behind sent ten messages thirty seconds apart. Advancing to the
+    /// first occurrence at or after `now` keeps the time of day (whole intervals, same as the
+    /// stale sweep) while spending the backlog once.
+    pub fn complete_scheduled_task(&self, id: &str, status: &str, now: i64) -> Result<()> {
         if status == "completed" {
             let recurrence: Option<(i64, i64)> = self
                 .connection
@@ -927,10 +934,16 @@ impl Database {
                 )
                 .optional()?
                 .flatten();
-            if let Some((run_at, interval)) = recurrence {
+            if let Some((run_at, interval)) = recurrence.filter(|(_, interval)| *interval > 0) {
+                // `now + 1`, because the two callers of `next_occurrence` want different
+                // strictness. The stale sweep treats an occurrence landing exactly on `now` as
+                // due and lets the same poll run it. Here the task has just *finished* running at
+                // `now`, so an occurrence at `now` is the one that was served — scheduling it
+                // again would fire the task twice on the same tick.
+                let (next_run_at, _) = next_occurrence(run_at, interval, now.saturating_add(1));
                 self.connection.execute(
                     "UPDATE scheduled_tasks SET status = 'pending', run_at = ?2 WHERE id = ?1",
-                    params![id, run_at + interval],
+                    params![id, next_run_at],
                 )?;
                 return Ok(());
             }
@@ -1706,7 +1719,9 @@ mod tests {
             .create_scheduled_task(42, "ping me", 100, None)
             .unwrap();
 
-        database.complete_scheduled_task(&id, "completed").unwrap();
+        database
+            .complete_scheduled_task(&id, "completed", 100)
+            .unwrap();
 
         assert!(database.claim_due_scheduled_tasks(500).unwrap().is_empty());
     }
@@ -1927,7 +1942,9 @@ mod tests {
             .create_scheduled_task(42, "ping me", 100, None)
             .unwrap();
         database.claim_due_scheduled_tasks(500).unwrap();
-        database.complete_scheduled_task(&id, "completed").unwrap();
+        database
+            .complete_scheduled_task(&id, "completed", 100)
+            .unwrap();
 
         assert_eq!(database.reset_stuck_running_tasks().unwrap(), 0);
     }
@@ -1946,7 +1963,7 @@ mod tests {
         let claimed = database.claim_due_scheduled_tasks(0).unwrap();
         assert_eq!(claimed[0].id, id);
         // The claim moved the row to 'running', which the CHECK constraint added in v4 must allow.
-        database.complete_scheduled_task(&id, "expired").unwrap();
+        database.complete_scheduled_task(&id, "expired", 0).unwrap();
     }
 
     #[test]
@@ -2002,7 +2019,9 @@ mod tests {
         let id = database
             .create_scheduled_task(42, "ping me", 100, None)
             .unwrap();
-        database.complete_scheduled_task(&id, "completed").unwrap();
+        database
+            .complete_scheduled_task(&id, "completed", 100)
+            .unwrap();
 
         assert_eq!(
             database.storage_summary().unwrap().pending_scheduled_tasks,
@@ -2017,7 +2036,9 @@ mod tests {
             .create_scheduled_task(42, "daily reminder", 1000, Some(86400))
             .unwrap();
 
-        database.complete_scheduled_task(&id, "completed").unwrap();
+        database
+            .complete_scheduled_task(&id, "completed", 1000)
+            .unwrap();
 
         let tasks = database.list_scheduled_tasks(42).unwrap();
         assert_eq!(
@@ -2036,9 +2057,43 @@ mod tests {
             .create_scheduled_task(42, "daily reminder", 1000, Some(86400))
             .unwrap();
 
-        database.complete_scheduled_task(&id, "failed").unwrap();
+        database
+            .complete_scheduled_task(&id, "failed", 1000)
+            .unwrap();
 
         assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_recurring_task_completed_late_does_not_replay_its_backlog() {
+        let mut database = database();
+        let five_minutes = 300;
+        let id = database
+            .create_scheduled_task(42, "stand up", 1_000, Some(five_minutes))
+            .unwrap();
+
+        // Fifty minutes late: inside the one-hour stale window, so the sweep never sees it, and
+        // the old "run_at + interval" landed at 1_300 — still in the past, due again at once, and
+        // again, until ten occurrences had been delivered thirty seconds apart.
+        let late = 1_000 + 50 * 60;
+        database
+            .complete_scheduled_task(&id, "completed", late)
+            .unwrap();
+
+        let next = database.list_scheduled_tasks(42).unwrap()[0].run_at;
+        assert!(
+            next > late,
+            "a task rescheduled into the past fires again immediately: next={next} now={late}"
+        );
+        assert_eq!(
+            (next - 1_000) % five_minutes,
+            0,
+            "the schedule keeps its original phase rather than restarting at now"
+        );
+        assert!(
+            database.claim_due_scheduled_tasks(late).unwrap().is_empty(),
+            "nothing is owed the moment the late run finishes"
+        );
     }
 
     #[test]
@@ -2048,7 +2103,9 @@ mod tests {
             .create_scheduled_task(42, "one-off", 1000, None)
             .unwrap();
 
-        database.complete_scheduled_task(&id, "completed").unwrap();
+        database
+            .complete_scheduled_task(&id, "completed", 1000)
+            .unwrap();
 
         assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
     }

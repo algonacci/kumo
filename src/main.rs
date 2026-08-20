@@ -3618,7 +3618,7 @@ mod tests {
                 database
                     .lock()
                     .await
-                    .complete_scheduled_task(&id, "completed")
+                    .complete_scheduled_task(&id, "completed", chrono::Utc::now().timestamp())
                     .unwrap();
                 drop(guard);
                 std::future::pending::<()>().await;

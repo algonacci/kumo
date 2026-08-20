@@ -171,12 +171,14 @@ async fn run_due_tasks(
                 "failed"
             }
         };
-        // For a successful, recurring task this reschedules it (run_at advanced by its interval)
-        // instead of actually marking it completed — see Database::complete_scheduled_task.
-        database
-            .lock()
-            .await
-            .complete_scheduled_task(&task.id, status)?;
+        // For a successful, recurring task this reschedules it instead of actually marking it
+        // completed — see Database::complete_scheduled_task. The timestamp is read here, after
+        // the turn has run, so a long turn does not reschedule into its own past.
+        database.lock().await.complete_scheduled_task(
+            &task.id,
+            status,
+            chrono::Utc::now().timestamp(),
+        )?;
     }
     Ok(())
 }
