@@ -9,8 +9,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     AppState, PendingApprovals, PendingQuestions, logging, prepare_history,
-    provider::Message as ProviderMessage, run_agent, send_formatted, send_mcp_images,
-    storage::Database,
+    provider::Message as ProviderMessage,
+    run_agent, send_formatted, send_mcp_images,
+    storage::{Database, ScheduledTask, StaleScheduledTask, StaleTaskOutcome},
 };
 
 /// How often to check for due tasks. Coarser than a typical cron minimum, but scheduled tasks are
@@ -77,27 +78,41 @@ async fn run_due_tasks(
         }
     }
 
-    // Tasks that missed their window by too long (e.g. Kumo was offline) are skipped rather than
-    // run late and silently; tell the owning chat why nothing happened at the scheduled time.
+    // Occurrences that missed their window by too long (e.g. Kumo was offline) are skipped rather
+    // than run late and silently; tell the owning chat why nothing happened at the scheduled time,
+    // and — for a recurring task, which is not over — when it will happen next.
     let stale = database
         .lock()
         .await
         .expire_stale_scheduled_tasks(now, STALE_AFTER.as_secs() as i64)?;
-    for task in stale {
-        let chat_id = ChatId(task.telegram_chat_id);
-        let notice = format!(
-            "\u{26a0}\u{fe0f} A scheduled task missed its time by more than an hour and was skipped: \"{}\"",
-            task.prompt
-        );
-        if let Err(error) = bot.send_message(chat_id, notice).await {
-            logging::warn(
+    if !stale.is_empty() {
+        let timezone = state.read().await.config.timezone();
+        for entry in stale {
+            let chat_id = ChatId(entry.task.telegram_chat_id);
+            let reason = match entry.outcome {
+                StaleTaskOutcome::Expired => "expired",
+                StaleTaskOutcome::Rescheduled { .. } => "rescheduled",
+            };
+            logging::info(
                 "scheduler",
                 format!(
-                    "task={} chat_id={} notification=failed reason=expired error={error:#}",
-                    &task.id[..8],
-                    chat_id
+                    "task={} chat_id={} status=stale due_at={} outcome={reason}",
+                    &entry.task.id[..8],
+                    chat_id,
+                    entry.task.run_at
                 ),
             );
+            let notice = stale_notice(&entry, timezone);
+            if let Err(error) = bot.send_message(chat_id, notice).await {
+                logging::warn(
+                    "scheduler",
+                    format!(
+                        "task={} chat_id={} notification=failed reason={reason} error={error:#}",
+                        &entry.task.id[..8],
+                        chat_id
+                    ),
+                );
+            }
         }
     }
 
@@ -166,11 +181,59 @@ async fn run_due_tasks(
     Ok(())
 }
 
+/// The notice sent when a task's occurrence was missed by more than `STALE_AFTER`.
+///
+/// The two cases have to read differently. A one-shot task is over, and saying only "skipped"
+/// leaves that unsaid. A recurring task is *not* over — it used to be, which is the bug this
+/// wording exists to close — so its notice names the occurrences that were dropped, says when the
+/// next one is, and carries the same cancel line a delivery would, because a reminder the owner no
+/// longer wants is exactly what a "you missed some of these" message brings to mind.
+fn stale_notice(entry: &StaleScheduledTask, timezone: chrono_tz::Tz) -> String {
+    match entry.outcome {
+        StaleTaskOutcome::Expired => format!(
+            "\u{26a0}\u{fe0f} A scheduled task missed its time by more than an hour and was skipped: \"{}\"\nIt was a one-off, so it will not run at all.",
+            entry.task.prompt
+        ),
+        StaleTaskOutcome::Rescheduled {
+            skipped,
+            next_run_at,
+        } => {
+            let occurrences = if skipped == 1 {
+                "1 occurrence was skipped".to_owned()
+            } else {
+                format!("{skipped} occurrences were skipped")
+            };
+            let mut notice = format!(
+                "\u{26a0}\u{fe0f} A recurring task missed its time by more than an hour, so {occurrences}: \"{}\"\nNext run: {}.",
+                entry.task.prompt,
+                local_time(next_run_at, timezone)
+            );
+            if let Some(note) = recurrence_note(&entry.task) {
+                notice.push('\n');
+                notice.push_str(&note);
+            }
+            notice
+        }
+    }
+}
+
+/// A unix timestamp rendered in the owner's configured timezone, the way `/reminders` renders one.
+fn local_time(timestamp: i64, timezone: chrono_tz::Tz) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|value| {
+            value
+                .with_timezone(&timezone)
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "an unknown time".to_owned())
+}
+
 /// The line appended to a recurring reminder telling the reader how to stop it. A reminder that
 /// turns out to be unwanted is discovered *by being delivered*, so the way out belongs in the
 /// message doing the interrupting — not in a command the reader has to already know about. One-shot
 /// tasks get nothing: there is nothing to stop.
-fn recurrence_note(task: &crate::storage::ScheduledTask) -> Option<String> {
+fn recurrence_note(task: &ScheduledTask) -> Option<String> {
     let interval = task.repeat_interval_seconds?;
     let every = match interval {
         seconds if seconds % 86_400 == 0 => format!("{} day(s)", seconds / 86_400),
@@ -230,7 +293,6 @@ async fn run_scheduled_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ScheduledTask;
 
     fn task(repeat_interval_seconds: Option<i64>) -> ScheduledTask {
         ScheduledTask {
@@ -254,6 +316,66 @@ mod tests {
         assert!(note.contains("Repeats every 1 day(s)"), "{note}");
         // The id has to be the short form /reminders cancel accepts.
         assert!(note.contains("/reminders cancel 8be7f7aa"), "{note}");
+    }
+
+    #[test]
+    fn a_stale_one_shot_notice_says_the_task_is_over() {
+        let notice = stale_notice(
+            &StaleScheduledTask {
+                task: task(None),
+                outcome: StaleTaskOutcome::Expired,
+            },
+            chrono_tz::UTC,
+        );
+
+        assert!(notice.contains("was skipped"), "{notice}");
+        assert!(notice.contains("will not run at all"), "{notice}");
+        assert!(
+            !notice.contains("/reminders cancel"),
+            "there is nothing left to cancel: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_stale_recurring_notice_says_when_it_will_next_run() {
+        let notice = stale_notice(
+            &StaleScheduledTask {
+                task: task(Some(86_400)),
+                outcome: StaleTaskOutcome::Rescheduled {
+                    skipped: 2,
+                    next_run_at: 1_700_000_000,
+                },
+            },
+            chrono_tz::UTC,
+        );
+
+        assert!(notice.contains("2 occurrences were skipped"), "{notice}");
+        assert!(
+            notice.contains("Next run: 2023-11-14 22:13 UTC"),
+            "{notice}"
+        );
+        // The escape hatch travels with the interruption, as it does on a delivery.
+        assert!(notice.contains("/reminders cancel 8be7f7aa"), "{notice}");
+        assert!(
+            !notice.contains("will not run"),
+            "a recurring task is not over: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_single_skipped_occurrence_reads_as_one() {
+        let notice = stale_notice(
+            &StaleScheduledTask {
+                task: task(Some(86_400)),
+                outcome: StaleTaskOutcome::Rescheduled {
+                    skipped: 1,
+                    next_run_at: 1_700_000_000,
+                },
+            },
+            chrono_tz::UTC,
+        );
+
+        assert!(notice.contains("1 occurrence was skipped"), "{notice}");
     }
 
     #[test]

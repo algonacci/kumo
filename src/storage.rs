@@ -39,6 +39,29 @@ pub struct ScheduledTask {
     pub repeat_interval_seconds: Option<i64>,
 }
 
+/// What `expire_stale_scheduled_tasks` did with a task that missed its window, so the caller can
+/// tell the owner the truth about it: a one-shot task is over, a recurring one is not.
+pub enum StaleTaskOutcome {
+    /// A one-shot task, now `expired`. That status is terminal: it will never run.
+    Expired,
+    /// A recurring task. The occurrences it slept through are skipped and the row stays `pending`
+    /// with `run_at` moved to the first occurrence that is not in the past, so the schedule keeps
+    /// its original phase (a 09:00 daily reminder stays at 09:00) instead of dying here.
+    Rescheduled {
+        /// How many occurrences were missed, counting the one that went stale.
+        skipped: i64,
+        /// The `run_at` the task now holds.
+        next_run_at: i64,
+    },
+}
+
+/// A task found past the staleness cutoff, paired with what was done about it. `task` carries the
+/// row as it was read, so `task.run_at` is the *missed* occurrence, not the rescheduled one.
+pub struct StaleScheduledTask {
+    pub task: ScheduledTask,
+    pub outcome: StaleTaskOutcome,
+}
+
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
@@ -784,14 +807,26 @@ impl Database {
         Ok(true)
     }
 
-    /// Mark `pending` tasks more than `stale_after` seconds past their `run_at` as `expired`
-    /// instead of dispatching them, and return the ones just expired (so the caller can tell the
-    /// user their reminder was skipped rather than silently dropping it).
+    /// Deal with `pending` tasks more than `stale_after` seconds past their `run_at` instead of
+    /// dispatching them, and return what happened to each (so the caller can tell the user their
+    /// reminder was skipped rather than silently dropping it).
+    ///
+    /// Running a reminder hours after it was wanted is worse than not running it, so the missed
+    /// *occurrence* is always skipped. What that means depends on the task: a one-shot task has
+    /// nothing left and is marked `expired`, which is terminal. A recurring task's missed
+    /// occurrence is not its whole life — applying the one-shot rule to it killed a daily reminder
+    /// because Kumo was asleep once — so it stays `pending` and `run_at` moves forward by whole
+    /// intervals to the first occurrence that is not in the past. Advancing to *at or after* `now`
+    /// rather than by a single interval is what stops a task that slept through twelve occurrences
+    /// from firing twelve times in the following six minutes.
+    ///
+    /// Only `pending` rows are selected and the updates re-check that status, so a `cancelled`,
+    /// `expired` or `running` task can never be brought back to life here.
     pub fn expire_stale_scheduled_tasks(
         &self,
         now: i64,
         stale_after: i64,
-    ) -> Result<Vec<ScheduledTask>> {
+    ) -> Result<Vec<StaleScheduledTask>> {
         let cutoff = now - stale_after;
         let mut statement = self.connection.prepare(
             "SELECT id, telegram_chat_id, prompt, run_at, repeat_interval_seconds
@@ -801,13 +836,38 @@ impl Database {
         )?;
         let rows = statement.query_map([cutoff], scheduled_task_from_row)?;
         let stale = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        for task in &stale {
-            self.connection.execute(
-                "UPDATE scheduled_tasks SET status = 'expired' WHERE id = ?1",
-                [&task.id],
-            )?;
+        let mut handled = Vec::with_capacity(stale.len());
+        for task in stale {
+            // A non-positive interval cannot come from `schedule_task` (MIN_REPEAT_INTERVAL), but
+            // treating one as recurring would divide by zero, so it falls through to one-shot.
+            let outcome = match task
+                .repeat_interval_seconds
+                .filter(|interval| *interval > 0)
+            {
+                Some(interval) => {
+                    let (next_run_at, skipped) = next_occurrence(task.run_at, interval, now);
+                    self.connection.execute(
+                        "UPDATE scheduled_tasks SET run_at = ?2
+                         WHERE id = ?1 AND status = 'pending'",
+                        params![task.id, next_run_at],
+                    )?;
+                    StaleTaskOutcome::Rescheduled {
+                        skipped,
+                        next_run_at,
+                    }
+                }
+                None => {
+                    self.connection.execute(
+                        "UPDATE scheduled_tasks SET status = 'expired'
+                         WHERE id = ?1 AND status = 'pending'",
+                        [&task.id],
+                    )?;
+                    StaleTaskOutcome::Expired
+                }
+            };
+            handled.push(StaleScheduledTask { task, outcome });
         }
-        Ok(stale)
+        Ok(handled)
     }
 
     /// Atomically claim every `pending` task whose `run_at` has passed by moving it straight to
@@ -915,6 +975,25 @@ impl Database {
         )?;
         Ok(())
     }
+}
+
+/// The first occurrence of a task repeating every `interval` seconds from `run_at` that is not in
+/// the past, plus how many occurrences (counting the one at `run_at`) were missed getting there.
+///
+/// Whole multiples of `interval` are added rather than restarting the schedule at `now`, so a
+/// reminder keeps the time of day it was set for. "Not in the past" is `>= now`, not `> now`: an
+/// occurrence landing exactly on `now` is due, not missed, and the caller's own
+/// `claim_due_scheduled_tasks` will run it in the same poll.
+fn next_occurrence(run_at: i64, interval: i64, now: i64) -> (i64, i64) {
+    debug_assert!(interval > 0, "a recurring interval must be positive");
+    let behind = now.saturating_sub(run_at).max(0);
+    // Round up (`i64::div_ceil` is still unstable), so the result lands at or after `now` and
+    // `skipped` counts the occurrence at `run_at` itself.
+    let skipped = (behind.saturating_add(interval - 1) / interval).max(1);
+    (
+        run_at.saturating_add(skipped.saturating_mul(interval)),
+        skipped,
+    )
 }
 
 fn scheduled_task_from_row(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask> {
@@ -1647,8 +1726,9 @@ mod tests {
         let expired = database.expire_stale_scheduled_tasks(1000, 100).unwrap();
 
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].id, stale);
-        assert_ne!(expired[0].id, fresh);
+        assert_eq!(expired[0].task.id, stale);
+        assert_ne!(expired[0].task.id, fresh);
+        assert!(matches!(expired[0].outcome, StaleTaskOutcome::Expired));
     }
 
     #[test]
@@ -1661,6 +1741,168 @@ mod tests {
         database.expire_stale_scheduled_tasks(1000, 100).unwrap();
 
         assert!(database.claim_due_scheduled_tasks(1000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stale_recurring_task_is_rescheduled_instead_of_expired() {
+        let database = database();
+        // Hourly from t=0; Kumo comes back at t=10_000, so the occurrence is ~2.8 hours late.
+        let id = database
+            .create_scheduled_task(42, "hourly check", 0, Some(3_600))
+            .unwrap();
+
+        let stale = database
+            .expire_stale_scheduled_tasks(10_000, 3_600)
+            .unwrap();
+
+        assert_eq!(stale.len(), 1);
+        match stale[0].outcome {
+            StaleTaskOutcome::Rescheduled {
+                skipped,
+                next_run_at,
+            } => {
+                assert_eq!(
+                    skipped, 3,
+                    "the occurrences at 0, 3600 and 7200 were missed"
+                );
+                assert_eq!(next_run_at, 10_800);
+            }
+            StaleTaskOutcome::Expired => {
+                panic!("a missed occurrence must not end a recurring task")
+            }
+        }
+        let pending = database.list_scheduled_tasks(42).unwrap();
+        assert_eq!(pending.len(), 1, "the task is still pending, not expired");
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].run_at, 10_800, "and has a future occurrence");
+    }
+
+    #[test]
+    fn a_rescheduled_stale_task_does_not_fire_in_the_same_poll() {
+        let mut database = database();
+        database
+            .create_scheduled_task(42, "hourly check", 0, Some(3_600))
+            .unwrap();
+
+        database
+            .expire_stale_scheduled_tasks(10_000, 3_600)
+            .unwrap();
+
+        assert!(
+            database
+                .claim_due_scheduled_tasks(10_000)
+                .unwrap()
+                .is_empty(),
+            "skipping a missed occurrence must not make the task immediately due"
+        );
+        assert_eq!(database.claim_due_scheduled_tasks(10_800).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_rescheduled_task_keeps_its_original_time_of_day() {
+        let database = database();
+        let nine_am = 9 * 3_600;
+        database
+            .create_scheduled_task(42, "morning check-in", nine_am, Some(86_400))
+            .unwrap();
+
+        // Back online at noon two days later.
+        let stale = database
+            .expire_stale_scheduled_tasks(2 * 86_400 + 12 * 3_600, 3_600)
+            .unwrap();
+
+        match stale[0].outcome {
+            StaleTaskOutcome::Rescheduled {
+                skipped,
+                next_run_at,
+            } => {
+                assert_eq!(skipped, 3);
+                assert_eq!(
+                    next_run_at,
+                    3 * 86_400 + nine_am,
+                    "the next 09:00, not 24 hours from now"
+                );
+            }
+            StaleTaskOutcome::Expired => panic!("a daily reminder must survive a missed day"),
+        }
+    }
+
+    #[test]
+    fn a_stale_sweep_expires_the_one_shot_and_keeps_the_recurring_one() {
+        let mut database = database();
+        let once = database
+            .create_scheduled_task(42, "call the dentist", 0, None)
+            .unwrap();
+        let daily = database
+            .create_scheduled_task(42, "take medication", 0, Some(86_400))
+            .unwrap();
+
+        let stale = database
+            .expire_stale_scheduled_tasks(10_000, 3_600)
+            .unwrap();
+
+        assert_eq!(stale.len(), 2);
+        let pending = database.list_scheduled_tasks(42).unwrap();
+        assert_eq!(pending.len(), 1, "only the recurring task survives");
+        assert_eq!(pending[0].id, daily);
+        assert!(
+            database
+                .claim_due_scheduled_tasks(10 * 86_400)
+                .unwrap()
+                .iter()
+                .all(|task| task.id != once),
+            "an expired one-shot task must never run"
+        );
+    }
+
+    #[test]
+    fn expiring_stale_tasks_does_not_revive_a_cancelled_recurring_task() {
+        let mut database = database();
+        let id = database
+            .create_scheduled_task(42, "weekly report", 0, Some(604_800))
+            .unwrap();
+        assert!(database.cancel_scheduled_task(42, &id[..8]).unwrap());
+
+        let stale = database
+            .expire_stale_scheduled_tasks(10_000, 3_600)
+            .unwrap();
+
+        assert!(stale.is_empty(), "a cancelled task is over, not stale");
+        assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+        assert!(
+            database
+                .claim_due_scheduled_tasks(10 * 604_800)
+                .unwrap()
+                .is_empty(),
+            "cancelled must stay cancelled"
+        );
+    }
+
+    #[test]
+    fn a_recurring_task_with_a_non_positive_interval_expires_instead_of_dividing_by_zero() {
+        let database = database();
+        // `schedule_task` enforces MIN_REPEAT_INTERVAL, so a zero interval can only come from a
+        // hand-edited database. It must not panic and must not reschedule onto its own timestamp.
+        database
+            .create_scheduled_task(42, "corrupt row", 0, Some(0))
+            .unwrap();
+
+        let stale = database
+            .expire_stale_scheduled_tasks(10_000, 3_600)
+            .unwrap();
+
+        assert!(matches!(stale[0].outcome, StaleTaskOutcome::Expired));
+        assert!(database.list_scheduled_tasks(42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_next_occurrence_is_the_first_one_not_in_the_past() {
+        // Two whole intervals behind plus a remainder: the third occurrence is the next one.
+        assert_eq!(next_occurrence(0, 3_600, 10_000), (10_800, 3));
+        // Exactly on an occurrence: that one is due now, not missed, so it is kept.
+        assert_eq!(next_occurrence(0, 3_600, 7_200), (7_200, 2));
+        // A single second past an occurrence still costs a whole interval.
+        assert_eq!(next_occurrence(0, 3_600, 3_601), (7_200, 2));
     }
 
     #[test]
