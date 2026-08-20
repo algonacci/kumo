@@ -1,7 +1,17 @@
-//! Converts common Markdown (as LLMs write it: `**bold**`, `_italic_`, `` `code` ``, fenced code
-//! blocks, links) into Telegram's MarkdownV2 dialect, escaping every character MarkdownV2 treats as
-//! reserved outside of an open entity. Telegram rejects a whole message if a reserved character is
-//! left unescaped, so a naive "just forward the model's Markdown" approach fails unpredictably.
+//! Converts common Markdown (as LLMs write it: `**bold**`, `` `code` ``, fenced code blocks, links)
+//! into Telegram's MarkdownV2 dialect, escaping every character MarkdownV2 treats as reserved
+//! outside of an open entity. Telegram rejects a whole message if a reserved character is left
+//! unescaped, so a naive "just forward the model's Markdown" approach fails unpredictably.
+//!
+//! **Underscores are never emphasis markers here.** `_x_` and `__x__` are rendered as literal
+//! underscores, so `snake_case_name`, `__init__` and `a_b_c` survive intact. Mangling an identifier
+//! is worse than under-styling prose, and no rule recovers both: CommonMark's flanking rules do
+//! rescue intra-word cases like `a_b_c`, but `__init__` has its delimiters at word boundaries and
+//! is strong emphasis under those same rules, so it would still render as a bold `init`. The one
+//! emphasis syntax kept is `**bold**`. Single-`*` italic is not accepted either, because it would
+//! corrupt globs like `src/*.rs`. Kamui reached the same conclusion for its terminal renderer
+//! (ROADMAP Phase 6); the reasoning survives the move to MarkdownV2 because the ambiguity is in the
+//! *input* Markdown, not in the output dialect.
 
 /// Characters MarkdownV2 requires to be escaped with a backslash outside of an entity.
 const RESERVED: &[char] = &[
@@ -56,8 +66,8 @@ fn escape_code(text: &str) -> String {
     out
 }
 
-/// Render a fence-free segment: inline code spans, bold, italic, and links become MarkdownV2
-/// entities; everything else is escaped as plain text.
+/// Render a fence-free segment: inline code spans, `**bold**`, and links become MarkdownV2
+/// entities; everything else — underscores included — is escaped as plain text.
 fn render_inline(text: &str) -> String {
     let mut out = String::new();
     let chars: Vec<char> = text.chars().collect();
@@ -84,28 +94,8 @@ fn render_inline(text: &str) -> String {
                 continue;
             }
         }
-        if chars[i] == '_' && i + 1 < chars.len() && chars[i + 1] == '_' {
-            if let Some(end) = find_str(&chars, i + 2, "__") {
-                out.push('*');
-                out.push_str(&render_inline(
-                    &chars[i + 2..end].iter().collect::<String>(),
-                ));
-                out.push('*');
-                i = end + 2;
-                continue;
-            }
-        }
-        if chars[i] == '_' {
-            if let Some(end) = find_char(&chars, i + 1, '_') {
-                out.push('_');
-                out.push_str(&render_inline(
-                    &chars[i + 1..end].iter().collect::<String>(),
-                ));
-                out.push('_');
-                i = end + 1;
-                continue;
-            }
-        }
+        // No `_` branch, by design: see the module comment. An underscore falls through to the
+        // escaping tail below and reaches Telegram as a literal `\_`.
         // A URL containing its own unescaped ')' (rare) closes early here; full paren-matching
         // is not worth the complexity for model-generated links.
         if chars[i] == '['
@@ -171,11 +161,47 @@ mod tests {
         assert_eq!(rendered, "Cost: $5\\.00 \\(really\\!\\)");
     }
 
+    /// The one emphasis syntax Kumo keeps. Underscore emphasis is deliberately gone (see below),
+    /// so this is what has to keep working.
     #[test]
-    fn converts_bold_and_italic() {
+    fn converts_bold() {
         assert_eq!(to_telegram_markdown_v2("**bold**"), "*bold*");
-        assert_eq!(to_telegram_markdown_v2("_italic_"), "_italic_");
-        assert_eq!(to_telegram_markdown_v2("__also italic__"), "*also italic*");
+        assert_eq!(to_telegram_markdown_v2("a **bold** word"), "a *bold* word");
+    }
+
+    /// An identifier must survive the round trip: the underscores reach Telegram escaped, which
+    /// renders as the literal name rather than as an italic entity.
+    #[test]
+    fn leaves_underscores_in_identifiers_literal() {
+        assert_eq!(
+            to_telegram_markdown_v2("snake_case_name"),
+            "snake\\_case\\_name"
+        );
+        assert_eq!(to_telegram_markdown_v2("a_b_c"), "a\\_b\\_c");
+        // Word-boundary delimiters: this is strong emphasis under CommonMark's flanking rules,
+        // which is why flanking alone would not have been enough.
+        assert_eq!(to_telegram_markdown_v2("__init__"), "\\_\\_init\\_\\_");
+        assert_eq!(
+            to_telegram_markdown_v2("call __init__ on Foo_Bar first"),
+            "call \\_\\_init\\_\\_ on Foo\\_Bar first"
+        );
+    }
+
+    /// Prose emphasis written with underscores is under-styled on purpose, not mangled: the text
+    /// itself still arrives intact.
+    #[test]
+    fn underscore_emphasis_is_not_an_entity() {
+        assert_eq!(to_telegram_markdown_v2("_italic_"), "\\_italic\\_");
+        assert_eq!(
+            to_telegram_markdown_v2("__also bold__"),
+            "\\_\\_also bold\\_\\_"
+        );
+    }
+
+    /// Bold still applies around an identifier, and the underscore inside it stays escaped.
+    #[test]
+    fn bold_containing_an_identifier_keeps_both() {
+        assert_eq!(to_telegram_markdown_v2("**snake_case**"), "*snake\\_case*");
     }
 
     #[test]
